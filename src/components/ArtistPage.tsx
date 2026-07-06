@@ -63,18 +63,12 @@ type ReleaseDetailState =
 // placeholders before expanding to its previous height.
 //
 // Bounded LRU: a heavy user can visit hundreds of distinct albums across
-// thousands of releases. Without a cap, both module-level Maps would grow
+// thousands of releases. Without a cap, the module-level Map would grow
 // forever (each `EntityDetail` carries the full track list + browse ids +
 // cover URLs — not small). 200 entries is ~50x the largest plausible
 // back/forward stack and well under any reasonable memory budget.
 const RELEASE_DETAIL_MEMORY_MAX = 200;
 const releaseDetailMemory = new Map<string, EntityDetail>();
-
-// Preserve the discography view mode (list vs grid) across Back/Forward
-// navigation so toggling grid survives visiting an album and coming back.
-// Same LRU cap pattern.
-const DISCOGRAPHY_VIEW_MODE_MEMORY_MAX = 200;
-const discographyViewModeMemory = new Map<string, ViewMode>();
 
 function rememberBounded<K, V>(map: Map<K, V>, key: K, value: V, max: number): void {
   if (map.has(key)) {
@@ -192,7 +186,10 @@ export function ArtistPage({
   const [pillStyle, setPillStyle] = useState<CSSProperties>({});
   const [releaseFilter, setReleaseFilter] = useState<ReleaseFilter>("all");
   const [sortMode, setSortMode] = useState<SortMode>("releaseDate");
-  const [viewMode, setViewMode] = useState<ViewMode>(() => discographyViewModeMemory.get(browseId) ?? "list");
+  // Discography view mode always starts in list mode for every visit —
+  // toggling to grid is per-session only and resets when the user enters
+  // (or re-enters) the discography page, including across different artists.
+  const [viewMode, setViewMode] = useState<ViewMode>("list");
   const [filterMenuOpen, setFilterMenuOpen] = useState(false);
   const [sortMenuOpen, setSortMenuOpen] = useState(false);
   const fullDiscographyOpen = section === "discography";
@@ -246,10 +243,6 @@ export function ArtistPage({
     setFilterMenuOpen(false);
     setSortMenuOpen(false);
   }, [fullDiscographyOpen]);
-
-  useEffect(() => {
-    rememberBounded(discographyViewModeMemory, browseId, viewMode, DISCOGRAPHY_VIEW_MODE_MEMORY_MAX);
-  }, [browseId, viewMode]);
 
   const detail = state.data ?? null;
   const topSongs = useMemo<MediaTrack[]>(
@@ -1582,7 +1575,12 @@ function FullDiscographyView({
       frame = 0;
       const { headerThresholdOffset, releaseAnchors, revealScrollTop } = stickyMetricsRef.current;
       const scrollTop = scrollContainer.scrollTop;
-      const shouldShow = scrollTop >= revealScrollTop;
+      // Grid mode releases the sticky header entirely — there's no per-release
+      // anchor to track, so the bar would otherwise render an empty slot.
+      // Keeping it off also avoids the [data-discography-sticky] CSS rule
+      // hiding the topbar search/history controls when there's nothing to
+      // replace them with.
+      const shouldShow = viewMode === "list" && scrollTop >= revealScrollTop;
 
       setStickyHeaderVisible((visible) => (visible === shouldShow ? visible : shouldShow));
 
@@ -2441,7 +2439,8 @@ function isReleaseShelf(title: string): boolean {
     lower.includes("single") ||
     lower.includes("ep") ||
     lower.includes("release") ||
-    lower.includes("discography")
+    lower.includes("discography") ||
+    lower.includes("compilation")
   );
 }
 

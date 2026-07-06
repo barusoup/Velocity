@@ -16,6 +16,7 @@
     "dialog:allow-open",
     "dialog:allow-message",
     "updater:default",
-    "process:default"
+    "process:default",
+    "autostart:default"
   ]
 }

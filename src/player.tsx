@@ -189,6 +189,28 @@ function tokenOverlap(left: string, right: string): number {
   return overlap / Math.max(leftTokens.size, rightTokens.size);
 }
 
+// When swapping a track's underlying videoId (e.g. a music video → Topic upload,
+// or an album-track mislabel), require the candidate's runtime to match the
+// original within a tolerance. This blocks mislabeled uploads that claim the
+// right title/artist but actually contain a different song (observed: a
+// "Paranoid Android" result that played "2 + 2 = 5"). We require a candidate
+// duration whenever the source has one; if the source has no duration we can't
+// validate, so we fall back to the title/artist checks alone.
+function isDurationMatchForAutoplaySwap(
+  sourceSeconds: number | null | undefined,
+  candidateSeconds: number | null | undefined,
+): boolean {
+  const hasSource =
+    sourceSeconds != null && Number.isFinite(sourceSeconds) && sourceSeconds > 0;
+  const hasCandidate =
+    candidateSeconds != null && Number.isFinite(candidateSeconds) && candidateSeconds > 0;
+  if (!hasSource) return true;
+  if (!hasCandidate) return false;
+  const diff = Math.abs(sourceSeconds - candidateSeconds);
+  const tolerance = Math.max(15, sourceSeconds * 0.15);
+  return diff <= tolerance;
+}
+
 function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
   return new Promise<T>((resolve, reject) => {
     const timer = setTimeout(() => reject(new Error(message)), timeoutMs);
@@ -266,6 +288,11 @@ async function findClosestSongForVideoTrack(
     const meetsTitle =
       best.exactTitle || best.titleScore >= AUTOPLAY_MIN_TITLE_OVERLAP;
     if (!meetsArtist || !meetsTitle) return null;
+    // Runtime guard: a title/artist match isn't enough if the candidate's
+    // length is wildly different — it may be a mislabeled upload.
+    if (!isDurationMatchForAutoplaySwap(video.durationSeconds, best.song.durationSeconds)) {
+      return null;
+    }
 
     const matched = best.song;
     const matchedVideoId = matched.videoId!;
@@ -353,9 +380,13 @@ async function findCanonicalSongVideoId(
     // fallback) with the SAME videoId as the track. Skip it and keep looking
     // for a result with a DIFFERENT videoId, which is the Topic upload.
     // Require exact (artist, title) match to avoid swapping to a different
-    // track (remix, live version, etc.).
+    // track (remix, live version, etc.), and verify runtime so a mislabeled
+    // upload cannot sneak through with the right metadata but wrong audio.
     for (const entry of ranked) {
       if (!entry.exactArtist || !entry.exactTitle) continue;
+      if (!isDurationMatchForAutoplaySwap(track.durationSeconds, entry.song.durationSeconds)) {
+        continue;
+      }
       const matchedVideoId = entry.song.videoId!;
       if (matchedVideoId === track.videoId) continue;
       return matchedVideoId;
@@ -839,6 +870,7 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
     const audio = audioRef.current;
     if (!audio) return;
     audio.pause();
+    audio.removeAttribute("src");
     audio.currentTime = 0;
     setProgress(0);
     setIsPlaying(false);
@@ -1160,6 +1192,42 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
         if (!src) throw new Error("No audio source is available for this track.");
         if (cancelled) return;
         audio.src = src;
+
+        // Re-apply the output gain so a new track loaded after a pause
+        // doesn't inherit the gain=0 that togglePlay's pause branch set
+        // on the previous track. Without this, the new track plays
+        // silently until the user nudges the volume slider or
+        // pause+unpauses (both of which re-trigger applyOutputLevels).
+        // We use a hard setValueAtTime (not applyOutputLevels' 0.15s
+        // exponential ramp) so the first frame of a fresh track plays
+        // at the correct level rather than ramping up from silence.
+        {
+          const gainNode = gainNodeRef.current;
+          const ctx = audioContextRef.current;
+          if (gainNode && ctx) {
+            const now = ctx.currentTime;
+            const masterVolumeDb = getSetting("masterVolume");
+            const masterVolumeGain = Math.pow(10, masterVolumeDb / 20);
+            const normalizationEnabled = getSetting("audioNormalization");
+            const effectiveGain = normalizationEnabled
+              ? (Number.isFinite(normGainRef.current) && normGainRef.current > 0
+                ? normGainRef.current
+                : 1)
+              : 1;
+            gainNode.gain.cancelScheduledValues(now);
+            gainNode.gain.setValueAtTime(
+              effectiveGain * clampVolume(volumeRef.current) * masterVolumeGain,
+              now,
+            );
+            // Mirror applyOutputLevels: when the gain node is the master,
+            // keep the audio element at 1 so it doesn't double-attenuate
+            // the signal. Defensive against setLiveVolume (the slider's
+            // onChange) having run between the previous track's
+            // applyOutputLevels and this block.
+            audio.volume = 1;
+          }
+          audio.muted = mutedRef.current;
+        }
 
         // On initial app boot, any track that was loaded without an explicit
         // user play() call (session restore, etc.) must start paused so the

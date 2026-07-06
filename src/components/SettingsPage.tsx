@@ -446,8 +446,8 @@ async function setLaunchOnStartup(enabled: boolean): Promise<void> {
     } else {
       await disable();
     }
-  } catch {
-    // Plugin not available — preference is still saved locally.
+  } catch (e) {
+    console.warn("Failed to set launch on startup:", e);
   }
 }
 
