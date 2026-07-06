@@ -42,6 +42,10 @@ body {
   --ui-artist-hero: clamp(26.875rem, 36.71875vw, 34rem);
   --ui-player-bottom: clamp(0.75rem, 1.5625vw, 1.5rem);
   --ui-player-height: clamp(4.1rem, 5.9375vw, 5.4rem);
+  --ui-home-card-width: clamp(10.25rem, 15.3125vw, 12.25rem);
+  /* Five cards, four gap-1 gaps, and px-1 rail padding — keeps the first
+     five songs fully visible when the rail is centered. */
+  --ui-home-rail-width: calc(5 * var(--ui-home-card-width) + 1.5rem);
 }
 
 @media (max-width: 760px) {
@@ -1345,6 +1349,48 @@ input[type="number"]::-webkit-inner-spin-button {
   animation: sidebar-item-enter 220ms cubic-bezier(0.16, 1, 0.3, 1) both;
 }
 
+/* Home nav slot — h-10 + mb-1 from SidebarLink. Collapsing this in sync
+   with the pop animation lets Collection slide rather than snap. */
+.sidebar-nav-slot {
+  overflow: hidden;
+  max-height: 0;
+  transition: max-height 260ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.sidebar-nav-slot.is-open {
+  max-height: 2.75rem;
+}
+
+.sidebar-nav-item-enter {
+  animation: sidebar-nav-item-enter 260ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+.sidebar-nav-item-exit {
+  animation: sidebar-nav-item-exit 260ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+@keyframes sidebar-nav-item-enter {
+  from {
+    opacity: 0;
+    transform: scale(0.88) translateX(-8px);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1) translateX(0);
+  }
+}
+
+@keyframes sidebar-nav-item-exit {
+  from {
+    opacity: 1;
+    transform: scale(1) translateX(0);
+  }
+  to {
+    opacity: 0;
+    transform: scale(0.88) translateX(-8px);
+  }
+}
+
 @keyframes sidebar-item-enter {
   from {
     opacity: 0;
@@ -1357,8 +1403,14 @@ input[type="number"]::-webkit-inner-spin-button {
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .sidebar-item-enter {
+  .sidebar-item-enter,
+  .sidebar-nav-item-enter,
+  .sidebar-nav-item-exit {
     animation: none;
+  }
+
+  .sidebar-nav-slot {
+    transition: none;
   }
 
   /* The translate fades out via the Tailwind motion-reduce:animate-none

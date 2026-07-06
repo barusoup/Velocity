@@ -13,13 +13,14 @@ import { cn } from "../utils/cn";
 // Sizes:
 //   * "lg" — matches the existing CirclePlus button next to shuffle/play on
 //            the Album header (~h-10 w-10). Hover turns the icon white.
+//   * "md" — album rows on the full discography page (~h-8 w-8).
 //   * "sm" — compact pill for track rows / queue rows / player bar (~h-7 w-7).
 //
 // The toggle uses a quick Spotify-like pop: the green disc blooms in, the
 // check settles into place, and a tiny sparkle burst fades out.
 // ---------------------------------------------------------------------------
 
-type SaveButtonSize = "lg" | "sm";
+type SaveButtonSize = "lg" | "md" | "sm";
 
 export type SaveButtonProps = {
   isSaved: boolean;
@@ -83,9 +84,12 @@ export function SaveButton({
   // The button keeps a stable hit area, while the visible icon/disc stays
   // pixel-matched between states. The plus icon draws its own circle; the
   // saved state gets a green inner disc at that same box size.
-  const dimensions = size === "lg" ? "h-10 w-10" : "h-7 w-7";
-  const iconDiscDimensions = size === "lg" ? "h-7 w-7" : "h-4 w-4";
-  const savedIconDimensions = size === "lg" ? "h-[18px] w-[18px]" : "h-2.5 w-2.5";
+  const dimensions =
+    size === "lg" ? "h-10 w-10" : size === "md" ? "h-8 w-8" : "h-7 w-7";
+  const iconDiscDimensions =
+    size === "lg" ? "h-7 w-7" : size === "md" ? "h-[22px] w-[22px]" : "h-4 w-4";
+  const savedIconDimensions =
+    size === "lg" ? "h-[18px] w-[18px]" : size === "md" ? "h-3.5 w-3.5" : "h-2.5 w-2.5";
 
   // One glyph per state. The saved check is intentionally smaller than the
   // disc around it, matching Spotify's compact black tick inside the green
@@ -129,7 +133,10 @@ export function SaveButton({
       )}
       {isLoading && (
         <span className="absolute inset-0 flex items-center justify-center text-white">
-          <LoaderCircle className="animate-spin" size={size === "lg" ? 24 : 14} />
+          <LoaderCircle
+            className="animate-spin"
+            size={size === "lg" ? 24 : size === "md" ? 18 : 14}
+          />
         </span>
       )}
     </button>

@@ -2,14 +2,13 @@
 // verify-bundled-installer.mjs
 //
 // Tier 3 belt-and-suspenders. After `npm run tauri -- build` produces a
-// real installer, re-extract it (NSIS .exe / .dmg / .app.tar.gz /
-// .AppImage) with 7z and re-run the embedded icon checks. Catches the
-// regression class where the pre-build verifier is green but Tauri's
-// bundler still ships a broken icon into the artifact.
+// real installer, re-extract it (NSIS .exe / .dmg / .app.tar.gz) with 7z
+// and re-run the embedded icon checks. Catches the regression class where
+// the pre-build verifier is green but Tauri's bundler still ships a broken
+// icon into the artifact.
 //
 // Prereq: `7z` on PATH.
 //   - macOS: `brew install p7zip`
-//   - Linux: `apt install p7zip-full` (Debian/Ubuntu) or pacman equivalent
 //   - Windows: install 7-Zip standalone; Git Bash's bundled 7z also works
 //
 // Exit 0 if every embedded icon passes. Exit 1 if any extracted icon
@@ -58,7 +57,7 @@ for (const cmd of ["7z", "7za"]) {
   }
 }
 if (!extractor) {
-  fail(`7z (or 7za) not found on PATH. Install p7zip-full (Linux), p7zip (brew on macOS), or 7-Zip (Windows).`);
+  fail(`7z (or 7za) not found on PATH. Install p7zip (brew on macOS) or 7-Zip (Windows).`);
   console.log(`
 Refusing to proceed without an extractor. Tier 3 is opt-in: skip if 7z
 isn't installed.`);
@@ -93,9 +92,8 @@ function findArtifacts() {
   const dirs = [
     "src-tauri/target/release",
     "src-tauri/target/aarch64-apple-darwin/release",
-    "src-tauri/target/x86_64-apple-darwin/release",
   ];
-  const subs = ["bundle/nsis", "bundle/dmg", "bundle/macos", "bundle/appimage"];
+  const subs = ["bundle/nsis", "bundle/dmg", "bundle/macos"];
   const results = [];
   for (const dir of dirs) {
     if (!existsSync(dir)) continue;
@@ -107,7 +105,6 @@ function findArtifacts() {
           if (
             entry.endsWith(".exe") ||
             entry.endsWith(".dmg") ||
-            entry.endsWith(".AppImage") ||
             entry.endsWith(".app.tar.gz")
           ) {
             results.push(path.join(full, entry));
@@ -123,7 +120,7 @@ function findArtifacts() {
 
 const artifacts = findArtifacts();
 if (artifacts.length === 0) {
-  fail(`No built installers found under src-tauri/target/*/release/bundle/{nsis,dmg,macos,appimage}.\nRun \`npm run tauri -- build\` first, then re-run this script.`);
+  fail(`No built installers found under src-tauri/target/*/release/bundle/{nsis,dmg,macos}.\nRun \`npm run tauri -- build\` first, then re-run this script.`);
   process.exit(1);
 }
 pass(`Found ${artifacts.length} built installer(s)`);
@@ -239,24 +236,6 @@ for (const art of artifacts) {
     }
   }
 
-  if (ext === ".AppImage") {
-    // Linux AppImage: squashfs containing the app + hicolor icons.
-    try {
-      const files = walk(extractDir).filter((f) =>
-        /velocity.*\.png$/i.test(f),
-      );
-      if (files.length === 0) {
-        warn(
-          `No velocity*.png found in AppImage. Linux bundlers may use a ` +
-            `different naming convention; manual inspection required.`,
-        );
-      } else {
-        pass(`AppImage contains ${files.length} velocity*.png file(s)`);
-      }
-    } catch (err) {
-      warn(`could not inspect AppImage payload: ${err.message}`);
-    }
-  }
 }
 
 rmSync(tmp, { recursive: true, force: true });

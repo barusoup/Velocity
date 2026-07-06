@@ -1,7 +1,7 @@
 {
   "name": "velocity",
   "private": true,
-  "version": "0.0.2",
+  "version": "0.1.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -10,7 +10,11 @@
     "tauri": "node scripts/tauri.js",
     "regen-icons": "npx tauri icon src-tauri/icons/desktop-icon.png && node scripts/reorder-ico-frames.mjs",
     "verify-release": "node scripts/verify-release-assets.mjs",
-    "verify-bundled-installer": "node scripts/verify-bundled-installer.mjs"
+    "verify-bundled-installer": "node scripts/verify-bundled-installer.mjs",
+    "test": "vitest run",
+    "test:discord-presence": "vitest run src/discord-presence",
+    "test:discord-presence:deep": "vitest run src/discord-presence/deep-scenarios.test.ts src/discord-presence/fuzz.test.ts",
+    "harness:discord-presence": "node scripts/discord-presence-harness.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.10.0",
@@ -23,17 +27,19 @@
     "react": "19.2.6",
     "react-dom": "19.2.6",
     "react-icons": "^5.6.0",
-    "tailwind-merge": "3.4.0"
+    "tailwind-merge": "3.4.0",
+    "zustand": "^5.0.14"
   },
   "devDependencies": {
-    "@tailwindcss/vite": "4.1.17",
+    "@tailwindcss/vite": "^4.3.2",
     "@tauri-apps/cli": "^2.10.0",
     "@types/node": "22.19.17",
     "@types/react": "19.2.7",
     "@types/react-dom": "19.2.3",
     "@vitejs/plugin-react": "5.1.1",
-    "tailwindcss": "4.1.17",
+    "tailwindcss": "^4.3.2",
     "typescript": "5.9.3",
-    "vite": "7.3.2"
+    "vite": "7.3.2",
+    "vitest": "^3.2.4"
   }
 }

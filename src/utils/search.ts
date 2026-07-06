@@ -9,6 +9,7 @@ const SEARCH_TYPE_LABELS = new Set([
   "playlist",
   "podcast",
   "episode",
+  "mix",
   "video",
 ]);
 

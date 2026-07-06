@@ -1,5 +1,14 @@
-import { useCallback, useEffect, useRef, useState } from "react";
-import { useCollection } from "../collection";
+import {
+  forwardRef,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
+import { HardDrive, Monitor, Settings as SettingsIcon, Volume2 } from "lucide-react";
+import { scheduleOfflineSyncForTrack, useCollection } from "../collection";
 import { usePlayer } from "../player";
 import {
   type Settings,
@@ -10,10 +19,29 @@ import {
   clearAllUserData,
   subscribe,
 } from "../settings";
-import { clearAllOffline, saveOffline } from "../api";
+import { clearAllOffline } from "../api";
+import { clearTasteProfile } from "../taste-profile";
+import { cn } from "../utils/cn";
 import { ConfirmDialog } from "./Shared";
 
-type ConfirmAction = "configs" | "data" | "offline" | null;
+type ConfirmAction = "configs" | "data" | "offline" | "tasteProfile" | null;
+type SettingsTab = "general" | "playback" | "display" | "storage";
+
+const SETTINGS_TABS: {
+  id: SettingsTab;
+  label: string;
+  icon: ReactNode;
+}[] = [
+  { id: "general", label: "General", icon: <SettingsIcon size={16} strokeWidth={1.8} /> },
+  { id: "playback", label: "Playback", icon: <Volume2 size={16} strokeWidth={1.8} /> },
+  { id: "display", label: "Display", icon: <Monitor size={16} strokeWidth={1.8} /> },
+  { id: "storage", label: "Storage", icon: <HardDrive size={16} strokeWidth={1.8} /> },
+];
+
+let _lastSettingsTab: SettingsTab | null = null;
+// Remember whether home was on before both sections were turned off and
+// auto-disabled the home menu, so re-enabling a section can restore it.
+let _homeMenuEnabledBeforeSectionLock = false;
 
 const EQ_FREQUENCIES = ["32", "64", "125", "250", "500", "1k", "2k", "4k", "8k", "16k"] as const;
 
@@ -22,14 +50,21 @@ function ToggleRow({
   description,
   enabled,
   onChange,
+  disabled = false,
 }: {
   label: string;
   description?: string;
   enabled: boolean;
   onChange: (value: boolean) => void;
+  disabled?: boolean;
 }) {
   return (
-    <div className="flex items-center justify-between gap-4 py-3">
+    <div
+      className={cn(
+        "flex items-center justify-between gap-4 py-3",
+        disabled && "pointer-events-none opacity-40",
+      )}
+    >
       <div className="min-w-0 flex-1">
         <div className="text-sm font-medium text-white">{label}</div>
         {description && (
@@ -40,11 +75,13 @@ function ToggleRow({
         type="button"
         role="switch"
         aria-checked={enabled}
+        aria-disabled={disabled || undefined}
+        disabled={disabled}
         onClick={() => onChange(!enabled)}
-        className={`group relative h-7 w-[3.25rem] shrink-0 rounded-full transition-colors duration-300 ease-out outline-none focus-visible:ring-2 focus-visible:ring-white/40 ${
+        className={`group relative h-7 w-[3.25rem] shrink-0 rounded-full transition-colors duration-300 ease-out outline-none focus-visible:ring-2 focus-visible:ring-white/40 disabled:cursor-not-allowed ${
           enabled
             ? "bg-white shadow-[inset_0_1px_2px_rgba(0,0,0,0.08),0_0_18px_rgba(255,255,255,0.18)]"
-            : "bg-white/[0.08] shadow-[inset_0_1px_2px_rgba(0,0,0,0.4)] hover:bg-white/[0.13]"
+            : "bg-white/[0.08] shadow-[inset_0_1px_2px_rgba(0,0,0,0.4)] hover:bg-white/[0.13] disabled:hover:bg-white/[0.08]"
         }`}
       >
         <span
@@ -68,6 +105,29 @@ function SectionHeader({ children }: { children: string }) {
     </div>
   );
 }
+
+const SettingsTabButton = forwardRef<HTMLButtonElement, {
+  label: string;
+  active: boolean;
+  onClick: () => void;
+  icon: ReactNode;
+}>(function SettingsTabButton({ label, active, onClick, icon }, ref) {
+  return (
+    <button
+      ref={ref}
+      type="button"
+      onClick={onClick}
+      aria-pressed={active}
+      className={cn(
+        "relative z-10 inline-flex h-8 items-center justify-center gap-2 rounded-full px-3.5 text-sm font-semibold leading-none transition-colors animate-none",
+        active ? "text-black" : "text-white hover:text-white/80",
+      )}
+    >
+      <span className="flex h-4 w-4 shrink-0 items-center justify-center">{icon}</span>
+      <span>{label}</span>
+    </button>
+  );
+});
 
 function DangerButton({
   label,
@@ -100,12 +160,42 @@ function DangerButton({
 export function SettingsPage() {
   const collection = useCollection();
   const player = usePlayer();
+  const [tab, setTab] = useState<SettingsTab>(_lastSettingsTab ?? "general");
   const [settings, setSettingsState] = useState<Settings>(getSettings);
   const [confirmAction, setConfirmAction] = useState<ConfirmAction>(null);
   const [masterVolumeLabel, setMasterVolumeLabel] = useState(() => {
     const v = getSettings().masterVolume;
     return formatMasterVolume(v);
   });
+  const tabRefs = useRef<Record<SettingsTab, HTMLButtonElement | null>>({
+    general: null,
+    playback: null,
+    display: null,
+    storage: null,
+  });
+  const tabContainerRef = useRef<HTMLDivElement | null>(null);
+  const [indicatorStyle, setIndicatorStyle] = useState<{
+    left: number;
+    width: number;
+  } | null>(null);
+
+  const handleTabClick = useCallback((next: SettingsTab) => {
+    if (next === tab) return;
+    setTab(next);
+    _lastSettingsTab = next;
+  }, [tab]);
+
+  useLayoutEffect(() => {
+    const container = tabContainerRef.current;
+    const activeBtn = tabRefs.current[tab];
+    if (!container || !activeBtn) return;
+    const containerRect = container.getBoundingClientRect();
+    const btnRect = activeBtn.getBoundingClientRect();
+    setIndicatorStyle({
+      left: btnRect.left - containerRect.left,
+      width: btnRect.width,
+    });
+  }, [tab]);
 
   // Kept as a ref so the ref-capturing callback below can read the
   // current collection without re-creating on every save/unsave. Without
@@ -115,6 +205,8 @@ export function SettingsPage() {
   // actually changed.
   const savedSongsRef = useRef(collection.savedSongs);
   savedSongsRef.current = collection.savedSongs;
+  const updateSongMetadataRef = useRef(collection.updateSongMetadata);
+  updateSongMetadataRef.current = collection.updateSongMetadata;
 
   useEffect(() => {
     const unsub = subscribe((key, _value) => {
@@ -163,7 +255,7 @@ export function SettingsPage() {
     if (key === "offlineSync" && value === true) {
       for (const track of savedSongsRef.current) {
         if (track.source === "stream" && track.videoId) {
-          saveOffline(track.videoId).catch(() => {});
+          scheduleOfflineSyncForTrack(track, updateSongMetadataRef.current);
         }
       }
     }
@@ -214,6 +306,50 @@ export function SettingsPage() {
     setConfirmAction(null);
   }, [updateSetting]);
 
+  const handleClearTasteProfile = useCallback(() => {
+    clearTasteProfile();
+    setConfirmAction(null);
+  }, []);
+
+  const homeSectionsEnabled =
+    settings.showHomeTopSongs || settings.showHomeTodaysPicks;
+
+  const handleShowHomeTopSongsChange = useCallback(
+    (value: boolean) => {
+      updateSetting("showHomeTopSongs", value);
+      if (!value && !settings.showHomeTodaysPicks) {
+        if (settings.showHomeMenu) {
+          _homeMenuEnabledBeforeSectionLock = true;
+        }
+        updateSetting("showHomeMenu", false);
+        return;
+      }
+      if (value && _homeMenuEnabledBeforeSectionLock) {
+        _homeMenuEnabledBeforeSectionLock = false;
+        updateSetting("showHomeMenu", true);
+      }
+    },
+    [settings.showHomeMenu, settings.showHomeTodaysPicks, updateSetting],
+  );
+
+  const handleShowHomeTodaysPicksChange = useCallback(
+    (value: boolean) => {
+      updateSetting("showHomeTodaysPicks", value);
+      if (!value && !settings.showHomeTopSongs) {
+        if (settings.showHomeMenu) {
+          _homeMenuEnabledBeforeSectionLock = true;
+        }
+        updateSetting("showHomeMenu", false);
+        return;
+      }
+      if (value && _homeMenuEnabledBeforeSectionLock) {
+        _homeMenuEnabledBeforeSectionLock = false;
+        updateSetting("showHomeMenu", true);
+      }
+    },
+    [settings.showHomeMenu, settings.showHomeTopSongs, updateSetting],
+  );
+
   const handleEqBandChange = useCallback((index: number, gain: number) => {
     const bands = [...(getSetting("equalizerBands") ?? Array(10).fill(0))];
     bands[index] = gain;
@@ -229,177 +365,275 @@ export function SettingsPage() {
   }, [updateSetting, player]);
 
   return (
-    <div className="mx-auto max-w-2xl py-6">
-      <div className="mb-8">
-        <h1 className="text-2xl font-bold text-white">Settings</h1>
-        <p className="mt-1 text-sm text-neutral-400">
-          Configure app behavior and manage your data
+    <div className="settings-page mx-auto max-w-2xl py-6">
+      <div className="mb-8 flex items-center justify-between gap-4">
+        <div
+          ref={tabContainerRef}
+          className="relative flex flex-wrap items-center gap-1.5"
+        >
+          {indicatorStyle && (
+            <div
+              className="settings-tab-indicator absolute top-0 bottom-0 rounded-full bg-white transition-all duration-300 ease-[cubic-bezier(0.16,1,0.3,1)]"
+              style={{
+                left: indicatorStyle.left,
+                width: indicatorStyle.width,
+              }}
+            />
+          )}
+          {SETTINGS_TABS.map((item) => (
+            <SettingsTabButton
+              key={item.id}
+              ref={(el) => { tabRefs.current[item.id] = el; }}
+              label={item.label}
+              active={tab === item.id}
+              onClick={() => handleTabClick(item.id)}
+              icon={item.icon}
+            />
+          ))}
+        </div>
+        <p className="shrink-0 text-xs font-medium tracking-[0.04em] text-neutral-500">
+          Velocity v0.1.0 Experimental
         </p>
       </div>
 
-      <div className="space-y-8">
-        <section>
-          <SectionHeader>General</SectionHeader>
-          <div className="divide-y divide-white/5">
-            <ToggleRow
-              label="Launch on startup"
-              description="Automatically start the app when your computer boots up"
-              enabled={settings.launchOnStartup}
-              onChange={(v) => updateSetting("launchOnStartup", v)}
-            />
-            <ToggleRow
-              label="Start minimized"
-              description="Launch the app minimized to the system tray"
-              enabled={settings.startMinimized}
-              onChange={(v) => updateSetting("startMinimized", v)}
-            />
-            <ToggleRow
-              label="Always show search bar"
-              description="Keep the search bar visible instead of hiding when not in use"
-              enabled={settings.alwaysShowSearch}
-              onChange={(v) => updateSetting("alwaysShowSearch", v)}
-            />
-          </div>
-        </section>
-
-        <section>
-          <SectionHeader>Playback</SectionHeader>
-          <div className="divide-y divide-white/5">
-            <ToggleRow
-              label="Audio normalization"
-              description="Automatically balance volume across different tracks"
-              enabled={settings.audioNormalization}
-              onChange={(v) => updateSetting("audioNormalization", v)}
-            />
-            <ToggleRow
-              label="Play/pause crossfade"
-              description="Smoothly fade between tracks when playing or pausing"
-              enabled={settings.crossfade}
-              onChange={(v) => updateSetting("crossfade", v)}
-            />
-
-            <div className="py-3">
-              <div className="mb-2 text-sm font-medium text-white">
-                Master volume
-              </div>
-              <div className="flex items-center gap-3">
-                <input
-                  type="range"
-                  min={-12}
-                  max={12}
-                  step={1}
-                  value={settings.masterVolume}
-                  onChange={(event) =>
-                    updateSetting("masterVolume", Number(event.target.value))
-                  }
-                  className="slider slider-volume flex-1"
-                />
-                <span className="w-20 shrink-0 text-right text-sm tabular-nums text-neutral-300">
-                  {masterVolumeLabel}
-                </span>
-              </div>
-              <p className="mt-1 text-xs text-neutral-500">
-                Offset from default volume. Adjusts the overall output level of
-                the app.
-              </p>
+      <div key={tab} className="settings-tab-panel space-y-8">
+        {tab === "general" && (
+          <section>
+            <div className="divide-y divide-white/5">
+              <ToggleRow
+                label="Launch on startup"
+                description="Automatically start the app when your computer boots up"
+                enabled={settings.launchOnStartup}
+                onChange={(v) => updateSetting("launchOnStartup", v)}
+              />
+              <ToggleRow
+                label="Start minimized"
+                description="Launch the app minimized to the system tray"
+                enabled={settings.startMinimized}
+                onChange={(v) => updateSetting("startMinimized", v)}
+              />
+              <ToggleRow
+                label="Always show search bar"
+                description="Keep the search bar visible instead of hiding when not in use"
+                enabled={settings.alwaysShowSearch}
+                onChange={(v) => updateSetting("alwaysShowSearch", v)}
+              />
+              <ToggleRow
+                label="Search suggestions"
+                description="Show inline autocomplete in the search bar; press Tab to accept"
+                enabled={settings.searchSuggestions}
+                onChange={(v) => updateSetting("searchSuggestions", v)}
+              />
+              <ToggleRow
+                label="Discord Rich Presence"
+                description="Share what you're listening to in your Discord status"
+                enabled={settings.discordRichPresence}
+                onChange={(v) => updateSetting("discordRichPresence", v)}
+              />
             </div>
-          </div>
-        </section>
+          </section>
+        )}
 
-        <section>
-          <div className="flex items-center justify-between border-b border-white/8 pb-2">
-            <h2 className="text-xs font-bold tracking-[0.06em] text-neutral-500">
-              Equalizer
-            </h2>
-            <button
-              type="button"
-              onClick={handleEqReset}
-              className="rounded-full border border-neutral-700 px-4 py-1.5 text-xs font-semibold text-neutral-200 transition hover:border-neutral-500 hover:text-white"
-            >
-              Reset
-            </button>
-          </div>
-          <div className="py-3">
-            <div className="flex items-end justify-center gap-0 px-2">
-              {EQ_FREQUENCIES.map((freq, i) => {
-                const gain = settings.equalizerBands?.[i] ?? 0;
-                return (
-                  <div key={freq} className="flex flex-1 flex-col items-center gap-1">
-                    <span className="text-[10px] tabular-nums text-neutral-500">
-                      {gain > 0 ? `+${gain}` : gain}
-                    </span>
+        {tab === "playback" && (
+          <>
+            <section>
+              <div className="divide-y divide-white/5">
+                <ToggleRow
+                  label="Audio normalization"
+                  description="Automatically balance volume across different tracks"
+                  enabled={settings.audioNormalization}
+                  onChange={(v) => updateSetting("audioNormalization", v)}
+                />
+                <ToggleRow
+                  label="Play/pause crossfade"
+                  description="Smoothly fade between tracks when playing or pausing"
+                  enabled={settings.crossfade}
+                  onChange={(v) => updateSetting("crossfade", v)}
+                />
+                <ToggleRow
+                  label="Remember playback position"
+                  description="Save the elapsed time of the current song between sessions"
+                  enabled={settings.saveTimestamp}
+                  onChange={(v) => updateSetting("saveTimestamp", v)}
+                />
+
+                <div className="py-3">
+                  <div className="mb-2 text-sm font-medium text-white">
+                    Master volume
+                  </div>
+                  <div className="flex items-center gap-3">
                     <input
                       type="range"
                       min={-12}
                       max={12}
                       step={1}
-                      value={gain}
-                      onChange={(e) => handleEqBandChange(i, Number(e.target.value))}
-                      className="slider-eq h-32 w-full"
-                      style={{
-                        writingMode: "vertical-lr",
-                        direction: "rtl",
-                      }}
+                      value={settings.masterVolume}
+                      onChange={(event) =>
+                        updateSetting("masterVolume", Number(event.target.value))
+                      }
+                      className="slider slider-volume flex-1"
                     />
-                    <span className="text-[10px] text-neutral-500">{freq}</span>
+                    <span className="w-20 shrink-0 text-right text-sm tabular-nums text-neutral-300">
+                      {masterVolumeLabel}
+                    </span>
                   </div>
-                );
-              })}
-            </div>
-          </div>
-        </section>
+                  <p className="mt-1 text-xs text-neutral-500">
+                    Offset from default volume. Adjusts the overall output level of
+                    the app.
+                  </p>
+                </div>
+              </div>
+            </section>
 
-        <section>
-          <SectionHeader>Display</SectionHeader>
-          <div className="divide-y divide-white/5">
-            <ToggleRow
-              label="Hide media player on lyrics"
-              description="Auto-hide the player bar when viewing the lyrics page"
-              enabled={settings.hidePlayerOnLyrics}
-              onChange={(v) => updateSetting("hidePlayerOnLyrics", v)}
-            />
-            <ToggleRow
-              label="Remember playback position"
-              description="Save the elapsed time of the current song between sessions"
-              enabled={settings.saveTimestamp}
-              onChange={(v) => updateSetting("saveTimestamp", v)}
-            />
-          </div>
-        </section>
+            <section>
+              <div className="flex items-center justify-between border-b border-white/8 pb-2">
+                <h2 className="text-xs font-bold tracking-[0.06em] text-neutral-500">
+                  Equalizer
+                </h2>
+                <button
+                  type="button"
+                  onClick={handleEqReset}
+                  className="rounded-full border border-neutral-700 px-4 py-1.5 text-xs font-semibold text-neutral-200 transition hover:border-neutral-500 hover:text-white"
+                >
+                  Reset
+                </button>
+              </div>
+              <div className="py-3">
+                <div className="flex items-end justify-center gap-0 px-2">
+                  {EQ_FREQUENCIES.map((freq, i) => {
+                    const gain = settings.equalizerBands?.[i] ?? 0;
+                    return (
+                      <div key={freq} className="flex flex-1 flex-col items-center gap-1">
+                        <span className="text-[10px] tabular-nums text-neutral-500">
+                          {gain > 0 ? `+${gain}` : gain}
+                        </span>
+                        <input
+                          type="range"
+                          min={-12}
+                          max={12}
+                          step={1}
+                          value={gain}
+                          onChange={(e) => handleEqBandChange(i, Number(e.target.value))}
+                          className="slider-eq h-32 w-full"
+                          style={{
+                            writingMode: "vertical-lr",
+                            direction: "rtl",
+                          }}
+                        />
+                        <span className="text-[10px] text-neutral-500">{freq}</span>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            </section>
+          </>
+        )}
 
-        <section>
-          <SectionHeader>Offline</SectionHeader>
-          <div className="divide-y divide-white/5">
-            <ToggleRow
-              label="Save songs for offline playback"
-              description="When enabled, songs added to your collection are automatically downloaded for offline listening. Disabling will prompt to remove downloaded files."
-              enabled={settings.offlineSync}
-              onChange={(v) => {
-                if (!v) {
-                  setConfirmAction("offline");
-                } else {
-                  updateSetting("offlineSync", true);
-                }
-              }}
-            />
-          </div>
-        </section>
+        {tab === "display" && (
+          <>
+            <section>
+              <SectionHeader>Home</SectionHeader>
+              <div className="divide-y divide-white/5">
+                <ToggleRow
+                  label="Show Top Songs"
+                  description="Display your most-played songs on the Home page"
+                  enabled={settings.showHomeTopSongs}
+                  onChange={handleShowHomeTopSongsChange}
+                />
+                <ToggleRow
+                  label="Show Today's Picks"
+                  description="Display personalized daily recommendations on the Home page"
+                  enabled={settings.showHomeTodaysPicks}
+                  onChange={handleShowHomeTodaysPicksChange}
+                />
+                <ToggleRow
+                  label="Show home menu"
+                  description={
+                    homeSectionsEnabled
+                      ? "Show the Home page in the sidebar and enable taste profile tracking"
+                      : "Enable Top Songs or Today's Picks to use the home menu"
+                  }
+                  enabled={settings.showHomeMenu}
+                  disabled={!homeSectionsEnabled}
+                  onChange={(v) => {
+                    if (!v) {
+                      _homeMenuEnabledBeforeSectionLock = false;
+                    }
+                    updateSetting("showHomeMenu", v);
+                  }}
+                />
+                <DangerButton
+                  label="Clear taste profile"
+                  description="Remove your listening history, top songs, and daily picks data"
+                  onClick={() => setConfirmAction("tasteProfile")}
+                />
+              </div>
+            </section>
 
-        <section>
-          <SectionHeader>Data Management</SectionHeader>
-          <div className="divide-y divide-white/5">
-            <DangerButton
-              label="Clear all configs"
-              description="Reset all settings to their defaults without removing your songs"
-              onClick={() => setConfirmAction("configs")}
-            />
-            <DangerButton
-              label="Clear all user data"
-              description="Factory reset — removes all local songs, configs, and preferences"
-              onClick={() => setConfirmAction("data")}
-            />
-          </div>
-        </section>
+            <section>
+              <SectionHeader>Lyrics &amp; Display</SectionHeader>
+              <div className="divide-y divide-white/5">
+                <ToggleRow
+                  label="Disable search bar on lyrics"
+                  description="Keep the search bar disabled on the lyrics page instead of revealing it on hover"
+                  enabled={settings.hideSearchOnLyrics}
+                  onChange={(v) => updateSetting("hideSearchOnLyrics", v)}
+                />
+                <ToggleRow
+                  label="Disable media player on lyrics"
+                  description="Keep the media player disabled on the lyrics page instead of revealing it on hover"
+                  enabled={settings.hidePlayerOnLyrics}
+                  onChange={(v) => updateSetting("hidePlayerOnLyrics", v)}
+                />
+                <ToggleRow
+                  label="Fade distant lyrics"
+                  description="Lyrics further from the active line become more transparent"
+                  enabled={settings.lyricsDistanceFade}
+                  onChange={(v) => updateSetting("lyricsDistanceFade", v)}
+                />
+              </div>
+            </section>
+          </>
+        )}
+
+        {tab === "storage" && (
+          <>
+            <section>
+              <SectionHeader>Offline</SectionHeader>
+              <div className="divide-y divide-white/5">
+                <ToggleRow
+                  label="Save songs for offline playback"
+                  description="When enabled, songs added to your collection are automatically downloaded for offline listening. Disabling will prompt to remove downloaded files."
+                  enabled={settings.offlineSync}
+                  onChange={(v) => {
+                    if (!v) {
+                      setConfirmAction("offline");
+                    } else {
+                      updateSetting("offlineSync", true);
+                    }
+                  }}
+                />
+              </div>
+            </section>
+
+            <section>
+              <SectionHeader>Data Management</SectionHeader>
+              <div className="divide-y divide-white/5">
+                <DangerButton
+                  label="Clear all configs"
+                  description="Reset all settings to their defaults without removing your songs"
+                  onClick={() => setConfirmAction("configs")}
+                />
+                <DangerButton
+                  label="Clear all user data"
+                  description="Factory reset — removes all local songs, configs, and preferences"
+                  onClick={() => setConfirmAction("data")}
+                />
+              </div>
+            </section>
+          </>
+        )}
       </div>
 
       <ConfirmDialog
@@ -421,6 +655,15 @@ export function SettingsPage() {
       />
 
       <ConfirmDialog
+        open={confirmAction === "tasteProfile"}
+        title="Clear taste profile?"
+        message="This will permanently delete your listening history, top songs, and daily picks. Your saved songs, playlists, and other settings will not be affected. This action cannot be undone."
+        confirmLabel="Clear profile"
+        onConfirm={handleClearTasteProfile}
+        onCancel={() => setConfirmAction(null)}
+      />
+
+      <ConfirmDialog
         open={confirmAction === "offline"}
         title="Disable offline sync?"
         message="Turning off offline sync will delete all downloaded songs from your local machine. Your saved songs in the collection will NOT be unsaved — only the local audio files will be removed. Locally uploaded songs are not affected."
@@ -435,11 +678,6 @@ export function SettingsPage() {
         }}
       />
 
-      <div className="mt-10 border-t border-white/8 pt-4 text-center">
-        <p className="text-xs font-medium tracking-[0.04em] text-neutral-500">
-          Velocity v0.0.2
-        </p>
-      </div>
     </div>
   );
 }

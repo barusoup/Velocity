@@ -8,20 +8,125 @@ export type ArtistNamePart =
   | { type: "text"; value: string }
   | { type: "name"; value: string };
 
+const COLLABORATION_SEPARATOR_PATTERN =
+  /(\s+(?:&|and|x|\+|with|ft\.?|feat\.?|featuring|vs\.?)\s+|\s*,\s*)/gi;
+
+function normalizeArtistToken(value: string): string {
+  return value.trim().replace(/\s+/g, " ").toLocaleLowerCase();
+}
+
+export function hasCollaborationSeparator(value: string): boolean {
+  return /\s(?:&|and|x|\+|with|ft\.?|feat\.?|featuring|vs\.?)\s/i.test(value) || /\s*,\s*/.test(value);
+}
+
+function shouldSplitComma(left: string, right: string, fullValue: string): boolean {
+  if (!left.trim() || !right.trim()) return false;
+  if (/^(the|la|le|el)\b/i.test(right.trim())) return false;
+
+  if (/\s(?:&|and|x|\+|with|ft\.?|feat\.?|featuring|vs\.?)\s/i.test(fullValue)) {
+    return true;
+  }
+
+  const leftTrim = left.trim();
+  const rightTrim = right.trim();
+  return /[a-zA-Z]/.test(leftTrim) && /[a-zA-Z]/.test(rightTrim);
+}
+
+function hasWhitespaceOnlyGap(parts: ArtistLinePart[]): boolean {
+  return parts.some(
+    (part, index) =>
+      part.type === "text" &&
+      !part.value.replace(/\s/g, "") &&
+      index > 0 &&
+      index < parts.length - 1 &&
+      parts[index - 1]?.type === "credit" &&
+      parts[index + 1]?.type === "credit",
+  );
+}
+
+function countMatchedCredits(parts: ArtistLinePart[] | null): number {
+  return parts?.filter((part) => part.type === "credit").length ?? 0;
+}
+
+function validCredits(artistCredits: ArtistCredit[]): ArtistCredit[] {
+  return artistCredits.filter((credit) => credit.name.trim() && credit.browseId.trim());
+}
+
+function findCreditPosition(artist: string, creditName: string): { index: number; length: number } | null {
+  const normalizedArtist = normalizeArtistToken(artist);
+  const normalizedName = normalizeArtistToken(creditName);
+  if (!normalizedName) return null;
+
+  const index = normalizedArtist.indexOf(normalizedName);
+  if (index === -1) return null;
+
+  let cursor = 0;
+  let normalizedCursor = 0;
+  while (normalizedCursor < index && cursor < artist.length) {
+    if (/\s/.test(artist[cursor]) && /\s/.test(normalizedArtist[normalizedCursor] ?? "")) {
+      while (cursor < artist.length && /\s/.test(artist[cursor])) cursor += 1;
+      normalizedCursor += 1;
+      continue;
+    }
+    cursor += 1;
+    normalizedCursor += 1;
+  }
+
+  let length = 0;
+  let matched = "";
+  while (matched.length < normalizedName.length && cursor + length < artist.length) {
+    length += 1;
+    matched = normalizeArtistToken(artist.slice(cursor, cursor + length));
+  }
+
+  if (matched !== normalizedName) return null;
+  return { index: cursor, length };
+}
+
+function artistNamesMatch(left: string, right: string): boolean {
+  const a = normalizeArtistToken(left);
+  const b = normalizeArtistToken(right);
+  return a === b || a.includes(b) || b.includes(a);
+}
+
+function findCreditForName(
+  name: string,
+  credits: ArtistCredit[],
+  usedBrowseIds: Set<string>,
+): ArtistCredit | null {
+  const trimmed = name.trim();
+  if (!trimmed) return null;
+
+  for (const credit of credits) {
+    if (usedBrowseIds.has(credit.browseId)) continue;
+    if (artistNamesMatch(credit.name, trimmed)) {
+      usedBrowseIds.add(credit.browseId);
+      return credit;
+    }
+  }
+
+  return null;
+}
+
 export function buildArtistLineParts(artist: string, artistCredits: ArtistCredit[]): ArtistLinePart[] | null {
-  const credits = artistCredits.filter((credit) => credit.name.trim() && credit.browseId.trim());
+  const credits = validCredits(artistCredits);
   if (credits.length === 0) return null;
 
-  const lowerArtist = artist.toLocaleLowerCase();
+  const positioned = credits
+    .map((credit) => {
+      const position = findCreditPosition(artist, credit.name);
+      return position ? { credit, ...position } : null;
+    })
+    .filter((entry): entry is { credit: ArtistCredit; index: number; length: number } => entry != null)
+    .sort((left, right) => left.index - right.index);
+
+  if (positioned.length === 0) return null;
+
   const parts: ArtistLinePart[] = [];
   let cursor = 0;
 
-  for (const credit of credits) {
-    const lowerName = credit.name.toLocaleLowerCase();
-    const index = lowerArtist.indexOf(lowerName, cursor);
-    if (index === -1) {
-      continue;
-    }
+  for (const { credit, index, length } of positioned) {
+    if (index < cursor) continue;
 
     if (index > cursor) {
       parts.push({ type: "text", value: artist.slice(cursor, index) });
@@ -29,11 +134,11 @@ export function buildArtistLineParts(artist: string, artistCredits: ArtistCredit
 
     parts.push({
       type: "credit",
-      value: artist.slice(index, index + credit.name.length),
+      value: artist.slice(index, index + length),
       credit,
     });
 
-    cursor = index + credit.name.length;
+    cursor = index + length;
   }
 
   if (cursor < artist.length) {
@@ -41,34 +146,9 @@ export function buildArtistLineParts(artist: string, artistCredits: ArtistCredit
   }
 
   if (!parts.some((part) => part.type === "credit")) return null;
-
-  // When credits are separated only by plain whitespace (no visible
-  // collaboration separator like "&", "feat.", etc.), the credits likely
-  // don't represent genuinely separate artists — e.g. "Atoms for Peace"
-  // split into ["Atoms", "for Peace"].  Fall back to a single-button
-  // rendering instead of producing a partial split.
-  const hasWhitespaceOnlyGap = parts.some(
-    (part, i) =>
-      part.type === "text" &&
-      !part.value.replace(/\s/g, "") &&
-      i > 0 &&
-      i < parts.length - 1 &&
-      parts[i - 1].type === "credit" &&
-      parts[i + 1]?.type === "credit",
-  );
-  if (hasWhitespaceOnlyGap) return null;
+  if (hasWhitespaceOnlyGap(parts)) return null;
 
   return parts;
-}
-
-function hasCollaborationSeparator(value: string): boolean {
-  return /\s(?:&|and|x|with|feat\.?|featuring)\s/i.test(value);
-}
-
-function shouldSplitComma(left: string, right: string, fullValue: string): boolean {
-  if (!hasCollaborationSeparator(fullValue)) return false;
-  if (!left.trim() || !right.trim()) return false;
-  return !/^(the|la|le|el)\b/i.test(right.trim());
 }
 
 export function buildArtistNameParts(artist: string): ArtistNamePart[] | null {
@@ -76,7 +156,7 @@ export function buildArtistNameParts(artist: string): ArtistNamePart[] | null {
   if (!trimmed || !hasCollaborationSeparator(trimmed)) return null;
 
   const parts: ArtistNamePart[] = [];
-  const separatorPattern = /(\s+(?:&|and|x|with|feat\.?|featuring)\s+|\s*,\s*)/gi;
+  const separatorPattern = new RegExp(COLLABORATION_SEPARATOR_PATTERN.source, COLLABORATION_SEPARATOR_PATTERN.flags);
   let cursor = 0;
   let match: RegExpExecArray | null;
 
@@ -108,4 +188,50 @@ export function buildArtistNameParts(artist: string): ArtistNamePart[] | null {
 
   const nameCount = parts.filter((part) => part.type === "name").length;
   return nameCount > 1 ? parts : null;
+}
+
+function buildArtistCreditPairedParts(artist: string, artistCredits: ArtistCredit[]): ArtistLinePart[] | null {
+  const credits = validCredits(artistCredits);
+  if (credits.length < 2) return null;
+
+  const nameParts = buildArtistNameParts(artist);
+  if (!nameParts) return null;
+
+  const usedBrowseIds = new Set<string>();
+  const result: ArtistLinePart[] = [];
+  let matchedCredits = 0;
+
+  for (const part of nameParts) {
+    if (part.type === "name") {
+      const credit = findCreditForName(part.value, credits, usedBrowseIds);
+      if (credit) {
+        result.push({ type: "credit", value: part.value, credit });
+        matchedCredits += 1;
+        continue;
+      }
+      result.push({ type: "text", value: part.value });
+      continue;
+    }
+
+    result.push(part);
+  }
+
+  return matchedCredits >= 2 ? result : null;
+}
+
+export function buildArtistDisplayParts(artist: string, artistCredits: ArtistCredit[]): ArtistLinePart[] | null {
+  const credits = validCredits(artistCredits);
+  if (credits.length === 0) return null;
+
+  const lineParts = buildArtistLineParts(artist, credits);
+  const pairedParts = buildArtistCreditPairedParts(artist, credits);
+
+  if (lineParts && pairedParts) {
+    const lineMatches = countMatchedCredits(lineParts);
+    const pairedMatches = countMatchedCredits(pairedParts);
+    if (pairedMatches > lineMatches) return pairedParts;
+    return lineParts;
+  }
+
+  return lineParts ?? pairedParts;
 }

@@ -10,15 +10,17 @@ import { relaunch } from "@tauri-apps/plugin-process";
 export async function checkForUpdateAndApply(): Promise<void> {
   try {
     const update: Update | null = await check();
-    if (!update?.available) return;
+    if (!update) return;
 
     // No UI — the spec is "check on startup, restart automatically, no user
     // action required." Download the signed bundle, verify its signature
     // (handled by the updater plugin against the embedded public key), install,
     // and relaunch. The user simply sees the window come back on the new build.
     await update.downloadAndInstall();
+    // Windows NSIS install exits the process before this returns.
     await relaunch();
-  } catch {
-    // Intentionally silent. Update failures must not degrade the music session.
+  } catch (error) {
+    // Keep failures out of the UI, but leave a breadcrumb for debugging.
+    console.warn("[updater] automatic update failed:", error);
   }
 }

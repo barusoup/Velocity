@@ -20,6 +20,8 @@ import {
   ListMusic,
   LoaderCircle,
   Menu,
+  Mic2,
+  Music2,
   Pause,
   Play,
   Plus,
@@ -28,8 +30,17 @@ import {
 } from "lucide-react";
 import { usePlayer } from "../player";
 import { useCollection } from "../collection";
-import { getEntityDetail, getTrackDuration, importTracks, searchMusic, updateImportedTrackMetadata, extractFileMetadata } from "../api";
-import { formatDuration, formatPlayCount, trimExtension } from "../utils/media";
+import { getArtistDetail, getEntityDetail, importTracks, updateImportedTrackMetadata, extractFileMetadata } from "../api";
+import {
+  resolveTrackAlbumMetadata,
+  resolveTrackMetadata,
+} from "../utils/track-metadata-backfill";
+import { formatDuration, formatPlayCount, isSameSongTrack, trimExtension } from "../utils/media";
+import {
+  displayAlbumName,
+  enrichUploadMetadataFromYtm,
+  isPlaceholderAlbumName,
+} from "../utils/upload-enrichment";
 import { cn } from "../utils/cn";
 import {
   getDirectAlbumBrowseId,
@@ -37,22 +48,31 @@ import {
   resolveAlbumBrowseId,
   resolveArtistBrowseId,
 } from "../utils/navigation";
-import { ArtworkImage, DefaultArtwork, getArtworkRoundedClass } from "./Shared";
+import {
+  ArtworkImage,
+  cardHoverPlayRevealClass,
+  cardHoverPlayTransitionClass,
+  DefaultArtwork,
+  getArtworkRoundedClass,
+} from "./Shared";
 import { SaveButton } from "./SaveButton";
 import { ArtistCreditText } from "./PagesShared";
 import { CoverImageCropper } from "./CoverImageCropper";
 import { ReleaseCard, type ReleaseItem } from "./ArtistPage";
-import type { MediaTrack, SearchItem } from "../types";
+import { Marquee } from "./Marquee";
+import { COLLECTION_TRACK_GRID } from "./TrackList";
+import type { MediaTrack } from "../types";
 import type { View } from "./Sidebar";
 import { useSetting, setSetting, type ViewMode } from "../settings";
 
 // -----------------------------------------------------------------------
 // CollectionPage — full implementation.
 //
-// Top of the page: a pill-style tab switcher (Albums / Songs / Local) on the
-// left, an Upload button on its right. The tab style mirrors the artist
-// Discography's filter/sort pill tags and the search filter popout: rounded
-// full + white fill on the active tab, hover lift on the rest.
+// Top of the page: a pill-style tab switcher (Albums / Songs / Artists /
+// Local) on the left, an Upload button on its right. The tab style mirrors
+// the artist Discography's filter/sort pill tags and the search filter
+// popout: rounded full + white fill on the active tab, hover lift on the
+// rest.
 //
 // Tabs:
 //   * Albums — card grid of saved albums. Tap a card to navigate to its
@@ -60,8 +80,10 @@ import { useSetting, setSetting, type ViewMode } from "../settings";
 //   * Songs — list of saved songs. Tap a row to play. Each row carries a
 //     SaveButton + the data-song-context-target marker so the global
 //     SongContextMenu can take over on right-click.
+//   * Artists — card grid of saved artists. Tap a card to open the artist
+//     page; hover play starts top tracks.
 //   * Local — list of locally uploaded tracks with a per-row remove
-//     button. Saved Albums and Songs state is persisted via the
+//     button. Saved Albums, Songs, and Artists state is persisted via the
 //     CollectionContext (localStorage); Local tracks are persisted via the
 //     backend's library.json.
 //
@@ -78,7 +100,7 @@ import { useSetting, setSetting, type ViewMode } from "../settings";
 //     "Cancel" drops the batch.
 // -------------------------------------------------------------------------
 
-type CollectionTab = "albums" | "songs" | "local";
+type CollectionTab = "albums" | "songs" | "artists" | "local";
 
 type CollectionPageProps = {
   uploadedTracks: MediaTrack[];
@@ -161,6 +183,7 @@ export function CollectionPage(props: CollectionPageProps) {
   const tabRefs = useRef<Record<CollectionTab, HTMLButtonElement | null>>({
     albums: null,
     songs: null,
+    artists: null,
     local: null,
   });
   const tabContainerRef = useRef<HTMLDivElement | null>(null);
@@ -324,19 +347,35 @@ export function CollectionPage(props: CollectionPageProps) {
 
       for (let i = 0; i < stored.length; i++) {
         const row = pendingRows[nonEmptyIndices[i]];
-        const needsMetadata =
-          row.artist.trim().length > 0 || row.album.trim().length > 0;
-        if ((needsMetadata || row.findLyrics) && stored[i]) {
-          try {
-            await updateImportedTrackMetadata(stored[i].id, {
-              title: row.title,
-              artist: row.artist.trim() || undefined,
-              album: row.album.trim() || undefined,
-              findLyrics: row.findLyrics || undefined,
-            });
-          } catch {
-            // best-effort
+        const storedTrack = stored[i];
+        if (!storedTrack) continue;
+
+        let artist = row.artist.trim() || storedTrack.artist;
+        let album = row.album.trim() || displayAlbumName(storedTrack.album);
+
+        try {
+          const enrichment = await enrichUploadMetadataFromYtm({
+            title: row.title || storedTrack.title,
+            artist,
+            album,
+          });
+          if (enrichment?.artist && !row.artist.trim()) artist = enrichment.artist;
+          if (enrichment?.album && (!album || isPlaceholderAlbumName(album))) {
+            album = enrichment.album;
           }
+        } catch {
+          // best-effort
+        }
+
+        try {
+          await updateImportedTrackMetadata(storedTrack.id, {
+            title: row.title,
+            artist: artist || undefined,
+            album: album || undefined,
+            findLyrics: row.findLyrics || undefined,
+          });
+        } catch {
+          // best-effort
         }
       }
       await props.onImportsChanged();
@@ -387,6 +426,13 @@ export function CollectionPage(props: CollectionPageProps) {
             icon={<ListMusic size={16} strokeWidth={1.8} />}
           />
           <CollectionTabButton
+            ref={(el) => { tabRefs.current.artists = el; }}
+            label="Artists"
+            active={tab === "artists"}
+            onClick={() => handleTabClick("artists")}
+            icon={<Mic2 size={16} strokeWidth={1.8} />}
+          />
+          <CollectionTabButton
             ref={(el) => { tabRefs.current.local = el; }}
             label="Local"
             active={tab === "local"}
@@ -414,7 +460,12 @@ export function CollectionPage(props: CollectionPageProps) {
       {tab === "songs" && (
         <SavedSongsList
           songs={collection.savedSongs}
-          onPlayTrack={props.onPlayTrack}
+          onNavigate={props.onNavigate}
+        />
+      )}
+      {tab === "artists" && (
+        <SavedArtistsGrid
+          artists={collection.savedArtists}
           onNavigate={props.onNavigate}
         />
       )}
@@ -598,6 +649,16 @@ function SavedAlbumsGrid({
                       artistBrowseId={album.artistBrowseId}
                       context="default"
                       onNavigate={onNavigate}
+                      onResolveNavigate={
+                        album.artistBrowseId
+                          ? null
+                          : () => {
+                              void resolveArtistBrowseId({ artist: album.byline ?? undefined }).then((browseId) => {
+                                if (!browseId) return;
+                                onNavigate({ name: "artist", browseId, context: "default" });
+                              });
+                            }
+                      }
                       onResolveArtistName={handleResolveArtistName}
                     />
                   </>
@@ -611,16 +672,153 @@ function SavedAlbumsGrid({
   );
 }
 
+function SavedArtistsGrid({
+  artists,
+  onNavigate,
+}: {
+  artists: Array<{
+    browseId: string;
+    title: string;
+    cover?: string | null;
+    banner?: string | null;
+    monthlyListeners?: string | null;
+  }>;
+  onNavigate: (view: View) => void;
+}) {
+  const player = usePlayer();
+
+  const handlePlayArtist = useCallback(
+    (browseId: string) => {
+      void getArtistDetail(browseId).then((artist) => {
+        if (artist.topSongs.length === 0) return;
+        const tracks = artist.topSongs.map((track) => ({
+          ...track,
+          artistBrowseId: browseId,
+        }));
+        void player.playMany(tracks, 0, { kind: "artist", browseId });
+      });
+    },
+    [player],
+  );
+
+  if (artists.length === 0) {
+    return (
+      <CollectionEmpty
+        title="No saved artists yet"
+        description="Open an artist and tap the plus icon next to the shuffle button to save them here."
+      />
+    );
+  }
+
+  return (
+    <div className="grid gap-2 grid-cols-2 sm:grid-cols-3 md:grid-cols-4 xl:grid-cols-6">
+      {artists.map((artist) => (
+        <SavedArtistCard
+          key={artist.browseId}
+          artist={artist}
+          onOpen={() =>
+            onNavigate({
+              name: "artist",
+              browseId: artist.browseId,
+              context: "default",
+              cover: artist.cover,
+            })
+          }
+          onPlay={() => handlePlayArtist(artist.browseId)}
+        />
+      ))}
+    </div>
+  );
+}
+
+function SavedArtistCard({
+  artist,
+  onOpen,
+  onPlay,
+}: {
+  artist: {
+    browseId: string;
+    title: string;
+    cover?: string | null;
+    monthlyListeners?: string | null;
+  };
+  onOpen: () => void;
+  onPlay: () => void;
+}) {
+  const player = usePlayer();
+  const isArtistActive =
+    player.queueOrigin?.kind === "artist" &&
+    player.queueOrigin.browseId === artist.browseId &&
+    player.currentTrack?.artistBrowseId === artist.browseId;
+  const playing = isArtistActive && player.isPlaying;
+  const buffering = isArtistActive && player.isBuffering;
+
+  return (
+    <div
+      role="button"
+      tabIndex={0}
+      onClick={onOpen}
+      onKeyDown={(event) => {
+        if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault();
+          onOpen();
+        }
+      }}
+      className="group block w-full min-w-0 cursor-pointer rounded-md p-1 text-left transition-colors hover:bg-white/[0.055] focus-visible:outline-none animate-none"
+    >
+      <div className="relative aspect-square">
+        <div
+          className={`h-full w-full overflow-hidden bg-neutral-900 shadow-[0_8px_22px_rgba(0,0,0,0.32)] ${getArtworkRoundedClass("circle")}`}
+        >
+          {artist.cover ? (
+            <ArtworkImage src={artist.cover} className="h-full w-full object-cover" />
+          ) : (
+            <div className="flex h-full w-full items-center justify-center text-white/30">
+              <Music2 size={22} />
+            </div>
+          )}
+        </div>
+        <button
+          type="button"
+          onClick={(event) => {
+            event.stopPropagation();
+            if (isArtistActive) {
+              player.togglePlay();
+            } else {
+              onPlay();
+            }
+          }}
+          className={`absolute bottom-0.5 right-0.5 z-10 flex h-14 w-14 items-center justify-center rounded-full bg-white text-black shadow-lg ${cardHoverPlayTransitionClass} ${cardHoverPlayRevealClass()}`}
+          aria-label={buffering ? "Loading" : playing ? "Pause artist" : "Play artist"}
+        >
+          {buffering ? (
+            <LoaderCircle size={24} className="animate-spin" />
+          ) : playing ? (
+            <Pause size={24} fill="currentColor" strokeWidth={0} />
+          ) : (
+            <Play size={24} fill="currentColor" strokeWidth={0} className="translate-x-[1.5px]" />
+          )}
+        </button>
+      </div>
+      <div className="mt-2 min-w-0">
+        <Marquee className="text-[15px] font-semibold text-white/92">{artist.title}</Marquee>
+        {artist.monthlyListeners && (
+          <div className="mt-0.5 truncate text-[12px] text-white/50">{artist.monthlyListeners}</div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function SavedSongsList({
   songs,
-  onPlayTrack,
   onNavigate,
 }: {
   songs: MediaTrack[];
-  onPlayTrack: (track: MediaTrack) => void;
   onNavigate: (view: View) => void;
 }) {
   const collection = useCollection();
+  const player = usePlayer();
   const viewMode = useSetting("viewModeCollectionSongs");
   const [viewMenuOpen, setViewMenuOpen] = useState(false);
   const viewMenuScopeRef = useRef<HTMLDivElement | null>(null);
@@ -651,10 +849,14 @@ function SavedSongsList({
   );
 
   useEffect(() => {
-    const missing = songs.filter(
-      (t) =>
-        (t.durationSeconds == null || t.playCount == null) && !!t.videoId,
-    );
+    const missing = songs.filter((track) => {
+      if (!track.videoId) return false;
+      const needsDuration = track.durationSeconds == null;
+      const needsPlayCount = track.playCount == null;
+      const needsAlbum = isPlaceholderAlbumName(track.album);
+      const needsAlbumBrowseId = !track.albumBrowseId?.trim();
+      return needsDuration || needsPlayCount || needsAlbum || needsAlbumBrowseId;
+    });
     if (missing.length === 0) return;
 
     const controller = new AbortController();
@@ -672,65 +874,24 @@ function SavedSongsList({
           try {
             const needsDuration = track.durationSeconds == null;
             const needsPlayCount = track.playCount == null;
+            const needsAlbum = isPlaceholderAlbumName(track.album);
+            const needsAlbumBrowseId = !track.albumBrowseId?.trim();
 
-            let duration: number | null = track.durationSeconds ?? null;
-            let playCount: string | null = track.playCount ?? null;
+            const metadataUpdates = needsDuration || needsPlayCount
+              ? await resolveTrackMetadata(track, { needsDuration, needsPlayCount })
+              : null;
+            const albumUpdates = needsAlbum || needsAlbumBrowseId
+              ? await resolveTrackAlbumMetadata(track)
+              : null;
 
-            // Cheapest path: getTrackDuration only returns a duration, so
-            // skip it when we're solely missing the play count.
-            if (needsDuration) {
-              duration = await getTrackDuration(track.videoId);
-            }
+            const merged = {
+              ...(metadataUpdates ?? {}),
+              ...(albumUpdates ?? {}),
+            };
+            if (Object.keys(merged).length === 0) continue;
 
-            // If we still need the duration OR the play count, fall back to
-            // the album entity detail, which carries both fields per track.
-            if ((duration == null && needsDuration) || (playCount == null && needsPlayCount)) {
-              if (track.albumBrowseId) {
-                const entity = await getEntityDetail(track.albumBrowseId);
-                const match = entity.tracks.find(
-                  (t) => t.title === track.title && t.artist === track.artist,
-                );
-                if (match) {
-                  if (duration == null) duration = match.durationSeconds ?? null;
-                  if (playCount == null) playCount = match.playCount ?? null;
-                }
-              }
-            }
-
-            // Final fallback: search for the track. Search items also
-            // carry play counts, so we can extract whichever field is
-            // still missing.
-            if ((duration == null && needsDuration) || (playCount == null && needsPlayCount)) {
-              if (track.title) {
-                const query = [track.title, track.artist].filter(Boolean).join(" ");
-                if (query) {
-                  const response = await searchMusic(query);
-                  const items = [response.topResult, ...response.results].filter(Boolean) as SearchItem[];
-                  const match = items.find(
-                    (item) => item.kind === "song" && item.videoId === track.videoId,
-                  ) ?? items.find(
-                    (item) => item.kind === "song" && item.title === track.title && item.artist === track.artist,
-                  );
-                  if (match) {
-                    if (duration == null && match.durationSeconds != null) {
-                      duration = match.durationSeconds;
-                    }
-                    if (playCount == null) playCount = match.playCount ?? null;
-                  }
-                }
-              }
-            }
-
-            let updated = false;
-            if (needsDuration && duration != null) {
-              collection.updateSongMetadata(track.id, { durationSeconds: duration });
-              updated = true;
-            }
-            if (needsPlayCount && playCount != null) {
-              collection.updateSongMetadata(track.id, { playCount });
-              updated = true;
-            }
-            if (updated) anyFetched = true;
+            collection.updateSongMetadata(track.id, merged);
+            anyFetched = true;
           } catch {
             // transient — retry
           }
@@ -801,10 +962,15 @@ function SavedSongsList({
             : `Total ${formatDuration(totalSeconds)}`}
         </span>
       </div>
-      <div className="grid grid-cols-[2.25rem_minmax(0,1fr)_minmax(5rem,8rem)_3.5rem_4rem] items-center gap-3 px-3 pb-1 text-xs text-neutral-500">
+      <div
+        className={cn(
+          "grid items-center gap-3 px-3 pb-1 text-xs text-neutral-500",
+          COLLECTION_TRACK_GRID,
+        )}
+      >
         <div />
         <div />
-        <div className="-ml-32 hidden sm:block">Album</div>
+        <div className="-ml-1 hidden sm:block">Album</div>
         <div className="hidden items-center justify-end sm:flex">Plays</div>
         <div className="flex items-center justify-end">
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="8.5" /><path d="M12 8.3v4.2" /></svg>
@@ -816,7 +982,12 @@ function SavedSongsList({
           track={track}
           index={index}
           compact={viewMode === "compact"}
-          onPlay={() => onPlayTrack(track)}
+          onPlay={() => {
+            const playable = songs.map((song) =>
+              song.kind === "video" ? { ...song, kind: "song" as const } : song,
+            );
+            void player.playMany(playable, index);
+          }}
           onNavigate={onNavigate}
         />
       ))}
@@ -915,10 +1086,15 @@ function LocalUploadsList({
             : `Total ${formatDuration(totalSeconds)}`}
         </span>
       </div>
-      <div className="grid grid-cols-[2.25rem_minmax(0,1fr)_minmax(5rem,8rem)_3.5rem_4rem] items-center gap-3 px-3 pb-1 text-xs text-neutral-500">
+      <div
+        className={cn(
+          "grid items-center gap-3 px-3 pb-1 text-xs text-neutral-500",
+          COLLECTION_TRACK_GRID,
+        )}
+      >
         <div />
         <div />
-        <div className="-ml-32 hidden sm:block">Album</div>
+        <div className="-ml-1 hidden sm:block">Album</div>
         <div />
         <div className="flex items-center justify-end">
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="8.5" /><path d="M12 8.3v4.2" /></svg>
@@ -958,12 +1134,13 @@ function CollectionRowShell({
   index?: number;
 }) {
   const { currentTrack, isPlaying, isBuffering, togglePlay } = usePlayer();
-  const active = isTrackActive(currentTrack, track);
+  const active = isSameSongTrack(currentTrack, track);
   const playingActive = active && isPlaying;
   const bufferingActive = active && isBuffering;
 
   const directAlbumBrowseId = getDirectAlbumBrowseId(track);
-  const canNavigateToAlbum = Boolean(directAlbumBrowseId || track.videoId || track.album?.trim());
+  const albumLabel = displayAlbumName(track.album);
+  const canNavigateToAlbum = Boolean(directAlbumBrowseId || track.videoId || albumLabel);
 
   const handleNavigateToAlbum = useCallback(() => {
     if (directAlbumBrowseId) {
@@ -1017,11 +1194,12 @@ function CollectionRowShell({
       data-track={withContextTarget ? JSON.stringify(stripTrackForContextMenu(track)) : undefined}
       data-track-source={withContextTarget ? (track.source ?? "stream") : undefined}
       role="row"
-      className={`collection-row group grid cursor-pointer ${
-        compact
-          ? "grid-cols-[2.25rem_minmax(0,1fr)_minmax(5rem,8rem)_3.5rem_4rem] py-1.5"
-          : "grid-cols-[2.25rem_minmax(0,1fr)_minmax(5rem,8rem)_3.5rem_4rem] py-2"
-      } items-center gap-3 rounded-lg px-3 text-sm hover:bg-neutral-900 ${active ? "bg-neutral-900/70" : ""}`}
+      className={cn(
+        "collection-row group grid cursor-pointer items-center gap-3 rounded-lg px-3 text-sm hover:bg-neutral-900",
+        COLLECTION_TRACK_GRID,
+        compact ? "py-1.5" : "py-2",
+        active && "bg-neutral-900/70",
+      )}
       onClick={active ? togglePlay : onPlay}
     >
       {compact ? (
@@ -1074,33 +1252,35 @@ function CollectionRowShell({
       )}
       {compact ? (
         <div className="flex min-w-0 items-center gap-2 self-center">
-          {canNavigateToAlbum ? (
-            <button
-              type="button"
-              onClick={(event) => {
-                event.stopPropagation();
-                handleNavigateToAlbum();
-              }}
-              className="min-w-0 truncate text-left text-[15px] font-semibold text-white transition hover:text-white/85 focus-visible:outline-none"
-            >
-              {track.title}
-            </button>
-          ) : track.source === "upload" ? (
-            <button
-              type="button"
-              onClick={(event) => {
-                event.stopPropagation();
-                handleNavigateToLocal();
-              }}
-              className="min-w-0 truncate text-left text-[15px] font-semibold text-white transition hover:text-white/85 focus-visible:outline-none"
-            >
-              {track.title}
-            </button>
-          ) : (
-            <span className="min-w-0 truncate text-[15px] font-semibold text-white">{track.title}</span>
-          )}
-          <span className="text-neutral-600" aria-hidden="true">•</span>
-          <div className="min-w-0 truncate text-sm text-neutral-400">
+          <div className="min-w-0 flex-1 overflow-hidden">
+            {canNavigateToAlbum ? (
+              <button
+                type="button"
+                onClick={(event) => {
+                  event.stopPropagation();
+                  handleNavigateToAlbum();
+                }}
+                className="block w-full text-left text-[15px] font-semibold text-white transition hover:text-white/85 focus-visible:outline-none"
+              >
+                <Marquee className="text-[15px] font-semibold text-inherit">{track.title}</Marquee>
+              </button>
+            ) : track.source === "upload" ? (
+              <button
+                type="button"
+                onClick={(event) => {
+                  event.stopPropagation();
+                  handleNavigateToLocal();
+                }}
+                className="block w-full text-left text-[15px] font-semibold text-white transition hover:text-white/85 focus-visible:outline-none"
+              >
+                <Marquee className="text-[15px] font-semibold text-inherit">{track.title}</Marquee>
+              </button>
+            ) : (
+              <Marquee className="text-[15px] font-semibold text-white">{track.title}</Marquee>
+            )}
+          </div>
+          <span className="shrink-0 text-neutral-600" aria-hidden="true">•</span>
+          <div className="min-w-0 max-w-[42%] shrink truncate text-sm text-neutral-400">
             <ArtistCreditText
               artist={track.artist || "\u2014"}
               artistBrowseId={track.artistBrowseId}
@@ -1134,9 +1314,9 @@ function CollectionRowShell({
                   event.stopPropagation();
                   handleNavigateToAlbum();
                 }}
-                className="block w-full truncate text-left text-[15px] font-semibold text-white transition hover:text-white/85 focus-visible:outline-none"
+                className="block w-full text-left text-[15px] font-semibold text-white transition hover:text-white/85 focus-visible:outline-none"
               >
-                {track.title}
+                <Marquee className="text-[15px] font-semibold text-inherit">{track.title}</Marquee>
               </button>
             ) : track.source === "upload" ? (
               <button
@@ -1145,12 +1325,12 @@ function CollectionRowShell({
                   event.stopPropagation();
                   handleNavigateToLocal();
                 }}
-                className="block w-full truncate text-left text-[15px] font-semibold text-white transition hover:text-white/85 focus-visible:outline-none"
+                className="block w-full text-left text-[15px] font-semibold text-white transition hover:text-white/85 focus-visible:outline-none"
               >
-                {track.title}
+                <Marquee className="text-[15px] font-semibold text-inherit">{track.title}</Marquee>
               </button>
             ) : (
-              <div className="truncate text-[15px] font-semibold text-white">{track.title}</div>
+              <Marquee className="text-[15px] font-semibold text-white">{track.title}</Marquee>
             )}
             <div className="truncate text-xs text-neutral-400">
               <ArtistCreditText
@@ -1165,7 +1345,10 @@ function CollectionRowShell({
             </div>
           </div>
           {withContextTarget && onToggleSave && track.source !== "upload" && (
-            <div className="shrink-0 invisible group-hover:visible opacity-0 group-hover:opacity-100 transition-all" onClick={(e) => e.stopPropagation()}>
+            <div
+              className="shrink-0 invisible group-hover:visible opacity-0 group-hover:opacity-100 transition-all"
+              onClick={(e) => e.stopPropagation()}
+            >
               <SaveButton
                 isSaved={isSaved ?? true}
                 size="sm"
@@ -1176,22 +1359,26 @@ function CollectionRowShell({
           )}
         </div>
       )}
-      {canNavigateToAlbum ? (
-        <button
-          type="button"
-          onClick={(event) => {
-            event.stopPropagation();
-            handleNavigateToAlbum();
-          }}
-          className="-ml-32 hidden min-w-0 truncate text-left text-sm text-neutral-400 transition hover:text-white/85 focus-visible:outline-none sm:block"
-        >
-          {track.album ?? ""}
-        </button>
-      ) : (
-        <div className="-ml-32 hidden min-w-0 truncate text-sm text-neutral-400 sm:block">
-          {track.album ?? ""}
-        </div>
-      )}
+      <div className="relative -ml-1 hidden min-w-0 self-center sm:block">
+        {canNavigateToAlbum && albumLabel ? (
+          <Marquee className="text-sm text-neutral-400">
+            <button
+              type="button"
+              onClick={(event) => {
+                event.stopPropagation();
+                handleNavigateToAlbum();
+              }}
+              className="text-left transition hover:text-white/85 focus-visible:outline-none animate-none"
+            >
+              {albumLabel}
+            </button>
+          </Marquee>
+        ) : (
+          <Marquee className="text-sm text-neutral-400">
+            <span>{albumLabel || "\u2014"}</span>
+          </Marquee>
+        )}
+      </div>
       <div className="hidden items-center justify-end text-xs tabular-nums text-neutral-400 sm:flex">
         {formatPlayCount(track.playCount)}
       </div>
@@ -1224,7 +1411,7 @@ function CollectionSongRow({
       withContextTarget
       compact={compact}
       index={index}
-      isSaved={collection.isSongSaved(track.id)}
+      isSaved={collection.isTrackSaved(track)}
       onToggleSave={() => collection.toggleSong(track)}
     />
   );
@@ -1252,7 +1439,7 @@ function LocalTrackRow({
       withContextTarget
       compact={compact}
       index={index}
-      isSaved={collection.isSongSaved(track.id)}
+      isSaved={collection.isTrackSaved(track)}
     />
   );
 }
@@ -1309,6 +1496,16 @@ async function buildPendingRow(
 
   if (!title) title = deriveTitleFromFilename(file.name);
   if (!artist) artist = deriveArtistFromFilename(file.name);
+
+  if (title && artist && (!album || isPlaceholderAlbumName(album))) {
+    try {
+      const enrichment = await enrichUploadMetadataFromYtm({ title, artist, album });
+      if (enrichment?.artist && !artist) artist = enrichment.artist;
+      if (enrichment?.album) album = enrichment.album;
+    } catch {
+      // best-effort
+    }
+  }
 
   // Sibling cover detection: only when the picker was opened in directory
   // mode does `webkitRelativePath` populate, which lets us find sibling
@@ -1378,18 +1575,6 @@ function formatRowDuration(seconds?: number | null): string {
   const mins = Math.floor(seconds / 60);
   const secs = Math.floor(seconds % 60).toString().padStart(2, "0");
   return `${mins}:${secs}`;
-}
-
-function isTrackActive(currentTrack: MediaTrack | null, track: MediaTrack): boolean {
-  if (!currentTrack) return false;
-  // Match by videoId for stream tracks, or by id for uploads. The
-  // albumBrowseId check is removed because resolveTrackAudio preserves
-  // the original videoId for identity while using resolvedVideoId for
-  // streaming — so the videoId is a stable identity key.
-  if (currentTrack.videoId && track.videoId) {
-    return currentTrack.videoId === track.videoId;
-  }
-  return currentTrack.id === track.id;
 }
 
 function ImportMetadataModal({

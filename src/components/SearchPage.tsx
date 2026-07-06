@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { LoaderCircle, Pause, Play, Search as SearchIcon } from "lucide-react";
 import { searchMusic, peekSearchMusic, getSyncedLyrics } from "../api";
 import { usePlayer } from "../player";
-import { useCollection } from "../collection";
+import { useCollection, type SavedAlbum, type SavedArtist } from "../collection";
 import type { MediaTrack, SearchItem, SearchResponse } from "../types";
 import { ArtworkImage, encodeTrackForContextMenu, getArtworkRoundedClass } from "./Shared";
 import { SaveButton } from "./SaveButton";
@@ -17,6 +17,8 @@ import {
   SearchItemMeta,
   toTrack,
 } from "./PagesShared";
+import { getSearchItemArtist } from "../utils/search";
+import { Marquee } from "./Marquee";
 
 export function SearchPage({
   query,
@@ -128,7 +130,7 @@ export function SearchPage({
       if (!items.some((existing) => existing.id === item.id)) items.push(item);
     }
     for (const item of items) {
-      if (item.kind !== "song" && item.kind !== "video") continue;
+      if (item.kind !== "song") continue;
       if (!item.videoId) continue;
       void getSyncedLyrics(item.videoId).catch(() => {});
     }
@@ -148,40 +150,16 @@ export function SearchPage({
   const hasUnfilteredResults = Boolean(top || results.length);
   const hasFilteredResults = Boolean(filteredTop || filteredResults.length);
 
-  // Build a flat list of all playable songs (in display order) so clicking
-  // any song in search results queues all songs from that position onward,
-  // mirroring Spotify's behavior.
-  const allSongItems = useMemo(() => {
-    const songs: SearchItem[] = [];
-    const seen = new Set<string>();
-    if (filteredTop && filteredTop.kind === "song" && filteredTop.videoId) {
-      songs.push(filteredTop);
-      seen.add(filteredTop.id);
-    }
-    for (const item of filteredResults) {
-      if (item.kind !== "song" || !item.videoId) continue;
-      if (seen.has(item.id)) continue;
-      songs.push(item);
-      seen.add(item.id);
-    }
-    return songs;
-  }, [filteredTop, filteredResults]);
-  const songTracks = useMemo(
-    () => allSongItems.map(toTrack).filter((t): t is MediaTrack => t !== null),
-    [allSongItems],
-  );
   const getSongPlayHandler = useCallback(
     (item: SearchItem): (() => void) | undefined => {
-      const idx = allSongItems.findIndex((s) => s.id === item.id);
-      if (idx === -1) return undefined;
       const track = toTrack(item);
       if (!track) return undefined;
-      if (songTracks.length > 1 && idx < songTracks.length) {
-        return () => onPlayMany(songTracks, idx);
-      }
+      // Play only the clicked result; autoplay fills the queue. Queuing every
+      // song-shaped search hit (covers, live cuts, remixes) looked like manual
+      // "Up next" entries and drowned out real autoplay.
       return () => onPlayTrack(track);
     },
-    [allSongItems, songTracks, onPlayMany, onPlayTrack],
+    [onPlayTrack],
   );
 
   if (!query.trim()) {
@@ -258,6 +236,7 @@ function applySearchFilters(items: SearchItem[], filters: SearchFilters): Search
 }
 
 function passesSearchFilters(item: SearchItem, filters: SearchFilters): boolean {
+  if (item.kind === "video") return false;
   if (!filters.types.includes(item.kind as "artist" | "album" | "song")) return false;
   return true;
 }
@@ -295,6 +274,7 @@ function TopResultBlock({
 }) {
   const rounded = getArtworkRoundedClass(item.kind === "artist" ? "circle" : "square");
   const titleView = getSearchItemTitleView(item);
+  const collection = useCollection();
 
   const { currentTrack, isPlaying, isBuffering, togglePlay, queueOrigin } = usePlayer();
   const active = isItemPlaying(item, currentTrack, isPlaying, queueOrigin);
@@ -302,7 +282,7 @@ function TopResultBlock({
   const bufferingActive = active && isBuffering;
 
   const contextTrack = useMemo(() => {
-    if (item.kind !== "song" && item.kind !== "video") return null;
+    if (item.kind !== "song") return null;
     const track = toTrack(item);
     if (!track) return null;
     return encodeTrackForContextMenu(track);
@@ -320,6 +300,10 @@ function TopResultBlock({
       artistBrowseId: item.artistBrowseId,
     });
   }, [item]);
+
+  const saveTrack = useMemo(() => toSaveableTrack(item), [item]);
+  const savedAlbum = useMemo(() => toSavedAlbum(item), [item]);
+  const savedArtist = useMemo(() => toSavedArtist(item), [item]);
 
   return (
     <div
@@ -362,20 +346,31 @@ function TopResultBlock({
             }
           }}
         >
-          {titleView ? (
-            <button
-              type="button"
-              onClick={(event) => {
-                event.stopPropagation();
-                onNavigate(titleView);
-              }}
-              className="truncate text-left text-[clamp(1.2rem,2.4vw,1.55rem)] font-bold tracking-tight text-white transition hover:text-white/95 focus-visible:outline-none"
-            >
-              {item.title}
-            </button>
-          ) : (
-            <div className="truncate text-[clamp(1.2rem,2.4vw,1.55rem)] font-bold tracking-tight text-white">{item.title}</div>
-          )}
+          <div className="flex w-max max-w-full min-w-0 items-center gap-2">
+            <div className="min-w-0 shrink overflow-hidden leading-tight">
+              {titleView ? (
+                <button
+                  type="button"
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    onNavigate(titleView);
+                  }}
+                  className="block w-full text-left text-[clamp(1.2rem,2.4vw,1.55rem)] font-bold leading-tight tracking-tight text-white transition hover:text-white/95 focus-visible:outline-none"
+                >
+                  <Marquee className="text-[clamp(1.2rem,2.4vw,1.55rem)] font-bold leading-tight tracking-tight text-inherit">{item.title}</Marquee>
+                </button>
+              ) : (
+                <Marquee className="text-[clamp(1.2rem,2.4vw,1.55rem)] font-bold leading-tight tracking-tight text-white">{item.title}</Marquee>
+              )}
+            </div>
+            <SearchItemSaveButtons
+              collection={collection}
+              saveTrack={saveTrack}
+              savedAlbum={savedAlbum}
+              savedArtist={savedArtist}
+              titleInline
+            />
+          </div>
           <div className="mt-1 text-sm text-neutral-400 sm:text-base">
             <SearchItemMeta item={item} onNavigate={onNavigate} />
           </div>
@@ -426,7 +421,7 @@ function SearchResultRow({
   const bufferingActive = active && isBuffering;
 
   const contextTrack = useMemo(() => {
-    if (item.kind !== "song" && item.kind !== "video") return null;
+    if (item.kind !== "song") return null;
     const track = toTrack(item);
     if (!track) return null;
     return encodeTrackForContextMenu(track);
@@ -445,10 +440,9 @@ function SearchResultRow({
     });
   }, [item]);
 
-  const saveTrack = useMemo(() => {
-    if (item.kind !== "song" && item.kind !== "video") return null;
-    return toTrack(item);
-  }, [item]);
+  const saveTrack = useMemo(() => toSaveableTrack(item), [item]);
+  const savedAlbum = useMemo(() => toSavedAlbum(item), [item]);
+  const savedArtist = useMemo(() => toSavedArtist(item), [item]);
 
   return (
     <div
@@ -495,31 +489,25 @@ function SearchResultRow({
               event.stopPropagation();
               onNavigate(titleView);
             }}
-            className="truncate text-left text-lg font-semibold text-white transition hover:text-white/95 focus-visible:outline-none"
+            className="text-left text-lg font-semibold text-white transition hover:text-white/95 focus-visible:outline-none"
           >
-            {item.title}
+            <Marquee className="text-lg font-semibold text-inherit">{item.title}</Marquee>
           </button>
         ) : (
-          <div className="truncate text-lg font-semibold text-white">{item.title}</div>
+          <Marquee className="text-lg font-semibold text-white">{item.title}</Marquee>
         )}
         <div className="truncate text-sm text-neutral-400">
           <SearchItemMeta item={item} onNavigate={onNavigate} />
         </div>
       </div>
 
-      {saveTrack && saveTrack.source !== "upload" && (
-        <div
-          className="shrink-0 invisible group-hover:visible opacity-0 group-hover:opacity-100 transition-all"
-          onClick={(event) => event.stopPropagation()}
-        >
-          <SaveButton
-            isSaved={collection.isSongSaved(saveTrack.id)}
-            size="sm"
-            onToggle={() => collection.toggleSong(saveTrack)}
-            ariaLabel={collection.isSongSaved(saveTrack.id) ? "Remove from collection" : "Save to collection"}
-          />
-        </div>
-      )}
+      <SearchItemSaveButtons
+        collection={collection}
+        saveTrack={saveTrack}
+        savedAlbum={savedAlbum}
+        savedArtist={savedArtist}
+        hoverReveal
+      />
 
       {onPlay && (
         <button
@@ -544,4 +532,142 @@ function SearchResultRow({
       )}
     </div>
   );
+}
+
+function SearchItemSaveButtons({
+  collection,
+  saveTrack,
+  savedAlbum,
+  savedArtist,
+  hoverReveal = false,
+  titleInline = false,
+}: {
+  collection: ReturnType<typeof useCollection>;
+  saveTrack: MediaTrack | null;
+  savedAlbum: SavedAlbum | null;
+  savedArtist: SavedArtist | null;
+  hoverReveal?: boolean;
+  /** Top-result title row: keep the icon vertically centered on the name line. */
+  titleInline?: boolean;
+}) {
+  const revealClass = hoverReveal
+    ? "shrink-0 invisible group-hover:visible opacity-0 group-hover:opacity-100 transition-all"
+    : titleInline
+      ? "flex shrink-0 items-center"
+      : "shrink-0";
+  const buttonSize = hoverReveal ? "sm" : titleInline ? "md" : undefined;
+
+  return (
+    <>
+      {saveTrack && saveTrack.source !== "upload" && (
+        <div className={revealClass} onClick={(event) => event.stopPropagation()}>
+          <SaveButton
+            isSaved={collection.isSongSaved(saveTrack.id, saveTrack.videoId)}
+            size={buttonSize}
+            onToggle={() => collection.toggleSong(saveTrack)}
+            ariaLabel={
+              collection.isSongSaved(saveTrack.id, saveTrack.videoId)
+                ? "Remove from collection"
+                : "Save to collection"
+            }
+          />
+        </div>
+      )}
+
+      {savedAlbum && (
+        <div className={revealClass} onClick={(event) => event.stopPropagation()}>
+          <SaveButton
+            isSaved={collection.isAlbumSaved(savedAlbum.browseId)}
+            size={buttonSize}
+            onToggle={() => collection.toggleAlbum(savedAlbum)}
+            ariaLabel={
+              collection.isAlbumSaved(savedAlbum.browseId)
+                ? "Remove from collection"
+                : "Save album to collection"
+            }
+          />
+        </div>
+      )}
+
+      {savedArtist && (
+        <div className={revealClass} onClick={(event) => event.stopPropagation()}>
+          <SaveButton
+            isSaved={collection.isArtistSaved(savedArtist.browseId)}
+            size={buttonSize}
+            onToggle={() => collection.toggleArtist(savedArtist)}
+            ariaLabel={
+              collection.isArtistSaved(savedArtist.browseId)
+                ? "Remove from collection"
+                : "Save artist to collection"
+            }
+          />
+        </div>
+      )}
+    </>
+  );
+}
+
+function toSaveableTrack(item: SearchItem): MediaTrack | null {
+  if (item.kind !== "song" && item.kind !== "video") return null;
+  if (!item.videoId) return null;
+  const id = item.albumBrowseId
+    ? `yt:${item.videoId}:${item.albumBrowseId}`
+    : `yt:${item.videoId}`;
+  return {
+    id,
+    kind: item.kind,
+    title: item.title,
+    artist: getSearchItemArtist(item),
+    album: item.album ?? null,
+    albumBrowseId: item.albumBrowseId ?? null,
+    artistBrowseId: item.artistBrowseId ?? null,
+    artistCredits: item.artistCredits ?? null,
+    durationSeconds: item.durationSeconds ?? null,
+    playCount: item.playCount ?? null,
+    cover: item.cover ?? null,
+    videoId: item.videoId,
+    source: "stream",
+    filePath: null,
+  };
+}
+
+function browseIdFromSearchItemId(id: string): string | null {
+  if (!id.startsWith("browse:")) return null;
+  return id.slice("browse:".length) || null;
+}
+
+function toSavedAlbum(item: SearchItem): SavedAlbum | null {
+  if (item.kind !== "album") return null;
+  const browseId = item.browseId ?? browseIdFromSearchItemId(item.id);
+  if (!browseId) return null;
+  return {
+    browseId,
+    title: item.title,
+    subtitle: item.subtitle,
+    cover: item.cover ?? null,
+    byline: item.artist ?? null,
+    year: item.year ?? null,
+    artistBrowseId: item.artistBrowseId ?? null,
+  };
+}
+
+function toSavedArtist(item: SearchItem): SavedArtist | null {
+  if (item.kind !== "artist") return null;
+  const browseId = item.browseId ?? browseIdFromSearchItemId(item.id);
+  if (!browseId) return null;
+  return {
+    browseId,
+    title: item.title,
+    cover: item.cover ?? null,
+    banner: null,
+    monthlyListeners: monthlyListenersFromSearchSubtitle(item.subtitle),
+  };
+}
+
+function monthlyListenersFromSearchSubtitle(subtitle: string): string | null {
+  for (const part of subtitle.split("•")) {
+    const trimmed = part.trim();
+    if (trimmed.toLowerCase().includes("monthly listener")) return trimmed;
+  }
+  return null;
 }

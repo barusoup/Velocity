@@ -25,10 +25,8 @@ async function boot() {
     </StrictMode>
   );
 
-  // Fire-and-forget: check the public repo for a newer signed build and, if
-  // found, download + install + relaunch. See src/updater.ts. Never blocks the
-  // UI and never throws into the boot path.
-  void import("./updater").then((m) => m.checkForUpdateAndApply()).catch(() => {});
+  // Startup auto-update runs in the Rust backend (see spawn_startup_updater in
+  // src-tauri/src/main.rs) so it is not tied to the webview boot path.
 }
 
 boot();

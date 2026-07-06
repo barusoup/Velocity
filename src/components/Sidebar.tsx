@@ -3,14 +3,25 @@ import {
   useCallback,
   useEffect,
   useEffectEvent,
+  useMemo,
   useRef,
   useState,
   type CSSProperties,
+  type ReactNode,
 } from "react";
 import { createPortal } from "react-dom";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { clsx } from "clsx";
-import { ArrowDown, ArrowUp, ArrowUpDown, Book, Pin, Plus, SlidersHorizontal } from "lucide-react";
+import { cn } from "../utils/cn";
+import { ArrowDown, ArrowUp, ArrowUpDown, Book, Home, Pin, Plus, SlidersHorizontal } from "lucide-react";
+import { fetchSearchSuggestions } from "../api";
+import type { SearchSuggestion } from "../types";
+
+function getInlineSuggestionSuffix(draft: string, suggestion: string): string | null {
+  if (!draft || !suggestion || draft === suggestion) return null;
+  if (!suggestion.toLowerCase().startsWith(draft.toLowerCase())) return null;
+  return suggestion.slice(draft.length);
+}
 import {
   IconChevronLeft,
   IconChevronRight,
@@ -58,7 +69,6 @@ export function Sidebar({
   onNavigate,
   expanded,
   onToggle,
-  onReturnToSearch,
   playlists,
   playlistsSortMode,
   playlistsSortDirection,
@@ -72,7 +82,6 @@ export function Sidebar({
   onNavigate: (view: View) => void;
   expanded: boolean;
   onToggle: () => void;
-  onReturnToSearch: () => void;
   playlists: UserPlaylist[];
   playlistsSortMode: SortMode;
   playlistsSortDirection: SortDirection;
@@ -82,6 +91,8 @@ export function Sidebar({
   onDeletePlaylist: (id: string) => void;
   onTogglePinPlaylist: (id: string) => void;
 }) {
+  const showHomeMenu = useSetting("showHomeMenu");
+
   // `expanded` drives the sidebar width animation. Content visibility is
   // controlled via opacity transitions so the labels fade in/out in sync
   // with the sidebar opening/closing rather than teleporting at the end.
@@ -142,13 +153,15 @@ export function Sidebar({
       </div>
 
       <nav className="relative w-[var(--ui-sidebar-open)]">
-        <SidebarLink
-          label="Search"
-          active={isSearchWorkspace(view)}
-          onClick={onReturnToSearch}
-          icon={<IconSearch size={18} />}
-          compact={!expanded}
-        />
+        <AnimatedSidebarNavItem visible={showHomeMenu}>
+          <SidebarLink
+            label="Home"
+            active={view.name === "home"}
+            onClick={() => onNavigate({ name: "home" })}
+            icon={<Home size={18} strokeWidth={1.8} />}
+            compact={!expanded}
+          />
+        </AnimatedSidebarNavItem>
         <SidebarLink
           label="Collection"
           active={view.name === "collection"}
@@ -687,6 +700,98 @@ function PlaylistsSidebarItem({
   );
 }
 
+function AnimatedSidebarNavItem({
+  visible,
+  children,
+}: {
+  visible: boolean;
+  children: ReactNode;
+}) {
+  const [contentMounted, setContentMounted] = useState(visible);
+  const [slotOpen, setSlotOpen] = useState(visible);
+  const [motion, setMotion] = useState<"enter" | "exit" | null>(null);
+  const prevVisibleRef = useRef(visible);
+  const initialRenderRef = useRef(true);
+
+  useEffect(() => {
+    const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+    if (initialRenderRef.current) {
+      initialRenderRef.current = false;
+      prevVisibleRef.current = visible;
+      setContentMounted(visible);
+      setSlotOpen(visible);
+      return;
+    }
+
+    if (visible === prevVisibleRef.current) return;
+    prevVisibleRef.current = visible;
+
+    if (visible) {
+      setContentMounted(true);
+      if (reducedMotion) {
+        setSlotOpen(true);
+        setMotion(null);
+        return;
+      }
+      setSlotOpen(false);
+      setMotion(null);
+      requestAnimationFrame(() => {
+        requestAnimationFrame(() => {
+          setSlotOpen(true);
+          setMotion("enter");
+        });
+      });
+      return;
+    }
+
+    if (reducedMotion) {
+      setSlotOpen(false);
+      setContentMounted(false);
+      setMotion(null);
+      return;
+    }
+
+    setMotion("exit");
+    setSlotOpen(false);
+  }, [visible]);
+
+  const handleSlotTransitionEnd = useCallback(
+    (event: React.TransitionEvent<HTMLDivElement>) => {
+      if (event.propertyName !== "max-height") return;
+      if (slotOpen || motion !== "exit") return;
+      setContentMounted(false);
+      setMotion(null);
+    },
+    [slotOpen, motion],
+  );
+
+  const handleAnimationEnd = useCallback(() => {
+    if (motion === "enter") {
+      setMotion(null);
+    }
+  }, [motion]);
+
+  return (
+    <div
+      className={cn("sidebar-nav-slot", slotOpen && "is-open")}
+      onTransitionEnd={handleSlotTransitionEnd}
+    >
+      {contentMounted ? (
+        <div
+          className={cn(
+            motion === "enter" && "sidebar-nav-item-enter",
+            motion === "exit" && "sidebar-nav-item-exit",
+          )}
+          onAnimationEnd={handleAnimationEnd}
+        >
+          {children}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
 function SidebarLink({
   label,
   active,
@@ -766,8 +871,12 @@ export function TopBar({
 }) {
   const [draft, setDraft] = useState(query);
   const timeoutRef = useRef<number | null>(null);
+  const suggestionsTimeoutRef = useRef<number | null>(null);
+  const suggestionsRequestRef = useRef(0);
   const filterPanelRef = useRef<HTMLDivElement | null>(null);
+  const searchInputRef = useRef<HTMLInputElement | null>(null);
   const [searchFocused, setSearchFocused] = useState(false);
+  const [suggestions, setSuggestions] = useState<SearchSuggestion[]>([]);
   const [hoveringTopArea, setHoveringTopArea] = useState(false);
   const sensorLeaveTimeoutRef = useRef<number | null>(null);
   const topbarSensorRef = useRef<HTMLDivElement | null>(null);
@@ -804,6 +913,12 @@ export function TopBar({
   // immediately. With getSetting the snapshot was only re-read on
   // parent-driven re-renders, so toggling had no live effect.
   const alwaysShowSearch = useSetting("alwaysShowSearch");
+  const searchSuggestionsEnabled = useSetting("searchSuggestions");
+  const topSuggestionText = suggestions[0]?.text ?? null;
+  const inlineSuggestionSuffix = useMemo(() => {
+    if (!searchSuggestionsEnabled || !searchFocused || !topSuggestionText) return null;
+    return getInlineSuggestionSuffix(draft, topSuggestionText);
+  }, [draft, searchFocused, searchSuggestionsEnabled, topSuggestionText]);
   const topbarInteractive = suppressSearchBar
     ? false
     : alwaysShowSearch
@@ -910,6 +1025,47 @@ export function TopBar({
   }, [draft]);
 
   useEffect(() => {
+    if (!searchSuggestionsEnabled || !searchFocused) {
+      setSuggestions([]);
+      return;
+    }
+
+    const clean = draft.trim();
+    if (!clean) {
+      setSuggestions([]);
+      return;
+    }
+
+    setSuggestions([]);
+
+    if (suggestionsTimeoutRef.current !== null) {
+      window.clearTimeout(suggestionsTimeoutRef.current);
+    }
+
+    const requestId = suggestionsRequestRef.current + 1;
+    suggestionsRequestRef.current = requestId;
+
+    suggestionsTimeoutRef.current = window.setTimeout(() => {
+      void fetchSearchSuggestions(clean)
+        .then((next) => {
+          if (suggestionsRequestRef.current !== requestId) return;
+          setSuggestions(next);
+        })
+        .catch(() => {
+          if (suggestionsRequestRef.current !== requestId) return;
+          setSuggestions([]);
+        });
+    }, 200);
+
+    return () => {
+      if (suggestionsTimeoutRef.current !== null) {
+        window.clearTimeout(suggestionsTimeoutRef.current);
+        suggestionsTimeoutRef.current = null;
+      }
+    };
+  }, [draft, searchFocused, searchSuggestionsEnabled]);
+
+  useEffect(() => {
     if (!searchFiltersOpen) return;
 
     function handlePointerDown(event: PointerEvent) {
@@ -935,12 +1091,34 @@ export function TopBar({
   const handleDraftChange = (value: string) => {
     setDraft(value);
     if (!value.trim()) {
+      setSuggestions([]);
       // Clearing the field should jump straight back to the empty search page.
       onSearch("");
     }
   };
 
   const handleKeyDown = (event: React.KeyboardEvent<HTMLInputElement>) => {
+    if (event.key === "Tab" && inlineSuggestionSuffix && topSuggestionText) {
+      event.preventDefault();
+      setDraft(topSuggestionText);
+      setSuggestions([]);
+      suggestionsRequestRef.current += 1;
+      requestAnimationFrame(() => {
+        const input = searchInputRef.current;
+        if (!input) return;
+        const end = topSuggestionText.length;
+        input.setSelectionRange(end, end);
+      });
+      return;
+    }
+
+    if (event.key === "Escape" && inlineSuggestionSuffix) {
+      event.preventDefault();
+      setSuggestions([]);
+      suggestionsRequestRef.current += 1;
+      return;
+    }
+
     if (event.key === "Enter") {
       event.currentTarget.blur();
       const clean = draft.trim();
@@ -1082,6 +1260,7 @@ export function TopBar({
           </div>            <div className="flex h-full min-w-0 items-center">
              <div className="topbar-search-input-wrapper relative h-full min-w-0 flex-1">
                <input
+                ref={searchInputRef}
                 type="text"
                 value={draft}
                 onChange={(event) => handleDraftChange(event.target.value)}
@@ -1092,8 +1271,20 @@ export function TopBar({
                 autoComplete="off"
                 autoCorrect="off"
                 spellCheck={false}
-                className="topbar-search-element peer relative z-0 h-full min-h-[var(--ui-control)] max-h-[var(--ui-control)] w-full rounded-full border border-white/10 bg-white/5 pl-11 pr-10 text-[0.95rem] text-white placeholder-neutral-500 outline-none backdrop-blur-md transition-colors hover:border-white/15 hover:bg-white/10 focus:border-white/15 focus:bg-white/10"
+                aria-autocomplete="inline"
+                className="topbar-search-element peer relative z-[2] h-full min-h-[var(--ui-control)] max-h-[var(--ui-control)] w-full rounded-full border border-white/10 bg-white/5 pl-11 pr-10 text-[0.95rem] text-white placeholder-neutral-500 outline-none backdrop-blur-md transition-colors hover:border-white/15 hover:bg-white/10 focus:border-white/15 focus:bg-white/10"
               />
+              {inlineSuggestionSuffix && (
+                <div
+                  aria-hidden="true"
+                  className="topbar-search-element pointer-events-none absolute inset-0 z-[3] flex items-center overflow-hidden rounded-full pl-11 pr-10 text-[0.95rem]"
+                >
+                  <span className="min-w-0 truncate whitespace-pre">
+                    <span className="invisible">{draft}</span>
+                    <span className="text-white/35">{inlineSuggestionSuffix}</span>
+                  </span>
+                </div>
+              )}
               <div className="topbar-search-icon pointer-events-none absolute inset-y-0 left-4 z-10 flex items-center text-white peer-placeholder-shown:text-neutral-500">
                 <IconSearch size={18} />
               </div>

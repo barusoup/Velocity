@@ -1,12 +1,19 @@
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { CircleArrowRight, ChevronUp, LoaderCircle, Pause, Play, RefreshCw, SkipBack, SkipForward } from "lucide-react";
+import { CircleArrowRight, ChevronUp, LoaderCircle, Pause, Play, RefreshCw, SkipBack, SkipForward, X } from "lucide-react";
 import { convertFileSrc } from "@tauri-apps/api/core";
-import { getArtistDetail, cacheArtwork, getEntityDetail, getSyncedLyrics, peekSyncedLyrics } from "../api";
+import {
+  getArtistDetail,
+  cacheArtwork,
+  getEntityDetail,
+  getSyncedLyricsForTrack,
+  hydratePersistedLyricsForTrack,
+  isLyricsExhaustedForTrack,
+} from "../api";
 import { fetchSyncedLyricsByMeta } from "../lyrics";
 import { useCollection } from "../collection";
-import { usePlayer } from "../player";
+import { currentAudio, usePlayer } from "../player";
 import { useSetting } from "../settings";
-import { formatDuration } from "../utils/media";
+import { formatDuration, readLiveMediaDuration } from "../utils/media";
 import {
   getDirectAlbumBrowseId,
   getDirectArtistBrowseId,
@@ -35,6 +42,10 @@ const SIDEBAR_LAYOUT_TRANSITION = "220ms cubic-bezier(0.22, 1, 0.36, 1)";
 const MARQUEE_SPEED = 40;
 const MARQUEE_PAUSE_SECONDS = 0.85;
 const MARQUEE_MIN_DURATION = 4;
+// Keep in sync with Marquee's overflow dead band so the title/artist
+// shared cycle doesn't churn (and rewrite keyframes) on 1–2 px layout
+// dither from the volume slider, seek bar, or progress ticks.
+const MARQUEE_OVERFLOW_DEAD_BAND_PX = 1.5;
 
 function ArtistLine({
   track,
@@ -120,6 +131,7 @@ export default function PlayerBar({
   const [queueEverOpened, setQueueEverOpened] = useState(false);
   const [titleOverflow, setTitleOverflow] = useState(0);
   const [artistOverflow, setArtistOverflow] = useState(0);
+  const [syncOverflow, setSyncOverflow] = useState(0);
   // Pending flags surface a dimmed/wait-cursor state on the title and artist
   // links while their browseId is being resolved. Without these, a click on
   // a track with no direct browseId appears to do nothing for the seconds
@@ -132,6 +144,7 @@ export default function PlayerBar({
   const [cachedCover, setCachedCover] = useState<string | null>(null);
 
   const onLyricsPage = viewName === "lyrics";
+  const hidePlayerOnLyrics = useSetting("hidePlayerOnLyrics");
   const hideBarTimeoutRef = useRef<number | null>(null);
   const barHoveredRef = useRef(false);
   const mouseInBottomZoneRef = useRef(false);
@@ -158,7 +171,13 @@ export default function PlayerBar({
   const handleArtistOverflowChange = useCallback((value: number) => {
     setArtistOverflow(value);
   }, []);
-  const syncOverflow = Math.max(titleOverflow, artistOverflow);
+  useEffect(() => {
+    const next = Math.max(titleOverflow, artistOverflow);
+    setSyncOverflow((prev) => {
+      if (next === 0 || prev === 0) return next;
+      return Math.abs(prev - next) > MARQUEE_OVERFLOW_DEAD_BAND_PX ? next : prev;
+    });
+  }, [titleOverflow, artistOverflow]);
   const sharedCycle =
     syncOverflow > 0
       ? 2 * (MARQUEE_PAUSE_SECONDS + syncOverflow / MARQUEE_SPEED)
@@ -173,12 +192,22 @@ export default function PlayerBar({
   }, [track?.id]);
   const draggingVolume = useRef(false);
   const draggingSeek = useRef(false);
+  const wasPlayingBeforeSeekDragRef = useRef(false);
+  const lastSeekClientXRef = useRef<number | null>(null);
+
   const pendingVolumeRef = useRef(0);
   const volumeTrackRef = useRef<HTMLDivElement | null>(null);
   const volumeContainerRef = useRef<HTMLDivElement | null>(null);
   const seekTrackRef = useRef<HTMLDivElement | null>(null);
+  const seekFillRef = useRef<HTMLDivElement | null>(null);
+  const seekThumbRef = useRef<HTMLDivElement | null>(null);
+  const seekElapsedRef = useRef<HTMLSpanElement | null>(null);
+  const seekRemainingRef = useRef<HTMLSpanElement | null>(null);
   const playerRef = useRef(player);
   playerRef.current = player;
+  const seekScrubProgressRef = useRef(player.seekScrubProgress);
+  seekScrubProgressRef.current = player.seekScrubProgress;
+  const liveDurationRef = useRef(0);
 
   useEffect(() => {
     let cancelled = false;
@@ -292,7 +321,22 @@ export default function PlayerBar({
     };
   }, [track?.cover]);
 
-  const [lyricsAvailable, setLyricsAvailable] = useState(false);
+  const [lyricsAvailable, setLyricsAvailable] = useState(
+    () => (track?.source === "stream" ? hydratePersistedLyricsForTrack(track) !== null : false),
+  );
+  const [lyricsLoading, setLyricsLoading] = useState(
+    () =>
+      track?.source === "stream" &&
+      track !== null &&
+      hydratePersistedLyricsForTrack(track) === null,
+  );
+  const [lyricsLoadFailed, setLyricsLoadFailed] = useState(false);
+
+  useEffect(() => {
+    if (!lyricsLoadFailed) return;
+    const t = setTimeout(() => setLyricsLoadFailed(false), 1100);
+    return () => clearTimeout(t);
+  }, [lyricsLoadFailed]);
 
   useEffect(() => {
     if (!track) {
@@ -309,75 +353,108 @@ export default function PlayerBar({
         setLyricsAvailable(false);
         return;
       }
+      if (isLyricsExhaustedForTrack(track)) {
+        setLyricsAvailable(false);
+        setLyricsLoading(false);
+        setLyricsLoadFailed(true);
+        return;
+      }
       setLyricsAvailable(false);
+      setLyricsLoading(true);
+      setLyricsLoadFailed(false);
       let cancelled = false;
-      const timeoutId = setTimeout(() => {
-        if (!cancelled) setLyricsAvailable(false);
-      }, 7000);
       void fetchSyncedLyricsByMeta(track)
-        .then((result) => {
-          if (cancelled) return;
-          clearTimeout(timeoutId);
-          setLyricsAvailable(Boolean(result));
-        })
-        .catch(() => {
-          if (cancelled) return;
-          clearTimeout(timeoutId);
+      .then((result) => {
+        if (cancelled) return;
+        if (result) {
+          setLyricsAvailable(true);
+          setLyricsLoading(false);
+          setLyricsLoadFailed(false);
+        } else {
           setLyricsAvailable(false);
-        });
-      return () => {
-        cancelled = true;
-        clearTimeout(timeoutId);
-      };
+          setLyricsLoading(false);
+          setLyricsLoadFailed(true);
+        }
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setLyricsAvailable(false);
+        setLyricsLoading(false);
+        setLyricsLoadFailed(true);
+      });
+    return () => {
+      cancelled = true;
+    };
     }
 
-    if (!track.videoId) {
+    const effectiveVideoId = track.resolvedVideoId ?? track.videoId;
+    if (!effectiveVideoId) {
       setLyricsAvailable(false);
+      setLyricsLoading(false);
+      setLyricsLoadFailed(false);
+      return;
+    }
+
+    if (hydratePersistedLyricsForTrack(track)) {
+      setLyricsAvailable(true);
+      setLyricsLoading(false);
+      setLyricsLoadFailed(false);
+      return;
+    }
+
+    if (isLyricsExhaustedForTrack(track)) {
+      setLyricsAvailable(false);
+      setLyricsLoading(false);
+      setLyricsLoadFailed(true);
       return;
     }
 
     setLyricsAvailable(false);
-
-    if (peekSyncedLyrics(track.videoId)) {
-      setLyricsAvailable(true);
-      return;
-    }
+    setLyricsLoading(true);
+    setLyricsLoadFailed(false);
 
     let cancelled = false;
 
-    const timeoutId = setTimeout(() => {
-      if (!cancelled) setLyricsAvailable(false);
-    }, 7000);
-
-    void getSyncedLyrics(track.videoId)
+    void getSyncedLyricsForTrack(track, { persist: true })
       .then((result) => {
         if (cancelled) return;
-        clearTimeout(timeoutId);
-        setLyricsAvailable(Boolean(result));
+        if (result) {
+          setLyricsAvailable(true);
+          setLyricsLoading(false);
+          setLyricsLoadFailed(false);
+        } else {
+          setLyricsAvailable(false);
+          setLyricsLoading(false);
+          setLyricsLoadFailed(true);
+        }
       })
       .catch(() => {
         if (cancelled) return;
-        clearTimeout(timeoutId);
         setLyricsAvailable(false);
+        setLyricsLoading(false);
+        setLyricsLoadFailed(true);
       });
 
     return () => {
       cancelled = true;
-      clearTimeout(timeoutId);
     };
     // Tighter dep list than the LyricsPage equivalent: we only need to
     // know whether lyrics are *available* to render the affordance, not
     // refetch the lyrics themselves. So we only watch the keys that
     // distinguish "this is a different track" from "this is the same
-    // track with a metadata tweak". For stream tracks the videoId is
-    // canonical; for uploads, the (id, findLyrics) pair is.
-  }, [track?.id, track?.videoId, track?.source, track?.findLyrics]);
+    // track with a metadata tweak". For stream tracks the effective
+    // lyrics id (`resolvedVideoId ?? videoId`) is canonical; for uploads,
+    // the (id, findLyrics) pair is.
+  }, [track?.id, track?.videoId, track?.resolvedVideoId, track?.source, track?.findLyrics]);
 
   // Lyrics page: auto-hide player bar, reveal on hover near bottom.
   // Uses the same pattern as the search bar: a bottom-zone sensor
   // (mouseenter/mouseleave) combined with dock hover tracking and a
   // grace timeout. React state drives the hidden class so re-renders
   // (e.g. clicking a button) don't clobber DOM-manipulated classes.
+  // When hidePlayerOnLyrics is enabled the bar is omitted entirely
+  // (see the early return below) — this path only runs for the default
+  // hover-to-reveal behavior.
   const [barVisible, setBarVisible] = useState(true);
 
   const showBar = useCallback(() => {
@@ -388,29 +465,24 @@ export default function PlayerBar({
     setBarVisible(true);
   }, []);
 
-  const scheduleHideBar = useCallback(() => {
+  const scheduleHideBar = useCallback((fromDockLeave = false) => {
     if (hideBarTimeoutRef.current !== null) {
       clearTimeout(hideBarTimeoutRef.current);
     }
     if (queueOpen) return;
     hideBarTimeoutRef.current = window.setTimeout(() => {
-      if (!barHoveredRef.current && !mouseInBottomZoneRef.current) {
+      const keepForBottomZone = !fromDockLeave && mouseInBottomZoneRef.current;
+      if (!barHoveredRef.current && !keepForBottomZone) {
         setBarVisible(false);
       }
       hideBarTimeoutRef.current = null;
     }, 250);
   }, [queueOpen]);
 
-  // useSetting (not getSetting) so that flipping the toggle in
-  // SettingsPage re-renders PlayerBar and immediately updates the
-  // lyrics-hidden state, instead of waiting for the next time the
-  // parent passes in new props.
-  const hidePlayerOnLyrics = useSetting("hidePlayerOnLyrics");
-
   useEffect(() => {
     const wasQueueOpen = prevQueueOpenRef.current;
     prevQueueOpenRef.current = queueOpen;
-    if (!onLyricsPage || !hasHoverCapability || queueOpen || !hidePlayerOnLyrics) {
+    if (!onLyricsPage || !hasHoverCapability || queueOpen || hidePlayerOnLyrics) {
       setBarVisible(true);
       return;
     }
@@ -427,7 +499,7 @@ export default function PlayerBar({
   // pointer-events-toggling sensor div which caused the dock to
   // sometimes miss mouseenter/mouseleave, leaving the bar visible.
   useEffect(() => {
-    if (!onLyricsPage || !hasHoverCapability) return;
+    if (!onLyricsPage || !hasHoverCapability || hidePlayerOnLyrics) return;
 
     const handleMouseMove = (e: MouseEvent) => {
       const threshold = window.innerHeight - 150;
@@ -444,14 +516,14 @@ export default function PlayerBar({
 
     document.addEventListener("mousemove", handleMouseMove, { passive: true });
     return () => document.removeEventListener("mousemove", handleMouseMove);
-  }, [onLyricsPage, hasHoverCapability, showBar, scheduleHideBar]);
+  }, [onLyricsPage, hasHoverCapability, hidePlayerOnLyrics, showBar, scheduleHideBar]);
 
   // When the cursor leaves the browser window (e.g. alt+tab, or moving
   // diagonally out of the viewport) no mouseleave fires on the dock, so
   // hover refs stay stale and the bar never auto-hides. Detect the exit
   // via document mouseout with a null relatedTarget and reset everything.
   useEffect(() => {
-    if (!onLyricsPage || !hasHoverCapability) return;
+    if (!onLyricsPage || !hasHoverCapability || hidePlayerOnLyrics) return;
 
     const handleWindowExit = (e: MouseEvent) => {
       if (e.relatedTarget !== null) return;
@@ -463,7 +535,7 @@ export default function PlayerBar({
 
     document.addEventListener("mouseout", handleWindowExit);
     return () => document.removeEventListener("mouseout", handleWindowExit);
-  }, [onLyricsPage, hasHoverCapability, scheduleHideBar]);
+  }, [onLyricsPage, hasHoverCapability, hidePlayerOnLyrics, scheduleHideBar]);
 
   const calcVolumeFromClientX = useCallback((clientX: number) => {
     const el = volumeTrackRef.current;
@@ -472,15 +544,103 @@ export default function PlayerBar({
     return Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
   }, []);
 
-  const calcSeekFromClientX = useCallback((clientX: number) => {
-    const el = seekTrackRef.current;
-    if (!el) return;
-    const rect = el.getBoundingClientRect();
-    const pct = (clientX - rect.left) / rect.width;
+  const resolveSeekDuration = useCallback(() => {
     const p = playerRef.current;
-    const dur = p.duration || p.currentTrack?.durationSeconds || 0;
-    p.seek(pct * dur);
+    const trackDuration = p.currentTrack?.durationSeconds;
+    const fromLive = readLiveMediaDuration(currentAudio.current, trackDuration);
+    if (fromLive > 0) {
+      liveDurationRef.current = fromLive;
+      return fromLive;
+    }
+    const fallback =
+      liveDurationRef.current ||
+      p.duration ||
+      trackDuration ||
+      0;
+    return fallback > 0 ? fallback : 0;
   }, []);
+
+  // Paint the seek bar straight from the media element so it cannot stall
+  // behind sparse React context updates or missing duration metadata.
+  useEffect(() => {
+    if (!track) return;
+
+    let frameId = 0;
+    let running = true;
+    let lastProgress = -1;
+    let lastDuration = -1;
+    let lastPct = -1;
+
+    const paintSeekBar = () => {
+      if (!running) return;
+      frameId = window.requestAnimationFrame(paintSeekBar);
+
+      const p = playerRef.current;
+      const audio = currentAudio.current;
+      const scrub = seekScrubProgressRef.current;
+      const progress =
+        scrub ??
+        (audio && Number.isFinite(audio.currentTime)
+          ? audio.currentTime
+          : p.progress);
+      const duration = resolveSeekDuration();
+
+      const pct =
+        duration > 0
+          ? Math.min(100, Math.max(0, (progress / duration) * 100))
+          : 0;
+
+      const progressChanged = Math.abs(progress - lastProgress) >= 0.01;
+      if (progressChanged) {
+        lastProgress = progress;
+        if (seekElapsedRef.current) {
+          seekElapsedRef.current.textContent = formatDuration(progress);
+        }
+        if (seekRemainingRef.current) {
+          seekRemainingRef.current.textContent = `-${formatDuration(Math.max(0, duration - progress))}`;
+        }
+      }
+
+      if (Math.abs(duration - lastDuration) >= 0.5) {
+        lastDuration = duration;
+        if (seekRemainingRef.current) {
+          seekRemainingRef.current.textContent = `-${formatDuration(Math.max(0, duration - progress))}`;
+        }
+      }
+
+      if (Math.abs(pct - lastPct) >= 0.05) {
+        lastPct = pct;
+        const width = `${pct}%`;
+        if (seekFillRef.current) seekFillRef.current.style.width = width;
+        if (seekThumbRef.current) seekThumbRef.current.style.left = width;
+      }
+    };
+
+    frameId = window.requestAnimationFrame(paintSeekBar);
+    return () => {
+      running = false;
+      window.cancelAnimationFrame(frameId);
+    };
+  }, [track?.id, resolveSeekDuration]);
+
+  const calcSeekSecondsFromClientX = useCallback((clientX: number) => {
+    const el = seekTrackRef.current;
+    if (!el) return null;
+    const rect = el.getBoundingClientRect();
+    if (rect.width <= 0) return null;
+    const pct = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
+    const dur = resolveSeekDuration();
+    if (dur <= 0) return null;
+    return pct * dur;
+  }, [resolveSeekDuration]);
+
+  const commitSeekFromClientX = useCallback((clientX: number) => {
+    const seconds = calcSeekSecondsFromClientX(clientX);
+    if (seconds === null) return;
+    seekScrubProgressRef.current = seconds;
+    playerRef.current.seek(seconds);
+    playerRef.current.updateSeekScrubPreview(seconds);
+  }, [calcSeekSecondsFromClientX]);
 
   const applyLiveDrag = useCallback((clientX: number) => {
     const pct = calcVolumeFromClientX(clientX);
@@ -503,7 +663,12 @@ export default function PlayerBar({
     const onMouseMove = (event: MouseEvent) => {
       if (!draggingVolume.current && !draggingSeek.current) return;
       if (draggingSeek.current) {
-        calcSeekFromClientX(event.clientX);
+        lastSeekClientXRef.current = event.clientX;
+        const seconds = calcSeekSecondsFromClientX(event.clientX);
+        if (seconds !== null) {
+          seekScrubProgressRef.current = seconds;
+          playerRef.current.updateSeekScrubPreview(seconds);
+        }
         return;
       }
       lastClientX = event.clientX;
@@ -530,6 +695,17 @@ export default function PlayerBar({
           }
         }
       }
+      if (draggingSeek.current) {
+        const resume = wasPlayingBeforeSeekDragRef.current;
+        wasPlayingBeforeSeekDragRef.current = false;
+        const seconds =
+          lastSeekClientXRef.current === null
+            ? null
+            : calcSeekSecondsFromClientX(lastSeekClientXRef.current);
+        playerRef.current.finishSeekScrub(seconds, resume);
+        seekScrubProgressRef.current = null;
+        lastSeekClientXRef.current = null;
+      }
       draggingVolume.current = false;
       draggingSeek.current = false;
       lastClientX = null;
@@ -544,7 +720,7 @@ export default function PlayerBar({
         cancelAnimationFrame(rafId);
       }
     };
-  }, [applyLiveDrag, calcSeekFromClientX]);
+  }, [applyLiveDrag, calcSeekSecondsFromClientX]);
 
   useEffect(() => {
     if (!queueOpen) return;
@@ -602,13 +778,18 @@ export default function PlayerBar({
   const hasLyrics = lyricsAvailable && viewName !== "lyrics";
 
   if (!track) return null;
+  if (onLyricsPage && hidePlayerOnLyrics) return null;
 
-  const duration = player.duration || track.durationSeconds || 0;
-  const remaining = Math.max(0, duration - player.progress);
-  const progressPct = duration ? (player.progress / duration) * 100 : 0;
+  const duration =
+    player.duration ||
+    track.durationSeconds ||
+    0;
+  const displayProgress = player.seekScrubProgress ?? player.progress;
+  const remaining = Math.max(0, duration - displayProgress);
+  const progressPct = duration ? (displayProgress / duration) * 100 : 0;
 
-  const lyricsHideActive = onLyricsPage && hasHoverCapability && !barVisible && !queueOpen;
-  const lyricsEnabled = onLyricsPage && hasHoverCapability;
+  const lyricsEnabled = onLyricsPage && hasHoverCapability && !hidePlayerOnLyrics;
+  const lyricsHideActive = lyricsEnabled && !barVisible && !queueOpen;
 
   return (
       <div
@@ -630,7 +811,7 @@ export default function PlayerBar({
         onMouseLeave={() => {
           barHoveredRef.current = false;
           if (lyricsEnabled) {
-            scheduleHideBar();
+            scheduleHideBar(true);
           }
         }}
       >
@@ -687,6 +868,42 @@ export default function PlayerBar({
                   </button>
                 </div>
               )}
+
+              <div
+                className={`absolute inset-0 transition-opacity duration-200 ${
+                  lyricsLoading || lyricsLoadFailed
+                    ? "opacity-100"
+                    : "opacity-0 pointer-events-none"
+                }`}
+              >
+                <div
+                  aria-hidden
+                  className="pointer-events-none absolute inset-0 bg-black/45"
+                />
+                <div className="absolute inset-0 flex items-center justify-center">
+                  <span
+                    className={`absolute transition-all duration-200 ${
+                      lyricsLoadFailed
+                        ? "opacity-0 scale-75"
+                        : "opacity-100 scale-100"
+                    }`}
+                  >
+                    <LoaderCircle
+                      size={18}
+                      className={`text-white ${lyricsLoading ? "animate-spin" : ""}`}
+                    />
+                  </span>
+                  <span
+                    className={`absolute transition-all duration-200 ${
+                      lyricsLoadFailed
+                        ? "opacity-100 scale-100"
+                        : "opacity-0 scale-75"
+                    }`}
+                  >
+                    <X size={16} strokeWidth={2.25} className="text-white" />
+                  </span>
+                </div>
+              </div>
             </div>
             <div className="relative min-w-0 flex-1">
               <div
@@ -751,10 +968,10 @@ export default function PlayerBar({
                   {track.source !== "upload" && (
                     <div className="shrink-0 mt-1">
                       <SaveButton
-                        isSaved={collection.isSongSaved(track.id)}
+                        isSaved={collection.isTrackSaved(track)}
                         size="sm"
                         onToggle={() => collection.toggleSong(track)}
-                        ariaLabel={collection.isSongSaved(track.id) ? "Remove from collection" : "Save to collection"}
+                        ariaLabel={collection.isTrackSaved(track) ? "Remove from collection" : "Save to collection"}
                         className="!h-5 !w-5"
                       />
                     </div>
@@ -837,28 +1054,43 @@ export default function PlayerBar({
             </div>
 
             <div className="mt-1 flex w-full items-center gap-3">
-              <span className="w-10 text-right text-[11px] tabular-nums text-neutral-400">
-                {formatDuration(player.progress)}
-              </span>
-              <div
-                ref={seekTrackRef}
-                className="group relative h-1 flex-1 cursor-pointer rounded-full bg-neutral-800"
-                onMouseDown={(event) => {
-                  event.stopPropagation();
-                  draggingSeek.current = true;
-                  calcSeekFromClientX(event.clientX);
-                }}
+              <span
+                ref={seekElapsedRef}
+                className="w-10 text-right text-[11px] tabular-nums text-neutral-400"
               >
+                {formatDuration(displayProgress)}
+              </span>
+              <div className="relative h-1 flex-1">
                 <div
-                  className="absolute left-0 top-0 h-full rounded-full bg-white"
-                  style={{ width: `${progressPct}%` }}
+                  className="absolute -inset-y-2 left-0 right-0 z-10 cursor-pointer"
+                  onMouseDown={(event) => {
+                    event.stopPropagation();
+                    wasPlayingBeforeSeekDragRef.current = player.beginSeekScrub();
+                    draggingSeek.current = true;
+                    lastSeekClientXRef.current = event.clientX;
+                    commitSeekFromClientX(event.clientX);
+                  }}
                 />
                 <div
-                  className="absolute top-1/2 h-3 w-3 -translate-x-1/2 -translate-y-1/2 rounded-full bg-white opacity-0 shadow transition-opacity duration-75 group-hover:opacity-100"
-                  style={{ left: `${progressPct}%` }}
-                />
+                  ref={seekTrackRef}
+                  className="group relative h-full rounded-full bg-neutral-800"
+                >
+                  <div
+                    ref={seekFillRef}
+                    className="pointer-events-none absolute left-0 top-0 z-[1] h-full min-w-0 rounded-full bg-white"
+                    style={{ width: `${progressPct}%` }}
+                  />
+                  <div
+                    ref={seekThumbRef}
+                    className="pointer-events-none absolute top-1/2 z-[2] h-3 w-3 -translate-x-1/2 -translate-y-1/2 rounded-full bg-white opacity-0 shadow transition-opacity duration-75 group-hover:opacity-100"
+                    style={{ left: `${progressPct}%` }}
+                  />
+                </div>
               </div>
-              <span className="w-10 text-[11px] tabular-nums text-neutral-400">
+              <span
+                ref={seekRemainingRef}
+                className="w-10 text-[11px] tabular-nums text-neutral-400"
+              >
                 -{formatDuration(remaining)}
               </span>
             </div>
