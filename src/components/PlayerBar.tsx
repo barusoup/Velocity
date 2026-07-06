@@ -4,6 +4,7 @@ import { convertFileSrc } from "@tauri-apps/api/core";
 import {
   getArtistDetail,
   cacheArtwork,
+  peekCachedArtwork,
   getEntityDetail,
   getSyncedLyricsForTrack,
   hydratePersistedLyricsForTrack,
@@ -323,14 +324,19 @@ export default function PlayerBar({
   // a fallback. This mirrors the pattern already used for album/artist
   // artwork preloading above and for accent-color extraction in AccentProvider.
   useEffect(() => {
-    setCachedCover(null);
-    if (!track?.cover) return;
+    if (!track?.cover) {
+      setCachedCover(null);
+      return;
+    }
 
     let cancelled = false;
     const source = track.cover.startsWith("//") ? `https:${track.cover}` : track.cover;
     if (source.startsWith("asset://") || source.startsWith("blob:") || source.startsWith("data:")) {
+      setCachedCover(null);
       return;
     }
+
+    setCachedCover(peekCachedArtwork(source));
 
     cacheArtwork(source)
       .then((filePath) => {
@@ -833,8 +839,8 @@ export default function PlayerBar({
     track.durationSeconds ||
     0;
   const seekScrubProgress = usePlayerUiStore((state) => state.seekScrubProgress);
-  const displayProgress =
-    seekScrubProgress ?? usePlayerUiStore.getState().progress;
+  const storedProgress = usePlayerUiStore((state) => state.progress);
+  const displayProgress = seekScrubProgress ?? storedProgress;
   const remaining = Math.max(0, duration - displayProgress);
   const progressPct = duration ? (displayProgress / duration) * 100 : 0;
 
@@ -890,7 +896,11 @@ export default function PlayerBar({
           >
             <div className={`group relative h-[var(--ui-art-sm)] w-[var(--ui-art-sm)] shrink-0 overflow-hidden bg-neutral-800 ${getArtworkRoundedClass()}`}>
               {(track.cover || cachedCover) ? (
-                <ArtworkImage sources={cachedCover ? [cachedCover, track.cover] : [track.cover]} className="h-full w-full object-cover" />
+                <ArtworkImage
+                  sources={cachedCover ? [cachedCover, track.cover] : [track.cover]}
+                  className="h-full w-full object-cover"
+                  loading="eager"
+                />
               ) : (
                 <DefaultArtwork />
               )}

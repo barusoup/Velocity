@@ -30,16 +30,14 @@ import {
 } from "lucide-react";
 import { usePlayer, usePlayerActions } from "../player";
 import { useContextTrackTarget } from "../hooks/useContextTrackTarget";
+import { useCollectionMetadataBackfill } from "../hooks/useCollectionMetadataBackfill";
 import { useTrackPlaybackState } from "../hooks/usePlayerSelectors";
 import { VirtualList } from "./VirtualList";
 import { useCollectionActions, useCollectionData } from "../collection";
 import { useIsTrackSaved, useToggleTrackSave } from "../hooks/useCollectionSelectors";
 import { getArtistDetail, getEntityDetail, importTracks, updateImportedTrackMetadata, extractFileMetadata } from "../api";
-import {
-  resolveTrackAlbumMetadata,
-  resolveTrackMetadata,
-} from "../utils/track-metadata-backfill";
 import { formatDuration, formatPlayCount, trimExtension } from "../utils/media";
+import { preloadArtworkUrls } from "../utils/artwork-preload";
 import {
   displayAlbumName,
   enrichUploadMetadataFromYtm,
@@ -153,8 +151,23 @@ const AUDIO_ACCEPT = [
 // create separate checkpoints in page history navigation).
 let _lastCollectionTab: CollectionTab | null = null;
 
+function KeepAliveTabPanel({
+  active,
+  children,
+}: {
+  active: boolean;
+  children: ReactNode;
+}) {
+  return (
+    <div className={active ? undefined : "hidden"} aria-hidden={!active}>
+      {children}
+    </div>
+  );
+}
+
 export function CollectionPage(props: CollectionPageProps) {
   const { savedSongs, savedAlbums, savedArtists } = useCollectionData();
+  const { updateSongMetadata, updateSongsMetadataBatch } = useCollectionActions();
   const [tab, setTab] = useState<CollectionTab>(
     props.initialTab ?? _lastCollectionTab ?? "albums",
   );
@@ -169,19 +182,6 @@ export function CollectionPage(props: CollectionPageProps) {
       setTab(props.initialTab);
     }
   }, [props.initialTab, tab]);
-
-  // Tab switches update state locally only — no history entry, so page
-  // history navigation doesn't treat each collection tab as a separate
-  // checkpoint. The last-active tab is remembered across page remounts
-  // via a module-level variable.
-  const handleTabClick = useCallback(
-    (next: CollectionTab) => {
-      if (next === tab) return;
-      setTab(next);
-      _lastCollectionTab = next;
-    },
-    [tab],
-  );
 
   // Carousel indicator state
   const tabRefs = useRef<Record<CollectionTab, HTMLButtonElement | null>>({
@@ -228,6 +228,63 @@ export function CollectionPage(props: CollectionPageProps) {
         .slice()
         .sort((a, b) => (a.id > b.id ? -1 : a.id < b.id ? 1 : 0)),
     [props.uploadedTracks],
+  );
+
+  useCollectionMetadataBackfill(savedSongs, {
+    updateSongMetadata,
+    updateSongsMetadataBatch,
+  });
+
+  const preloadTabArtwork = useCallback(
+    (target: CollectionTab) => {
+      switch (target) {
+        case "albums":
+          preloadArtworkUrls(savedAlbums.map((album) => album.cover));
+          break;
+        case "songs":
+          preloadArtworkUrls(savedSongs.map((song) => song.cover));
+          break;
+        case "artists":
+          preloadArtworkUrls([
+            ...savedArtists.map((artist) => artist.cover),
+            ...savedArtists.map((artist) => artist.banner),
+          ]);
+          break;
+        case "local":
+          preloadArtworkUrls(sortedLocal.map((track) => track.cover));
+          break;
+      }
+    },
+    [savedAlbums, savedArtists, savedSongs, sortedLocal],
+  );
+
+  useEffect(() => {
+    const controller = new AbortController();
+    preloadArtworkUrls(
+      [
+        ...savedAlbums.map((album) => album.cover),
+        ...savedArtists.map((artist) => artist.cover),
+        ...savedArtists.map((artist) => artist.banner),
+        ...savedSongs.map((song) => song.cover),
+        ...sortedLocal.map((track) => track.cover),
+      ],
+      { signal: controller.signal },
+    );
+    return () => controller.abort();
+  }, [savedAlbums, savedArtists, savedSongs, sortedLocal]);
+
+  // Tab switches update state locally only — no history entry, so page
+  // history navigation doesn't treat each collection tab as a separate
+  // checkpoint. The last-active tab is remembered across page remounts
+  // via a module-level variable.
+  const handleTabClick = useCallback(
+    (next: CollectionTab) => {
+      if (next === tab) return;
+      preloadTabArtwork(next);
+      setTab(next);
+      _lastCollectionTab = next;
+    },
+    [tab, preloadTabArtwork],
   );
 
   // Show the picker. The overlay renders synchronously with this state so the
@@ -420,6 +477,7 @@ export function CollectionPage(props: CollectionPageProps) {
             label="Albums"
             active={tab === "albums"}
             onClick={() => handleTabClick("albums")}
+            onHover={() => preloadTabArtwork("albums")}
             icon={<Disc size={16} strokeWidth={1.8} />}
           />
           <CollectionTabButton
@@ -427,6 +485,7 @@ export function CollectionPage(props: CollectionPageProps) {
             label="Songs"
             active={tab === "songs"}
             onClick={() => handleTabClick("songs")}
+            onHover={() => preloadTabArtwork("songs")}
             icon={<ListMusic size={16} strokeWidth={1.8} />}
           />
           <CollectionTabButton
@@ -434,6 +493,7 @@ export function CollectionPage(props: CollectionPageProps) {
             label="Artists"
             active={tab === "artists"}
             onClick={() => handleTabClick("artists")}
+            onHover={() => preloadTabArtwork("artists")}
             icon={<Mic2 size={16} strokeWidth={1.8} />}
           />
           <CollectionTabButton
@@ -441,6 +501,7 @@ export function CollectionPage(props: CollectionPageProps) {
             label="Local"
             active={tab === "local"}
             onClick={() => handleTabClick("local")}
+            onHover={() => preloadTabArtwork("local")}
             icon={<Folder size={16} strokeWidth={1.8} />}
           />
         </div>
@@ -455,31 +516,33 @@ export function CollectionPage(props: CollectionPageProps) {
         </button>
       </div>
 
-      {tab === "albums" && (
+      <KeepAliveTabPanel active={tab === "albums"}>
         <SavedAlbumsGrid
           albums={savedAlbums}
           onNavigate={props.onNavigate}
         />
-      )}
-      {tab === "songs" && (
+      </KeepAliveTabPanel>
+      <KeepAliveTabPanel active={tab === "songs"}>
         <SavedSongsList
           songs={savedSongs}
           onNavigate={props.onNavigate}
+          listEnabled={tab === "songs"}
         />
-      )}
-      {tab === "artists" && (
+      </KeepAliveTabPanel>
+      <KeepAliveTabPanel active={tab === "artists"}>
         <SavedArtistsGrid
           artists={savedArtists}
           onNavigate={props.onNavigate}
         />
-      )}
-      {tab === "local" && (
+      </KeepAliveTabPanel>
+      <KeepAliveTabPanel active={tab === "local"}>
         <LocalUploadsList
           tracks={sortedLocal}
           onPlayTrack={props.onPlayTrack}
           onNavigate={props.onNavigate}
+          listEnabled={tab === "local"}
         />
-      )}
+      </KeepAliveTabPanel>
 
       {/* Hidden native file picker filtered to audio files. */}
       <input
@@ -542,8 +605,9 @@ const CollectionTabButton = forwardRef<HTMLButtonElement, {
   label: string;
   active: boolean;
   onClick: () => void;
+  onHover?: () => void;
   icon: React.ReactNode;
-}>(function CollectionTabButton({ label, active, onClick, icon }, ref) {
+}>(function CollectionTabButton({ label, active, onClick, onHover, icon }, ref) {
   // Each tab hugs its own content (icon + label + small padding) instead
   // of stretching with `flex-1` to fill the row. With flex-1 the active
   // tab's white pill background extends across the full row width, which
@@ -561,6 +625,8 @@ const CollectionTabButton = forwardRef<HTMLButtonElement, {
       ref={ref}
       type="button"
       onClick={onClick}
+      onMouseEnter={onHover}
+      onFocus={onHover}
       aria-pressed={active}
       className={cn(
         "relative z-10 inline-flex h-8 items-center justify-center gap-2 rounded-full px-3.5 text-sm font-semibold leading-none transition-colors animate-none",
@@ -817,11 +883,12 @@ function SavedArtistCard({
 function SavedSongsList({
   songs,
   onNavigate,
+  listEnabled = true,
 }: {
   songs: MediaTrack[];
   onNavigate: (view: View) => void;
+  listEnabled?: boolean;
 }) {
-  const { updateSongMetadata } = useCollectionActions();
   const player = usePlayer();
   const viewMode = useSetting("viewModeCollectionSongs");
   const [viewMenuOpen, setViewMenuOpen] = useState(false);
@@ -851,67 +918,6 @@ function SavedSongsList({
     () => songs.filter((t) => t.durationSeconds == null).length,
     [songs],
   );
-
-  useEffect(() => {
-    const missing = songs.filter((track) => {
-      if (!track.videoId) return false;
-      const needsDuration = track.durationSeconds == null;
-      const needsPlayCount = track.playCount == null;
-      const needsAlbum = isPlaceholderAlbumName(track.album);
-      const needsAlbumBrowseId = !track.albumBrowseId?.trim();
-      return needsDuration || needsPlayCount || needsAlbum || needsAlbumBrowseId;
-    });
-    if (missing.length === 0) return;
-
-    const controller = new AbortController();
-
-    async function backfill() {
-      const MAX_ATTEMPTS = 3;
-      const DELAYS = [700, 2500, 5000];
-
-      for (let attemptNum = 0; attemptNum < MAX_ATTEMPTS; attemptNum++) {
-        if (controller.signal.aborted) return;
-
-        let anyFetched = false;
-        for (const track of missing) {
-          if (!track.videoId || controller.signal.aborted) continue;
-          try {
-            const needsDuration = track.durationSeconds == null;
-            const needsPlayCount = track.playCount == null;
-            const needsAlbum = isPlaceholderAlbumName(track.album);
-            const needsAlbumBrowseId = !track.albumBrowseId?.trim();
-
-            const metadataUpdates = needsDuration || needsPlayCount
-              ? await resolveTrackMetadata(track, { needsDuration, needsPlayCount })
-              : null;
-            const albumUpdates = needsAlbum || needsAlbumBrowseId
-              ? await resolveTrackAlbumMetadata(track)
-              : null;
-
-            const merged = {
-              ...(metadataUpdates ?? {}),
-              ...(albumUpdates ?? {}),
-            };
-            if (Object.keys(merged).length === 0) continue;
-
-            updateSongMetadata(track.id, merged);
-            anyFetched = true;
-          } catch {
-            // transient — retry
-          }
-        }
-
-        if (anyFetched) return;
-        if (attemptNum < MAX_ATTEMPTS - 1) {
-          await new Promise((r) => setTimeout(r, DELAYS[attemptNum]));
-        }
-      }
-    }
-
-    void backfill();
-
-    return () => controller.abort();
-  }, [songs, updateSongMetadata]);
 
   if (songs.length === 0) {
     return (
@@ -982,6 +988,7 @@ function SavedSongsList({
       </div>
       <VirtualList
         items={songs}
+        enabled={listEnabled}
         estimateSize={viewMode === "compact" ? 44 : 56}
         getItemKey={(track) => track.id}
         renderItem={(track, index) => (
@@ -1007,10 +1014,12 @@ function LocalUploadsList({
   tracks,
   onPlayTrack,
   onNavigate,
+  listEnabled = true,
 }: {
   tracks: MediaTrack[];
   onPlayTrack: (track: MediaTrack) => void;
   onNavigate: (view: View) => void;
+  listEnabled?: boolean;
 }) {
   const viewMode = useSetting("viewModeCollectionLocal");
   const [viewMenuOpen, setViewMenuOpen] = useState(false);
@@ -1110,6 +1119,7 @@ function LocalUploadsList({
       </div>
       <VirtualList
         items={tracks}
+        enabled={listEnabled}
         estimateSize={viewMode === "compact" ? 44 : 56}
         getItemKey={(track) => track.id}
         renderItem={(track, index) => (

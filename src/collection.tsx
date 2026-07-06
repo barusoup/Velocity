@@ -18,6 +18,10 @@ import {
   savedSongMatches,
 } from "./utils/saved-collection-match";
 import { useCollectionStore } from "./store/collectionStore";
+import {
+  mergeTrackListMetadataBatch,
+  type TrackMetadataUpdates,
+} from "./utils/track-metadata-backfill";
 
 // ---------------------------------------------------------------------------
 // Saved-collection state
@@ -175,6 +179,9 @@ export type CollectionActions = {
   toggleAlbum: (album: SavedAlbum) => boolean;
   toggleArtist: (artist: SavedArtist) => boolean;
   updateSongMetadata: (trackId: string, updates: SavedSongMetadataUpdates) => void;
+  updateSongsMetadataBatch: (
+    updatesById: ReadonlyMap<string, SavedSongMetadataUpdates>,
+  ) => void;
 };
 
 type CollectionContextValue = CollectionData & CollectionActions;
@@ -247,6 +254,14 @@ export function CollectionProvider({ children }: { children: ReactNode }) {
           entry.id === trackId ? { ...entry, ...updates } : entry,
         ),
       );
+    },
+    [],
+  );
+
+  const updateSongsMetadataBatch = useCallback(
+    (updatesById: ReadonlyMap<string, TrackMetadataUpdates>) => {
+      if (updatesById.size === 0) return;
+      setSavedSongs((current) => mergeTrackListMetadataBatch(current, updatesById));
     },
     [],
   );
@@ -361,6 +376,7 @@ export function CollectionProvider({ children }: { children: ReactNode }) {
       toggleAlbum,
       toggleArtist,
       updateSongMetadata,
+      updateSongsMetadataBatch,
     }),
     [
       isTrackSaved,
@@ -372,6 +388,7 @@ export function CollectionProvider({ children }: { children: ReactNode }) {
       toggleAlbum,
       toggleArtist,
       updateSongMetadata,
+      updateSongsMetadataBatch,
     ],
   );
 

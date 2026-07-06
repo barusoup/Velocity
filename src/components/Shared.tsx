@@ -1,7 +1,7 @@
-import { memo, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { Check, Ellipsis, LoaderCircle, Music2, Pause, Play } from "lucide-react";
-import { cacheArtwork } from "../api";
+import { cacheArtwork, peekCachedArtwork } from "../api";
 import { usePlayerActions } from "../player";
 import { useContextTrackTarget } from "../hooks/useContextTrackTarget";
 import { useIsTrackSaved, useToggleTrackSave } from "../hooks/useCollectionSelectors";
@@ -65,6 +65,32 @@ function buildArtworkCandidateList(sources: Array<string | null | undefined>): s
   return Array.from(new Set(candidates));
 }
 
+function peekCachedArtworkForCandidates(candidates: string[]): string | null {
+  for (const candidate of candidates) {
+    const cached = peekCachedArtwork(candidate);
+    if (cached) return cached;
+  }
+  return null;
+}
+
+const loadedArtworkUrls = new Set<string>();
+
+function isArtworkUrlLoaded(url: string | null | undefined): boolean {
+  return Boolean(url && loadedArtworkUrls.has(url));
+}
+
+function markArtworkUrlLoaded(url: string): void {
+  loadedArtworkUrls.add(url);
+}
+
+const ARTWORK_LAZY_ROOT_MARGIN_PX = 240;
+
+function isNearViewport(element: Element): boolean {
+  const rect = element.getBoundingClientRect();
+  const margin = ARTWORK_LAZY_ROOT_MARGIN_PX;
+  return rect.bottom >= -margin && rect.top <= window.innerHeight + margin;
+}
+
 export function useResolvedArtworkSource(sources: Array<string | null | undefined>) {
   const sourceSignature = sources.map((source) => source?.trim() ?? "").join("\n");
   const candidates = useMemo(
@@ -72,16 +98,16 @@ export function useResolvedArtworkSource(sources: Array<string | null | undefine
     [sourceSignature],
   );
   const [candidateIndex, setCandidateIndex] = useState(0);
-  const [cachedSrc, setCachedSrc] = useState<string | null>(null);
+  const [cachedSrc, setCachedSrc] = useState<string | null>(() => peekCachedArtworkForCandidates(candidates));
   const [cacheAttempted, setCacheAttempted] = useState(false);
   const signatureRef = useRef(sourceSignature);
 
   useEffect(() => {
     signatureRef.current = sourceSignature;
     setCandidateIndex(0);
-    setCachedSrc(null);
+    setCachedSrc(peekCachedArtworkForCandidates(candidates));
     setCacheAttempted(false);
-  }, [sourceSignature]);
+  }, [sourceSignature, candidates]);
 
   const activeSrc = cachedSrc ?? candidates[candidateIndex] ?? null;
 
@@ -132,37 +158,68 @@ export function DefaultArtwork({ className = "h-full w-full" }: { className?: st
   );
 }
 
+function ArtworkSkeleton({ className }: { className: string }) {
+  return <span className={`block bg-neutral-800 ${className}`} aria-hidden />;
+}
+
 function ArtworkImageLoaded({
   src,
   sources,
   className,
   draggable = false,
   fallback,
+  loading,
 }: {
   src?: string | null;
   sources?: Array<string | null | undefined>;
   className: string;
   draggable?: boolean;
   fallback?: ReactNode;
+  loading: "lazy" | "eager";
 }) {
   const resolved = useResolvedArtworkSource(sources ?? [src]);
   const activeSrc = resolved.src;
+  const imgRef = useRef<HTMLImageElement | null>(null);
+  const [loaded, setLoaded] = useState(() => isArtworkUrlLoaded(activeSrc));
+
+  useEffect(() => {
+    setLoaded(isArtworkUrlLoaded(activeSrc));
+  }, [activeSrc]);
+
+  useLayoutEffect(() => {
+    const img = imgRef.current;
+    if (!img || !activeSrc) return;
+    if (img.complete && img.naturalWidth > 0) {
+      markArtworkUrlLoaded(activeSrc);
+      setLoaded(true);
+    }
+  }, [activeSrc]);
+
   if (!activeSrc) {
     return fallback ?? <DefaultArtwork className={className} />;
   }
 
   return (
-    <img
-      src={activeSrc}
-      alt=""
-      className={`block bg-transparent ${className}`}
-      draggable={draggable}
-      decoding="async"
-      loading="lazy"
-      onError={(event) => {
-        resolved.onError(event.currentTarget.currentSrc || event.currentTarget.src);
-      }}
-    />
+    <>
+      {!loaded && <ArtworkSkeleton className={`absolute inset-0 ${className}`} />}
+      <img
+        ref={imgRef}
+        src={activeSrc}
+        alt=""
+        className={`block bg-transparent transition-opacity duration-150 ${loaded ? "opacity-100" : "opacity-0"} ${className}`}
+        draggable={draggable}
+        decoding="async"
+        loading={loading}
+        onLoad={() => {
+          markArtworkUrlLoaded(activeSrc);
+          setLoaded(true);
+        }}
+        onError={(event) => {
+          setLoaded(false);
+          resolved.onError(event.currentTarget.currentSrc || event.currentTarget.src);
+        }}
+      />
+    </>
   );
 }
 
@@ -183,11 +240,21 @@ export function ArtworkImage({
 }) {
   const hostRef = useRef<HTMLSpanElement | null>(null);
   const [visible, setVisible] = useState(loading === "eager");
+  const hasSource = Boolean(
+    buildArtworkCandidateList(sources ?? [src]).length > 0,
+  );
 
-  useEffect(() => {
-    if (loading === "eager" || visible) return;
+  useLayoutEffect(() => {
+    if (loading === "eager") {
+      setVisible(true);
+      return;
+    }
     const host = hostRef.current;
     if (!host) return;
+    if (isNearViewport(host)) {
+      setVisible(true);
+      return;
+    }
     const observer = new IntersectionObserver(
       ([entry]) => {
         if (entry?.isIntersecting) {
@@ -195,22 +262,25 @@ export function ArtworkImage({
           observer.disconnect();
         }
       },
-      { rootMargin: "240px" },
+      { rootMargin: `${ARTWORK_LAZY_ROOT_MARGIN_PX}px` },
     );
     observer.observe(host);
     return () => observer.disconnect();
-  }, [loading, visible]);
+  }, [loading, hasSource, src, sources]);
 
   return (
-    <span ref={hostRef} className={`inline-flex ${className}`}>
-      {visible ? (
+    <span ref={hostRef} className={`relative inline-flex ${className}`}>
+      {visible && hasSource ? (
         <ArtworkImageLoaded
           src={src}
           sources={sources}
           className={className}
           draggable={draggable}
           fallback={fallback}
+          loading={loading}
         />
+      ) : hasSource ? (
+        <ArtworkSkeleton className={className} />
       ) : (
         fallback ?? <DefaultArtwork className={className} />
       )}

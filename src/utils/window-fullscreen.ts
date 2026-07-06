@@ -104,15 +104,12 @@ export async function toggleFullscreenWithBoundsRestore(): Promise<void> {
       // Fall back to the last known pseudo-fullscreen state.
     }
 
-    if (!inAppFs) {
-      await saveBounds(win);
-    }
-
     const enabled = await invoke<boolean>("toggle_app_fullscreen");
     appPseudoFullscreen = enabled;
 
     if (!enabled) {
-      await restoreBounds(win);
+      // Windows restores bounds (and re-maximizes when needed) in Rust.
+      savedBounds = null;
     }
     return;
   } catch (error) {

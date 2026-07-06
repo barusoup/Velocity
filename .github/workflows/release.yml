@@ -2,9 +2,8 @@ name: release
 
 # Builds Velocity for Windows and macOS Apple Silicon (arm64) on every
 # annotated `vX.Y.Z` tag, signs the auto-updater bundles, and publishes the
-# installers + a Tauri v2 updater manifest to the PUBLIC repository
-# (barusoup/Velocity-Public) as a GitHub Release. Source code lives only in
-# this private repo.
+# installers + a Tauri v2 updater manifest to this repository as a GitHub
+# Release.
 
 on:
   push:
@@ -21,7 +20,7 @@ on:
         default: false
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
   group: release-${{ github.ref }}
@@ -106,7 +105,7 @@ jobs:
           retention-days: 7
 
   publish:
-    name: Publish to public repo
+    name: Publish release
     needs: build
     runs-on: ubuntu-latest
     steps:
@@ -120,32 +119,45 @@ jobs:
         with:
           path: _assets
 
-      # Idempotent overwrite: drop any prior release + git tag at $TAG on
-      # the public repo so this run can recreate it cleanly. Source repo
-      # (private) tag deletion is the caller's job before re-pushing, since
-      # this workflow's GH_TOKEN scopes only to Velocity-Public.
-      - name: Drop prior public release for overwrite
+      # Tag-triggered checkouts can land on the commit without the annotated
+      # tag ref locally, so `git tag -l --format=...` returns empty and the
+      # publish step falls back to a bare "Velocity X.Y.Z" title (missing
+      # "Experimental", attaching latest.json). Fetch the tag explicitly.
+      - name: Fetch annotated tag for release notes
         shell: bash
-        env:
-          GH_TOKEN: ${{ secrets.PUBLIC_REPO_TOKEN }}
         run: |
           set -eu
-          PUB_REPO="barusoup/Velocity-Public"
           if [ -n "${{ github.event.inputs.version }}" ]; then
             TAG="v${{ github.event.inputs.version }}"
           else
             TAG="${GITHUB_REF_NAME}"
           fi
-          gh release delete "$TAG" --repo "$PUB_REPO" --yes --cleanup-tag 2>/dev/null || true
+          git fetch origin "refs/tags/${TAG}:refs/tags/${TAG}"
+
+      # Idempotent overwrite: drop any prior release + git tag at $TAG so
+      # this run can recreate it cleanly.
+      - name: Drop prior release for overwrite
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          REPO="${{ github.repository }}"
+          if [ -n "${{ github.event.inputs.version }}" ]; then
+            TAG="v${{ github.event.inputs.version }}"
+          else
+            TAG="${GITHUB_REF_NAME}"
+          fi
+          gh release delete "$TAG" --repo "$REPO" --yes --cleanup-tag 2>/dev/null || true
 
       - name: Compose manifest + create release
         shell: bash
         env:
-          GH_TOKEN: ${{ secrets.PUBLIC_REPO_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -eu
-          PUB_REPO="barusoup/Velocity-Public"
-          BASE="https://github.com/${PUB_REPO}/releases/latest/download"
+          REPO="${{ github.repository }}"
+          BASE="https://github.com/${REPO}/releases/latest/download"
 
           if [ -n "${{ github.event.inputs.version }}" ]; then
             TAG="v${{ github.event.inputs.version }}"
@@ -214,16 +226,6 @@ jobs:
             rm -f latest.json
           fi
 
-          # The public repo must have at least one commit for gh release create
-          # to anchor the release tag. Initialize it with a README on the first
-          # run; subsequent runs skip this (the PUT 422s, file already exists).
-          printf '%s\n\n%s\n' '# Velocity' 'Public releases and issue tracker for the Velocity desktop music player.' | base64 -w0 > /tmp/readme_b64
-          gh api --method PUT "repos/${PUB_REPO}/contents/README.md" \
-            -f message="Initialize public repository" \
-            -f content="$(cat /tmp/readme_b64)" \
-            2>/dev/null || true
-          rm -f /tmp/readme_b64
-
           # Attach every staged asset. `nullglob` collapses globs for
           # platforms we didn't build this run, so `gh release create`
           # doesn't error on missing directories.
@@ -233,7 +235,7 @@ jobs:
             _assets/build-macos-arm64/*
           )
           gh release create "$TAG" \
-            --repo "$PUB_REPO" \
+            --repo "$REPO" \
             --title "$RELEASE_TITLE" \
             --notes "$NOTES" \
             "${PRERELEASE_FLAG[@]}" \
@@ -242,7 +244,7 @@ jobs:
       - name: Verify
         shell: bash
         env:
-          GH_TOKEN: ${{ secrets.PUBLIC_REPO_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           TAG="${{ github.event.inputs.version && format('v{0}', github.event.inputs.version) || github.ref_name }}"
-          gh release view "$TAG" --repo barusoup/Velocity-Public --json tagName,assets --jq '{tag:.tagName, assets:[.assets[].name]}'
+          gh release view "$TAG" --repo ${{ github.repository }} --json tagName,assets --jq '{tag:.tagName, assets:[.assets[].name]}'

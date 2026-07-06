@@ -1,4 +1,4 @@
-import { invoke } from "@tauri-apps/api/core";
+import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import type {
   ArtistDetail,
   BackendStatus,
@@ -352,6 +352,14 @@ export async function cacheArtwork(url: string): Promise<string> {
   return artworkCache.getOrCreate(key, () =>
     invokeCommand<string>("cache_artwork", { url: key }),
   );
+}
+
+/** Resolved local file URL when artwork was already cached this session. */
+export function peekCachedArtwork(url: string): string | null {
+  const key = url.trim();
+  if (!key) return null;
+  const filePath = artworkCache.peek(key);
+  return filePath ? convertFileSrc(filePath) : null;
 }
 
 export async function getEntityDetail(browseId: string): Promise<EntityDetail> {

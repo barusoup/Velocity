@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { LoaderCircle, X } from "lucide-react";
 import {
   hydratePersistedLyricsForTrack,
@@ -46,6 +46,20 @@ function sampleLogFrequencyAt(
 /** Bars ease to flat at full opacity, then the visualizer fades out. */
 const PAUSE_SETTLE_MS = 300;
 const PAUSE_FADE_MS = 200;
+
+function resolveLyricsScrollContainer(): HTMLElement | null {
+  const lyricsScrollArea = document.querySelector(".lyrics-scroll-area");
+  if (!lyricsScrollArea) {
+    return document.querySelector(".main-scrollport");
+  }
+  let container = lyricsScrollArea.parentElement;
+  while (container) {
+    const style = window.getComputedStyle(container);
+    if (style.overflowY === "auto" || style.overflowY === "scroll") break;
+    container = container.parentElement;
+  }
+  return container;
+}
 
 type PausePhase = "idle" | "settling" | "fading";
 
@@ -271,6 +285,9 @@ export function LyricsPage({
   const playerProgressRef = useRef(0);
   const seekScrubProgressRef = useRef<number | null>(null);
   const isProgrammaticScrollRef = useRef(false);
+  const holdTopAfterTrackChangeRef = useRef(false);
+  /** Active line index when the new track's lyrics first appear; auto-follow stays at top until this advances. */
+  const trackChangeLyricBaselineRef = useRef<number | null>(null);
   const autoScrollTimeoutRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const scrollContainerRef = useRef<HTMLElement | null>(null);
   const topSpacerRef = useRef<HTMLDivElement>(null);
@@ -384,7 +401,19 @@ export function LyricsPage({
     }
   }, [lyrics]);
 
+  const scrollLyricsToTop = useCallback((behavior: ScrollBehavior = "instant") => {
+    const container = scrollContainerRef.current ?? resolveLyricsScrollContainer();
+    if (!container) return;
+    scrollContainerRef.current = container;
+    isProgrammaticScrollRef.current = true;
+    container.scrollTo({ top: 0, behavior });
+    setTimeout(() => {
+      isProgrammaticScrollRef.current = false;
+    }, 0);
+  }, []);
+
   const recenterActiveLyric = useCallback((behavior: ScrollBehavior = "instant") => {
+    if (holdTopAfterTrackChangeRef.current) return;
     const index = activeLyricIndexRef.current;
     if (index < 0) return;
     const el = lyricLineRefs.current[index];
@@ -420,25 +449,21 @@ export function LyricsPage({
 
   // Reset scroll position and display progress when the track changes.
   // Jump to the top immediately so we are not still scrolled to the
-  // previous song's active line while the new track's lyrics load or
-  // before its first timed line becomes active. The lyrics-loaded effect
-  // recenters on the active line once the new lyrics are in place.
-  useEffect(() => {
+  // previous song's active line while the new track's lyrics load.
+  // Auto-follow resumes once the active line advances (or when playback
+  // reaches the first timed line on a fresh start).
+  useLayoutEffect(() => {
     lyricLineRefs.current = [];
     lastScrolledIndexRef.current = -1;
+    holdTopAfterTrackChangeRef.current = true;
+    trackChangeLyricBaselineRef.current = null;
     if (autoScrollTimeoutRef.current) clearTimeout(autoScrollTimeoutRef.current);
-
-    const container = scrollContainerRef.current;
-    if (container) {
-      isProgrammaticScrollRef.current = true;
-      container.scrollTo({ top: 0, behavior: "instant" });
-      setTimeout(() => { isProgrammaticScrollRef.current = false; }, 0);
-    }
+    scrollLyricsToTop("instant");
 
     const initial = playerProgressRef.current;
     displayProgressRef.current = initial;
     setDisplayProgress(initial);
-  }, [track?.id]);
+  }, [track?.id, scrollLyricsToTop]);
 
   // When the underlying audio element fires its `ended` event (track
   // reached its natural end without an immediate next-track handoff),
@@ -533,17 +558,8 @@ export function LyricsPage({
   }, [activeLyricIndex]);
 
   // Find the scroll container and attach auto-recenter listener
-  useEffect(() => {
-    const lyricsScrollArea = document.querySelector('.lyrics-scroll-area');
-    if (!lyricsScrollArea) return;
-    // Walk up to find the actual scroll viewport (first overflow-y-auto ancestor),
-    // not .lyrics-scroll-area itself which has .nice-scroll but no overflow.
-    let container = lyricsScrollArea.parentElement;
-    while (container) {
-      const style = window.getComputedStyle(container);
-      if (style.overflowY === 'auto' || style.overflowY === 'scroll') break;
-      container = container.parentElement;
-    }
+  useLayoutEffect(() => {
+    const container = resolveLyricsScrollContainer();
     if (!container) return;
     scrollContainerRef.current = container;
 
@@ -678,6 +694,14 @@ export function LyricsPage({
 
   useEffect(() => {
     if (activeLyricIndex < 0 || activeLyricIndex === lastScrolledIndexRef.current) return;
+    if (holdTopAfterTrackChangeRef.current) {
+      // Baseline is captured when the new track's lyrics mount — until then,
+      // ignore active-line updates that may still reflect the previous song.
+      if (trackChangeLyricBaselineRef.current === null) return;
+      if (activeLyricIndex === trackChangeLyricBaselineRef.current) return;
+      holdTopAfterTrackChangeRef.current = false;
+      trackChangeLyricBaselineRef.current = null;
+    }
     lastScrolledIndexRef.current = activeLyricIndex;
     isProgrammaticScrollRef.current = true;
     lyricLineRefs.current[activeLyricIndex]?.scrollIntoView({ block: "center", behavior: "smooth" });
@@ -685,33 +709,29 @@ export function LyricsPage({
   }, [activeLyricIndex]);
 
   const prevLyricsRef = useRef<SyncedLyrics | null>(null);
-  // When lyrics load or change for a new track, scroll to the active
-  // lyric line (if the song is mid-play) or to the first line (if the
-  // song is just starting).
+  // When lyrics load or change for a new track, size spacers and keep the
+  // viewport at the top until playback advances the active line.
   // Top and bottom spacers are sized dynamically so the first and last
   // lines can scroll to the viewport center without overscroll past the
   // ends. Both are recalculated on layout changes (see below).
-  // We read progress from the rAF-ref (not React state) because the
-  // state may lag behind during initial mount batching, causing us to
-  // scroll to line 0 and then snap to the real active line a frame later.
   useEffect(() => {
     const previousLyrics = prevLyricsRef.current;
     prevLyricsRef.current = lyrics;
     if (!lyrics || lyrics.lines.length === 0 || lyrics === previousLyrics) return;
     updateLyricsSpacers();
     const index = findActiveLyricIndex(lyrics.lines, displayProgressRef.current);
-    if (index < 0) {
-      // Before the first timed line — keep the track-change scroll-to-top
-      // position and let the active-lyric effect take over once playback
-      // reaches a real line.
-      lastScrolledIndexRef.current = -1;
+    if (holdTopAfterTrackChangeRef.current) {
+      trackChangeLyricBaselineRef.current = index;
+      lastScrolledIndexRef.current = index;
+      scrollLyricsToTop("instant");
       return;
     }
     lastScrolledIndexRef.current = index;
+    if (index < 0) return;
     isProgrammaticScrollRef.current = true;
     lyricLineRefs.current[index]?.scrollIntoView({ block: "center", behavior: "instant" });
     setTimeout(() => { isProgrammaticScrollRef.current = false; }, 0);
-  }, [lyrics, updateLyricsSpacers]);
+  }, [lyrics, updateLyricsSpacers, scrollLyricsToTop]);
 
   // Keep the active lyric centered when the scrollport changes size (window
   // resize, monitor move, DPI change, or --app-height refresh). A fixed

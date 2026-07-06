@@ -1,7 +1,9 @@
-import { useEffect, useRef } from "react";
+import { useLayoutEffect, useRef } from "react";
 import type { MediaTrack } from "../types";
 import {
+  isTrackMetadataBackfillExhausted,
   mergeTrackListMetadataBatch,
+  peekTrackMetadataCache,
   resolveTrackMetadata,
   type TrackMetadataUpdates,
 } from "../utils/track-metadata-backfill";
@@ -24,17 +26,28 @@ export function useTrackMetadataBackfill(
     .map((track) => `${track.id}:${track.durationSeconds ?? ""}:${track.playCount ?? ""}`)
     .join("|");
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     const missing = tracks.filter(
       (track) =>
         !!track.videoId &&
         ((backfillDuration && track.durationSeconds == null) ||
-          (backfillPlayCount && track.playCount == null)),
+          (backfillPlayCount && track.playCount == null)) &&
+        !isTrackMetadataBackfillExhausted(track.id, "core"),
     );
     if (missing.length === 0) return;
 
     const controller = new AbortController();
     let currentTracks = tracks;
+
+    const cachedUpdates = new Map<string, TrackMetadataUpdates>();
+    for (const track of missing) {
+      const cached = peekTrackMetadataCache(track.id, "core");
+      if (cached) cachedUpdates.set(track.id, cached);
+    }
+    if (cachedUpdates.size > 0) {
+      currentTracks = mergeTrackListMetadataBatch(currentTracks, cachedUpdates);
+      onTracksChangeRef.current(currentTracks);
+    }
 
     const applyBatch = (updatesById: ReadonlyMap<string, TrackMetadataUpdates>) => {
       if (updatesById.size === 0 || controller.signal.aborted) return false;

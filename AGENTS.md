@@ -3,19 +3,16 @@
 Notes for any agent (human or AI) working on Velocity. Read this before
 building or releasing.
 
-## Repositories
+## Repository
 
-- **Private (source):** `https://github.com/barusoup/Velocity`
-  Full source code, Tauri config, and the GitHub Actions release workflow
-  (`.github/workflows/release.yml`) live here. Nothing user-facing is
-  downloaded from this repo.
-- **Public (builds + issues):** `https://github.com/barusoup/Velocity-Public`
-  Hosts the compiled installers **and** the auto-update manifest as GitHub
-  Releases, and is the one and only place users file bug reports / feedback
-  (via Issues). No website, no GitHub Pages.
+- **Single repo:** `https://github.com/barusoup/Velocity`
+  Source code, Tauri config, the GitHub Actions release workflow
+  (`.github/workflows/release.yml`), compiled installers, the auto-update
+  manifest, and the issue tracker all live here. Downloads come straight from
+  this repo's Releases page.
 
 This repo's working tree has **no** website folder — Velocity has no marketing
-site. Downloads come straight from the public repo's Releases page.
+site beyond the README.
 
 ## The auto-updater
 
@@ -24,18 +21,18 @@ Velocity checks for updates on startup (`src/updater.ts`, invoked from
 against the embedded public key, installs it, and relaunches — no user
 action, no prompts.
 
-- The **manifest** (`latest.json`) is a regular release asset on the public
-  repo, uploaded under the fixed name `latest.json` every release. The
+- The **manifest** (`latest.json`) is a regular release asset on this repo,
+  uploaded under the fixed name `latest.json` every stable release. The
   "latest release download" pattern keeps its URL stable forever:
 
   ```
-  https://github.com/barusoup/Velocity-Public/releases/latest/download/latest.json
+  https://github.com/barusoup/Velocity/releases/latest/download/latest.json
   ```
 - The app's updater endpoint is set in `src-tauri/tauri.conf.json` under
   `plugins.updater.endpoints` and points at that URL.
 - Signing keypair: the **public key** is embedded in
   `src-tauri/tauri.conf.json` (`plugins.updater.pubkey`). The **private key**
-  and its password are stored as repository secrets on the private repo:
+  and its password are stored as repository secrets:
   `TAURI_SIGNING_PRIVATE_KEY` and `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`.
   Never commit the private key. Regenerating the keypair would break updates
   for every prior install.
@@ -74,23 +71,19 @@ the manifest stays valid even across cached GitHub release redirects.
 
 ## Finalizing a release
 
-When asked to "Push this release to both repositories appropriately", an agent
-must perform every step below. This is the **only** supported release path.
+When asked to push a release, an agent must perform every step below. This is
+the **only** supported release path.
 
 ### Prerequisites (verified once, already in place)
 1. A Tauri updater signing keypair exists, with the public key in
    `tauri.conf.json` and the private key + password as repo secrets
    (`TAURI_SIGNING_PRIVATE_KEY`, `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`) on the
    private repo. Never commit the private key.
-2. A cross-repo publish token is stored as the secret `PUBLIC_REPO_TOKEN` on
-   the private repo (any token with `contents:write` on
-   `barusoup/Velocity-Public`). The release workflow uses it to create the
-   release and upload assets on the public repo.
-3. `src-tauri/tauri.conf.json` has the Updater plugin configured
+2. `src-tauri/tauri.conf.json` has the Updater plugin configured
    (`plugins.updater`), bundle targets including `nsis` / `dmg` / `app`,
    `bundle.createUpdaterArtifacts: true`, and the endpoint pointing at the
    manifest URL.
-4. `.github/workflows/release.yml` on the private repo is the CI/CD workflow.
+3. `.github/workflows/release.yml` is the CI/CD workflow.
    It triggers automatically on an annotated tag `vX.Y.Z`. Its `build`
    matrix runs `npm run verify-release` as a fail-fast gate before any
    platform build, so a broken icon state in the source tree aborts the
@@ -151,21 +144,21 @@ must perform every step below. This is the **only** supported release path.
    so a bad local state is caught before 8-minute platform builds waste CI
    minutes.
 
-4. **Stage, commit, and push source to the private repo**:
+4. **Stage, commit, and push source**:
    ```
    git add -A
    git commit -m "Velocity X.Y.Z"
    git push origin main
    ```
-   Confirm no build artifacts or secrets leaked into the commit. The private
-   repo's default branch is `main` at `https://github.com/barusoup/Velocity`.
+   Confirm no build artifacts or secrets leaked into the commit. The default
+   branch is `main` at `https://github.com/barusoup/Velocity`.
 
 5. **Tag and push** an annotated tag matching the version:
    ```
    git tag -a vX.Y.Z -m "Velocity X.Y.Z"
    git push origin vX.Y.Z
    ```
-   This kicks off `.github/workflows/release.yml` on the private repo.
+   This kicks off `.github/workflows/release.yml`.
 
 6. **Wait for the workflow to finish.** The workflow:
    - Runs `npm run verify-release` on every matrix build as a fail-fast
@@ -176,14 +169,14 @@ must perform every step below. This is the **only** supported release path.
    - Stages every asset under its fixed name (see the fixed-asset-names table
      above).
    - In the `publish` job: reads each `.sig`, composes `latest.json`
-     (omitting platforms that weren't built), creates a GitHub Release on
-     `barusoup/Velocity-Public` tagged `vX.Y.Z`, and uploads all installers,
-     updater targets + signatures, and the manifest.
+     (omitting platforms that weren't built), creates a GitHub Release tagged
+     `vX.Y.Z`, and uploads all installers, updater targets + signatures, and
+     the manifest.
 
-7. **Verify the public release**:
-   - `https://github.com/barusoup/Velocity-Public/releases/latest` resolves
-     to the new release and all expected assets are attached.
-   - `https://github.com/barusoup/Velocity-Public/releases/latest/download/latest.json`
+7. **Verify the release**:
+   - `https://github.com/barusoup/Velocity/releases/latest` resolves to the
+     new release and all expected assets are attached.
+   - `https://github.com/barusoup/Velocity/releases/latest/download/latest.json`
      serves the new manifest with `version` matching the tag, and only
      includes platforms that were actually built (non-empty `signature`).
    - Optional smoke test: install the build on at least one OS and confirm an
@@ -204,18 +197,16 @@ must perform every step below. This is the **only** supported release path.
    - **macOS**: drag the installed `.app` out of `/Applications`, drag it
      back. The Dock re-reads the icon at relaunch time.
 
-### Removing an existing tag on the public repo
+### Removing an existing tag
 
 If re-releasing the same version (e.g. to fix a broken build), the workflow
-already drops the existing public release + tag before creating the new one.
-No manual cleanup needed — the `publish` job includes a `Drop prior public
-release for overwrite` step that handles it via `gh release delete`. The
-workflow's `GH_TOKEN` is scoped to `Velocity-Public` only, so this never
-affects the private repo.
+already drops the existing release + tag before creating the new one. No
+manual cleanup needed — the `publish` job includes a `Drop prior release for
+overwrite` step that handles it via `gh release delete`.
 
 ### Release notes
 
-The release body on Velocity-Public is user-facing — it appears in the
+The release body is user-facing — it appears in the
 auto-updater dialog and on the public Releases page. The publish workflow
 reads notes from the **annotated tag message** (`git tag -a`). Put the final,
 user-facing text in the tag body (not just the commit subject). Same content
@@ -286,7 +277,7 @@ Bad:
 - reworked queue, fixed spotify cap, sidebar bug, fullscreen, marquee scroll collision, ...
 ```
 
-After publish, verify the public release body on Velocity-Public matches the
+After publish, verify the release body on GitHub matches the
 tag notes. If the workflow picked up the wrong text (e.g. commit subject
 instead of tag annotation), patch the release body on the public repo.
 
@@ -294,7 +285,7 @@ instead of tag annotation), patch the release body on the public repo.
 
 Tag annotations containing "experimental" (case-insensitive), or
 `workflow_dispatch` with `experimental: true`, publish a **pre-release** on
-Velocity-Public: title suffix " Experimental", `--prerelease`, and no
+Experimental releases: title suffix " Experimental", `--prerelease`, and no
 `latest.json` asset so `releases/latest` stays on the current stable build.
 Release notes still use the same layout and writing rules above; the intro
 must call out the experimental / no-auto-update behavior.
