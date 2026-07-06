@@ -198,14 +198,15 @@ for (const rel of ["public/icon.png", "public/splash-icon.png"]) {
 }
 
 // ----- 5. canonical master existence -------------------------------------
-const master = path.join(ROOT, "velocity-logo.png");
-if (!existsSync(master)) {
-  fail(
-    `velocity-logo.png is missing. This is the byte-preserving master needed ` +
-      `to re-derive the icon set after any source-of-truth change. ` +
-      `See AGENTS.md -> "Design assets" for how to (re)introduce it.`,
-  );
-} else {
+const master = path.join(ROOT, "velocity-logo.png");  if (!existsSync(master)) {
+    fail(
+      `velocity-logo.png is missing. This is the byte-preserving master needed ` +
+        `to re-derive the icon set after any source-of-truth change. Drop the ` +
+        `full-resolution source into the project root, regenerate the square ` +
+        `wrapper via PIL (center-paste into a max(w,h)xmax(w,h) RGBA canvas), ` +
+        `then run \`npm run regen-icons\`.`,
+    );
+  } else {
   const buf = readFileSync(master);
   pass(`velocity-logo.png canonical master present`, `${buf.length} bytes`);
   // PNG magic: 0x89 0x50 0x4E 0x47 ("\x89PNG"). If the master is ever

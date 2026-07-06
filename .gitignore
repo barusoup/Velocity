@@ -42,6 +42,7 @@ Website/
 .codex/
 .claude/
 .commandcode/
+.opencode/
 agent-tools/
 terminals/
 *.lines.txt
@@ -50,3 +51,6 @@ ts_output.txt
 all_lines.txt
 print_lines.cjs
 show_line.cjs
+
+AGENTS.md
+.velocity-public-readme.md
