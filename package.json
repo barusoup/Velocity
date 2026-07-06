@@ -1,13 +1,14 @@
 {
   "name": "velocity",
   "private": true,
-  "version": "0.0.1",
+  "version": "0.0.2",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "node scripts/build-clean.mjs && vite build",
     "preview": "vite preview",
     "tauri": "node scripts/tauri.js",
+    "regen-icons": "npx tauri icon src-tauri/icons/desktop-icon.png && node scripts/reorder-ico-frames.mjs",
     "verify-release": "node scripts/verify-release-assets.mjs",
     "verify-bundled-installer": "node scripts/verify-bundled-installer.mjs"
   },

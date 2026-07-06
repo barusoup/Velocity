@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { getItem, setItem as storeSetItem, clearAll } from "./storage";
 
 export type ViewMode = "list" | "compact";
+export type DiscographyViewMode = "list" | "grid";
 
 export type Settings = {
   launchOnStartup: boolean;
@@ -18,6 +19,7 @@ export type Settings = {
   viewModeCollectionLocal: ViewMode;
   viewModeAlbum: ViewMode;
   viewModePlaylist: ViewMode;
+  viewModeDiscography: DiscographyViewMode;
 };
 
 const SETTINGS_KEY = "velocity-settings";
@@ -37,6 +39,7 @@ const DEFAULTS: Settings = {
   viewModeCollectionLocal: "list",
   viewModeAlbum: "list",
   viewModePlaylist: "list",
+  viewModeDiscography: "list",
 };
 
 export function getSettings(): Settings {

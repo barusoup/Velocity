@@ -1174,7 +1174,7 @@ function Shell() {
           <div
             ref={scrollContainerRef}
             className={cn(
-              "nice-scroll min-h-0 flex-1 overflow-y-auto",
+              "nice-scroll main-scrollport min-h-0 flex-1 overflow-y-auto",
               isFullBleedView ? "pt-0" : "pt-[var(--ui-topbar-height)]",
               isFullBleedView ? "px-0" : "px-[var(--ui-page-pad)]",
               player.currentTrack ? "pb-[clamp(5rem,8vw,7.5rem)]" : "pb-[clamp(1.5rem,2vw,2.5rem)]",

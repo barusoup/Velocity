@@ -103,7 +103,17 @@ export async function matchExternalTrackToYTM(
 
   const targetTitle = normalizeForMatching(external.title);
   const targetArtist = normalizeForMatching(external.artist);
-  if (!targetTitle || !targetArtist) return null;
+  // YT Music playlists served via `--flat-playlist` resolve the
+  // per-track uploader field to "NA" server-side, and our Rust
+  // importer maps that to an empty artist. Don't gate on
+  // `!targetArtist` here — the lenient topResult fallback below
+  // checks `topArtist.includes("")` which is true for empty
+  // ``targetArtist`` and rescues the track. The previous gate
+  // short-circuited before the fallback ever ran, dropping every
+  // YT Music import to zero matches (the "playlists fail to load"
+  // user-visible symptom). Empty ``targetTitle`` is still a hard
+  // reject — there's nothing meaningful to look up.
+  if (!targetTitle) return null;
 
   // Strict equality pass. This remains the preferred path because it
   // refuses near-misses that substring matching would tolerate (e.g.
@@ -130,20 +140,37 @@ export async function matchExternalTrackToYTM(
   // as a wrong match, AND require the shorter of the two titles to be at
   // least half the longer's length so a short external title can't be
   // substring-matched against a same-artist longer title (e.g. "Run" by
-  // Kate Bush falsely hitting "Running Up That Hill" by Kate Bush).
+  // Kate Bush falsely hitting "Running Up That Hill" by Kate Bush). The
+  // 50%-overlap substring rule below is also gated: when ``targetArtist``
+  // is empty (the YT Music flat-playlist-rescued case) we instead
+  // require strict title equality so a generic title like "Hello" can't
+  // land on the wrong artist's topResult.
   if (!match) {
     const top = candidates[0];
     if (top) {
       const topTitle = normalizeForMatching(top.title);
       const topArtist = normalizeForMatching(pickCandidateArtist(top));
       if (topTitle && topArtist) {
-        const minTitleLen = Math.min(topTitle.length, targetTitle.length);
-        const maxTitleLen = Math.max(topTitle.length, targetTitle.length);
-        const titleOverlap =
-          topTitle === targetTitle ||
-          ((topTitle.includes(targetTitle) || targetTitle.includes(topTitle)) &&
-            maxTitleLen > 0 &&
-            minTitleLen / maxTitleLen >= 0.5);
+        // Empty `targetArtist` is the YT Music flat-playlist-rescued
+        // case: the Rust importer maps the unresolvable "NA" uploader
+        // to empty and we can’t verify the artist at all. The
+        // standard 50%-overlap substring rule is too permissive here
+        // — a short generic title like "Hello" with no artist
+        // would happily rescue onto the wrong topResult. Require
+        // STRICT title equality whenever the target artist is empty so
+        // the rescue only fires on unambiguous matches.
+        let titleOverlap: boolean;
+        if (targetArtist === "") {
+          titleOverlap = topTitle === targetTitle;
+        } else {
+          const minTitleLen = Math.min(topTitle.length, targetTitle.length);
+          const maxTitleLen = Math.max(topTitle.length, targetTitle.length);
+          titleOverlap =
+            topTitle === targetTitle ||
+            ((topTitle.includes(targetTitle) || targetTitle.includes(topTitle)) &&
+              maxTitleLen > 0 &&
+              minTitleLen / maxTitleLen >= 0.5);
+        }
         const artistOverlap =
           topArtist === targetArtist ||
           topArtist.includes(targetArtist) ||

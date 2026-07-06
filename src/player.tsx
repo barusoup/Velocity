@@ -227,6 +227,80 @@ function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string)
   });
 }
 
+// Build the display-metadata patch that should be applied to a track when
+// the audio has been resolved to a different (canonical Topic upload) song.
+// The matched song's title/cover/etc. win over the source track's — the
+// caller wants the user to see the audio-only song's metadata, not the
+// music video's. We deliberately do NOT mutate `id` or `videoId`; those
+// are preserved so the track's identity (and the active-state checks that
+// depend on it) keeps matching the original entry shown in track lists.
+//
+// Note: we intentionally do NOT fall back to `track.X` when `matched.X`
+// is missing. The source track is often the music video, and silently
+// inheriting its cover/title would re-introduce the music video's
+// metadata after the audio has been corrected to the canonical song.
+//
+// `matched` may be either a `SearchItem` (returned by
+// `findCanonicalSongVideoId`) or a fully-built `MediaTrack` (returned by
+// `findClosestSongForVideoTrack`). The fields we read are common to both.
+function songMetadataFromMatch(
+  _track: MediaTrack,
+  matched: MediaTrack | SearchItem,
+): Partial<MediaTrack> {
+  return {
+    title: matched.title,
+    artist: matched.artist ?? undefined,
+    album: matched.album ?? undefined,
+    albumBrowseId: matched.albumBrowseId ?? undefined,
+    artistBrowseId: matched.artistBrowseId ?? undefined,
+    artistCredits: matched.artistCredits ?? undefined,
+    durationSeconds: matched.durationSeconds ?? undefined,
+    playCount: matched.playCount ?? undefined,
+    cover: matched.cover ?? undefined,
+    kind: "song",
+  };
+}
+
+// Resolve an autoplay-tail entry to its audio-only song counterpart.
+//   * `kind === "video"` (the YT Music autoplay-suggested music video) gets
+//     passed through `findClosestSongForVideoTrack`, which returns a
+//     brand-new track with the canonical Topic-upload's videoId and
+//     metadata. If no match is found the entry is dropped — we never add a
+//     raw music video to the autoplay tail because its videoId would play
+//     the video's audio (visual clip, not the song) in the queue.
+//   * `kind === "song"` (YT Music sometimes mislabels music videos as
+//     songs via its normalize_kind fallback) is run through
+//     `findCanonicalSongVideoId` to look up a *different* song-kind
+//     videoId for the same (artist, title). When found, the entry is
+//     rebuilt with the canonical's videoId and display metadata so the
+//     audio and the thumbnail/title stay in sync.
+//   * Episodes, podcasts, and anything else pass through untouched.
+//
+// Returns `null` for video entries with no match (so the autoplay tail
+// filter drops them); returns the transformed entry otherwise.
+async function resolveAutoplayEntryToSong(entry: MediaTrack): Promise<MediaTrack | null> {
+  if (entry.kind === "video") {
+    const matched = await findClosestSongForVideoTrack(entry);
+    return matched ?? null;
+  }
+  if (entry.kind === "song" && entry.videoId) {
+    try {
+      const canonical = await findCanonicalSongVideoId(entry);
+      if (canonical && canonical.videoId && canonical.videoId !== entry.videoId) {
+        return {
+          ...entry,
+          id: `yt:${canonical.videoId}`,
+          videoId: canonical.videoId,
+          ...songMetadataFromMatch(entry, canonical),
+        };
+      }
+    } catch {
+      // Search failed — keep the original entry rather than dropping it.
+    }
+  }
+  return entry;
+}
+
 async function findClosestSongForVideoTrack(
   video: MediaTrack,
 ): Promise<MediaTrack | null> {
@@ -296,19 +370,24 @@ async function findClosestSongForVideoTrack(
 
     const matched = best.song;
     const matchedVideoId = matched.videoId!;
+    // Build the new track from the matched song's metadata only. We do NOT
+    // fall back to the music video's title/cover/etc. when the matched song
+    // is missing a field — the caller explicitly wants the song counterpart's
+    // metadata, and silently inheriting the music video's cover would
+    // display the music video's thumbnail while playing the song's audio.
     return {
       ...video,
       id: `yt:${matchedVideoId}`,
       videoId: matchedVideoId,
       title: matched.title,
-      artist: matched.artist ?? video.artist,
-      album: matched.album ?? video.album ?? null,
-      albumBrowseId: matched.albumBrowseId ?? video.albumBrowseId ?? null,
-      artistBrowseId: matched.artistBrowseId ?? video.artistBrowseId ?? null,
-      artistCredits: matched.artistCredits ?? video.artistCredits ?? null,
-      durationSeconds: matched.durationSeconds ?? video.durationSeconds ?? null,
-      playCount: matched.playCount ?? video.playCount ?? null,
-      cover: matched.cover ?? video.cover ?? null,
+      artist: matched.artist ?? "",
+      album: matched.album ?? null,
+      albumBrowseId: matched.albumBrowseId ?? null,
+      artistBrowseId: matched.artistBrowseId ?? null,
+      artistCredits: matched.artistCredits ?? null,
+      durationSeconds: matched.durationSeconds ?? null,
+      playCount: matched.playCount ?? null,
+      cover: matched.cover ?? null,
       kind: "song",
     };
   } catch (error) {
@@ -318,13 +397,16 @@ async function findClosestSongForVideoTrack(
 }
 
 // Search for the canonical "song" (Topic upload) version of a track and return
-// its videoId. Used by `resolveTrackAudio` to swap a music-video videoId that
-// landed on a song-kind track. YouTube Music sometimes returns a music-video
+// it. Used by `resolveTrackAudio` to swap a music-video videoId that landed
+// on a song-kind track. YouTube Music sometimes returns a music-video
 // videoId for album/playlist tracks when the music video is the more popular
-// result; this finds the audio-only Topic upload's videoId instead.
+// result; this finds the audio-only Topic upload instead.
 //
-// Only the videoId is returned — the caller preserves the track's display
-// metadata (title, artist, album, cover) so the UI is unaffected.
+// The matched song's metadata (title, cover, etc.) is returned alongside the
+// videoId so the caller can update the track's display fields too. Without
+// this, a track that swaps to the canonical Topic upload's audio keeps
+// showing the music video's thumbnail and name in the UI — the audio
+// corrects but the metadata does not.
 //
 // Key: iterates ALL song-kind search results, skipping any with the same
 // videoId as the track (which would be the music video itself, possibly
@@ -333,7 +415,7 @@ async function findClosestSongForVideoTrack(
 // the ranked list.
 async function findCanonicalSongVideoId(
   track: MediaTrack,
-): Promise<string | null> {
+): Promise<SearchItem | null> {
   const query = `${track.artist} ${track.title}`.trim();
   if (!query || !track.videoId) return null;
 
@@ -389,7 +471,7 @@ async function findCanonicalSongVideoId(
       }
       const matchedVideoId = entry.song.videoId!;
       if (matchedVideoId === track.videoId) continue;
-      return matchedVideoId;
+      return entry.song;
     }
     return null;
   } catch (error) {
@@ -1415,17 +1497,22 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
   const resolveTrackAudio = useCallback(async (track: MediaTrack): Promise<MediaTrack> => {
     if (track.source !== "stream" || !track.videoId) return track;
     // Substitute music-video entries (kind === "video") with the audio-only
-    // song found via search. Instead of changing the track's `videoId`/
-    // `id` (which would break `isTrackActive` matching against the original
-    // track still shown in track lists), we set `resolvedVideoId` to the
-    // canonical Topic-upload videoId. The load effect and prefetch logic
+    // song found via search. We set `resolvedVideoId` to the canonical
+    // Topic-upload videoId (rather than mutating `videoId`/`id`, which
+    // would break `isTrackActive` matching against the original track still
+    // shown in track lists) and also apply the matched song's display
+    // metadata so the user sees the Topic upload's title/cover/etc.
+    // instead of the music video's. The load effect and prefetch logic
     // use `resolvedVideoId ?? videoId` for actual stream resolution.
-    // Display metadata (title, artist, album, cover) is preserved as-is.
     if (track.kind === "video") {
       try {
         const matched = await findClosestSongForVideoTrack(track);
         if (matched && matched.videoId && matched.videoId !== track.videoId) {
-          return { ...track, resolvedVideoId: matched.videoId };
+          return {
+            ...track,
+            resolvedVideoId: matched.videoId,
+            ...songMetadataFromMatch(track, matched),
+          };
         }
         return track;
       } catch {
@@ -1437,15 +1524,20 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
     // points to a music video instead of the canonical Topic upload. YouTube
     // Music sometimes assigns a music-video videoId to song-kind entries,
     // especially when the music video is the top result. If the search finds
-    // a different song-kind videoId for the same (artist, title), set
-    // `resolvedVideoId` to the canonical videoId — all display metadata
-    // (title, artist, album, cover, browse ids, videoId, id) is preserved
-    // so the UI and active-state checks are unaffected.
+    // a different song-kind videoId for the same (artist, title), swap to
+    // the canonical one and apply the matched song's display metadata so
+    // the UI shows the Topic upload's title/cover rather than the music
+    // video's. `id` is preserved so `isTrackActive` keeps matching the
+    // original track displayed in track lists.
     if (track.kind !== "episode" && track.kind !== "podcast") {
       try {
-        const canonicalVideoId = await findCanonicalSongVideoId(track);
-        if (canonicalVideoId && canonicalVideoId !== track.videoId) {
-          return { ...track, resolvedVideoId: canonicalVideoId };
+        const canonical = await findCanonicalSongVideoId(track);
+        if (canonical && canonical.videoId && canonical.videoId !== track.videoId) {
+          return {
+            ...track,
+            resolvedVideoId: canonical.videoId,
+            ...songMetadataFromMatch(track, canonical),
+          };
         }
       } catch {
         // Ignore search errors — play with the original videoId.
@@ -1510,15 +1602,29 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
     if (version !== playVersionRef.current) return;
     const resolved = tracks.slice();
     resolved[clampedStart] = resolvedFirst;
-    const clampedIndex = Math.max(0, Math.min(startIndex, resolved.length - 1));
-    const lastTrack = resolved[resolved.length - 1];
+    let finalQueue = resolved;
+    let finalIndex = Math.max(0, Math.min(startIndex, resolved.length - 1));
+
+    if (shuffleRef.current && finalQueue.length > 1) {
+      const current = finalQueue[finalIndex];
+      finalQueue = [
+        current,
+        ...shuffledCopy([
+          ...finalQueue.slice(0, finalIndex),
+          ...finalQueue.slice(finalIndex + 1),
+        ]),
+      ];
+      finalIndex = 0;
+    }
+
+    const lastTrack = finalQueue[finalQueue.length - 1];
     const lastSeedVideoId = lastTrack ? (lastTrack.resolvedVideoId ?? lastTrack.videoId) : null;
     const nextSeed = lastTrack && lastTrack.source === "stream" && lastSeedVideoId
       ? { videoId: lastSeedVideoId, playlistId: null }
       : null;
     setQueueState({
-      queue: resolved,
-      queueIndex: clampedIndex,
+      queue: finalQueue,
+      queueIndex: finalIndex,
       queueOrigin: origin ?? null,
       autoplayTrackIds: [],
       autoplaySeed: nextSeed,
@@ -1703,13 +1809,7 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
       );
 
       const transformed = await Promise.all(
-        incoming.map(async (entry) => {
-          if (entry.kind === "video") {
-            const matched = await findClosestSongForVideoTrack(entry);
-            return matched ?? null;
-          }
-          return entry;
-        }),
+        incoming.map((entry) => resolveAutoplayEntryToSong(entry)),
       );
       const candidates = transformed.filter(
         (entry): entry is MediaTrack => entry !== null,
@@ -1781,13 +1881,7 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
                 (entry) => entry.kind !== "episode" && entry.kind !== "podcast",
               );
               const secondTransformed = await Promise.all(
-                secondIncoming.map(async (entry) => {
-                  if (entry.kind === "video") {
-                    const matched = await findClosestSongForVideoTrack(entry);
-                    return matched ?? null;
-                  }
-                  return entry;
-                }),
+                secondIncoming.map((entry) => resolveAutoplayEntryToSong(entry)),
               );
               const secondCandidates = secondTransformed.filter(
                 (entry): entry is MediaTrack => entry !== null,
@@ -1834,13 +1928,7 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
                 (e) => e.kind !== "episode" && e.kind !== "podcast",
               );
               const compTransformed = await Promise.all(
-                compIncoming.map(async (entry) => {
-                  if (entry.kind === "video") {
-                    const matched = await findClosestSongForVideoTrack(entry);
-                    return matched ?? null;
-                  }
-                  return entry;
-                }),
+                compIncoming.map((entry) => resolveAutoplayEntryToSong(entry)),
               );
               const compCandidates = compTransformed.filter(
                 (e): e is MediaTrack => e !== null,

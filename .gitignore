@@ -42,6 +42,8 @@ Website/
 .codex/
 .claude/
 .commandcode/
+agent-tools/
+terminals/
 *.lines.txt
 *.cjs
 ts_output.txt
