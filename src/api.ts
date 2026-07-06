@@ -5,13 +5,18 @@ import type {
   EntityDetail,
   ExtractedMetadata,
   LoudnessData,
+  LeadingSilenceData,
   MediaTrack,
   SearchResponse,
+  SearchSuggestion,
   SyncedLyricsResponse,
   StreamResponse,
   TrackAlbumResolution,
   WatchPlaylistResponse,
 } from "./types";
+import { getItem, setItem, removeItem } from "./storage";
+import { exportStreamVideoId, streamIdentityVideoIds, withResolvedAudioSrc } from "./utils/media";
+
 
 declare global {
   interface Window {
@@ -48,12 +53,28 @@ type CacheEntry<T> = {
   resolved: boolean;
   value: T | undefined;
   error: unknown | undefined;
+  insertedAt: number;
 };
 
 class MemoCache<T> {
   private entries = new Map<string, CacheEntry<T>>();
 
-  constructor(private readonly maxSize: number) {}
+  constructor(
+    private readonly maxSize: number,
+    private readonly ttlMs?: number,
+  ) {}
+
+  // A cache with a configured TTL evicts resolved entries past the
+  // wall-clock window from `insertedAt`. In-flight promises are
+  // never TTL'd — only the resolved value ages out. The combination
+  // of TTL eviction on read AND inline eviction in `peek` keeps TTL'd
+  // caches from ever serving a stale value to the player, while
+  // non-TTL'd caches behave exactly as before.
+  private isExpired(entry: CacheEntry<T>): boolean {
+    if (this.ttlMs === undefined) return false;
+    if (!entry.resolved) return false;
+    return Date.now() - entry.insertedAt > this.ttlMs;
+  }
 
   has(key: string): boolean {
     return this.entries.has(key);
@@ -61,11 +82,23 @@ class MemoCache<T> {
 
   // Returns the resolved value if (and only if) the cached promise has
   // settled successfully. Returns null for cache misses, pending promises,
-  // and rejected promises so callers can fall back to a loading state.
+  // rejected promises, AND resolved-but-TTL-expired entries (which we
+  // evict inline so the next call re-fetches from the backend). The TTL
+  // eviction is critical for caches like `streamCache` whose values are
+  // short-lived YouTube URLs that 403 once Google rotates the signature.
   peek(key: string): T | null {
     const entry = this.entries.get(key);
     if (!entry || !entry.resolved || entry.error !== undefined) return null;
+    if (this.isExpired(entry)) {
+      this.entries.delete(key);
+      return null;
+    }
     return entry.value ?? null;
+  }
+
+  isPending(key: string): boolean {
+    const entry = this.entries.get(key);
+    return entry !== undefined && !entry.resolved;
   }
 
   // Returns the cached promise if one exists (touching it for LRU order),
@@ -89,7 +122,18 @@ class MemoCache<T> {
     }
 
     const promise = factory();
-    const entry: CacheEntry<T> = { promise, resolved: false, value: undefined, error: undefined };
+    // Stamp the entry's creation time so `peek` and `getOrCreate`
+    // can confidently age it out by the configured TTL. Using
+    // wall-clock time means the TTL window remains accurate even
+    // across the page being backgrounded; the entry is also
+    // bounded by `maxSize`'s LRU eviction policy.
+    const entry: CacheEntry<T> = {
+      promise,
+      resolved: false,
+      value: undefined,
+      error: undefined,
+      insertedAt: Date.now(),
+    };
     promise
       .then((value) => {
         // Only record the value if this entry is still the live one for the
@@ -119,6 +163,28 @@ class MemoCache<T> {
     this.entries.delete(key);
   }
 
+  // Insert an already-resolved value into the cache WITHOUT disturbing
+  // an existing entry (whether pending, resolved, or TTL'd). Used by
+  // the cross-session lyrics snapshot in `getSyncedLyrics` to seed the
+  // in-memory cache from a localStorage hit so subsequent `peek` and
+  // `get` calls skip both the disk and the backend. Distinct from
+  // `getOrCreate`: `getOrCreate` returns a Promise (and rejoins the
+  // in-flight promise on cache hit), whereas `prime` is a fast
+  // sync-only path used to install a value we already hold
+  // synchronously.
+  prime(key: string, value: T): void {
+    if (this.entries.has(key)) return;
+    const entry: CacheEntry<T> = {
+      promise: Promise.resolve(value),
+      resolved: true,
+      value,
+      error: undefined,
+      insertedAt: Date.now(),
+    };
+    this.entries.set(key, entry);
+    this.evictIfNeeded();
+  }
+
   private evictIfNeeded(): void {
     if (this.entries.size <= this.maxSize) return;
     const oldestKey = this.entries.keys().next().value;
@@ -127,11 +193,113 @@ class MemoCache<T> {
 }
 
 const searchCache = new MemoCache<SearchResponse>(100);
+const searchSuggestionsCache = new MemoCache<SearchSuggestion[]>(100);
 const entityCache = new MemoCache<EntityDetail>(200);
 const artistCache = new MemoCache<ArtistDetail>(100);
-const streamCache = new MemoCache<StreamResponse>(300);
-const watchPlaylistCache = new MemoCache<WatchPlaylistResponse>(50);
-const syncedLyricsCache = new MemoCache<SyncedLyricsResponse | null>(200);
+// Stream URLs and watch playlists are short-lived on YouTube Music
+// — the Rust backend's STREAM_CACHE_TTL is 45 min and
+// WATCH_PLAYLIST_CACHE_TTL is 30 min. We pass slightly shorter TTLs
+// here (25 min / 20 min) so the frontend evicts a cached URL/min
+// playlist BEFORE the backend would have invalidated it, keeping
+// us from ever serving a 403'd URL or stale playlist response
+// to the player.
+const streamCache = new MemoCache<StreamResponse>(300, 25 * 60 * 1000);
+const watchPlaylistCache = new MemoCache<WatchPlaylistResponse>(50, 20 * 60 * 1000);
+// Synced lyrics results include provider metadata that's reasonably
+// time-stable; we keep them around for a moderate TTL so the LyricsPage
+// doesn't repeatedly fetch across the same listening session. The TTL
+// is generous (1 h) because lyrics don't have a hard expiry — it's
+// purely a memory bound for long sessions where the user explores many
+// tracks.
+const syncedLyricsCache = new MemoCache<SyncedLyricsResponse | null>(200, 60 * 60 * 1000);
+
+// Session-scoped lyrics exhaustion. Queue prefetch failures accumulate per
+// track; after LYRICS_EXHAUSTION_THRESHOLD misses the active-track paths
+// short-circuit to "no lyrics" instead of re-hitting the multi-provider
+// backend (and the LyricsPage / PlayerBar loading overlays).
+const LYRICS_EXHAUSTION_THRESHOLD = 3;
+const lyricsFailureCounts = new Map<string, number>();
+const lyricsExhaustedKeys = new Set<string>();
+
+// Cross-session persistence for synced lyrics.
+//
+// Lyrics are the one piece of "derived info" that costs a noticeable
+// fetch latency (multi-provider roundtrip through the Rust backend)
+// AND is user-visible on the very first paint of the LyricsPage after
+// a cold launch. The in-memory `syncedLyricsCache` above dies with the
+// app, so we keep a tiny secondary layer in localStorage: at most one
+// snapshot per currently-playing stream track. The snapshot is replaced
+// (or evicted) as soon as the user moves on, per the user-facing rule
+// "don't bother holding it once the user passes the song".
+//
+//   * Keyed by `velocity-session-lyrics-${videoId}` so the existing
+//     `src/storage.ts::clearAll()` `velocity-` prefix filter sweeps it
+//     up when the user hits Settings → Clear all user data — no extra
+//     tear-down wiring needed.
+//   * Eviction on track change lives in `src/player.tsx` via
+//     `evictPersistedLyricsExcept(currentVideoId)`. With a typical
+//     session the disk holds exactly one snapshot at any moment.
+const PERSISTED_LYRICS_PREFIX = "velocity-session-lyrics-";
+
+function persistedLyricsKey(videoId: string): string {
+  return `${PERSISTED_LYRICS_PREFIX}${videoId}`;
+}
+
+// Read a JSON-encoded lyrics snapshot from localStorage. Returns null
+// on miss OR on any decode failure (corrupt entry, schema drift). The
+// caller depends on this being non-throwing because the localStorage
+// helper can throw on access-denied in some privacy modes — we never
+// want a stale key to crash a render.
+function readPersistedLyrics(videoId: string): SyncedLyricsResponse | null {
+  try {
+    const raw = getItem(persistedLyricsKey(videoId));
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as SyncedLyricsResponse | null | undefined;
+    if (!parsed || typeof parsed !== "object" || !Array.isArray(parsed.lines)) {
+      return null;
+    }
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+function writePersistedLyrics(videoId: string, lyrics: SyncedLyricsResponse): void {
+  try {
+    setItem(persistedLyricsKey(videoId), JSON.stringify(lyrics));
+  } catch {
+    // localStorage disabled, full, or in a privacy mode. Best-effort only.
+  }
+}
+
+// Removes every `velocity-session-lyrics-*` key whose `videoId` is not
+// the supplied `keepVideoId`. Pass `null` to drop ALL of them (used when
+// nothing is currently playing).
+//
+// IMPORTANT: this goes through `removeItem` from `src/storage.ts`
+// (NOT raw `localStorage.removeItem`) so the deletion is mirrored to
+// the Rust `data_store` via `invoke("delete_user_data", { key })`.
+// Skipping that mirror would leave stale lyrics snapshots in the
+// backend's coalesced JSON file, and `src/storage.ts::init()` would
+// silently rehydrate them on the next launch via `load_all_user_data`
+// — defeating the entire eviction strategy.
+//
+// Walks `localStorage` from end → start so removals during iteration
+// don't shift the indexes the next iteration is about to read; this
+// matches the pattern already used in `src/storage.ts::clearAll()`.
+export function evictPersistedLyricsExcept(keepVideoId: string | null): void {
+  for (let i = localStorage.length - 1; i >= 0; i--) {
+    const key = localStorage.key(i);
+    if (!key || !key.startsWith(PERSISTED_LYRICS_PREFIX)) continue;
+    if (keepVideoId && key === persistedLyricsKey(keepVideoId)) continue;
+    try {
+      removeItem(key);
+    } catch {
+      // ignore
+    }
+  }
+}
+
 const artworkCache = new MemoCache<string>(500);
 const monthlyListenersCache = new MemoCache<string | null>(200);
 
@@ -166,6 +334,14 @@ export function peekSearchMusic(query: string): SearchResponse | null {
   return searchCache.peek(key);
 }
 
+export async function fetchSearchSuggestions(query: string): Promise<SearchSuggestion[]> {
+  const key = query.trim().toLowerCase();
+  if (!key) return [];
+  return searchSuggestionsCache.getOrCreate(key, () =>
+    invokeCommand<SearchSuggestion[]>("search_suggestions", { query: key }),
+  );
+}
+
 export async function cacheArtwork(url: string): Promise<string> {
   const key = url.trim();
   if (!key) throw new Error("Artwork URL is empty.");
@@ -186,16 +362,34 @@ export function peekEntityDetail(browseId: string): EntityDetail | null {
   return entityCache.peek(browseId);
 }
 
+const ARTIST_DETAIL_TIMEOUT_MS = 25_000;
+
 export async function getArtistDetail(browseId: string): Promise<ArtistDetail> {
   return artistCache.getOrCreate(browseId, () =>
-    invokeCommand<ArtistDetail>("get_artist_detail", { browseId }),
+    Promise.race([
+      invokeCommand<ArtistDetail>("get_artist_detail", { browseId }),
+      new Promise<never>((_, reject) => {
+        setTimeout(
+          () => reject(new Error("Loading this artist took too long. Try again.")),
+          ARTIST_DETAIL_TIMEOUT_MS,
+        );
+      }),
+    ]),
   );
+}
+
+export async function getArtistTopSongsExtended(browseId: string): Promise<MediaTrack[]> {
+  return invokeCommand<MediaTrack[]>("get_artist_top_songs_extended", { browseId });
 }
 
 // Synchronously returns the cached artist detail if available, else null.
 // Used to skip the loading-panel flash on Back/Forward navigation.
 export function peekArtistDetail(browseId: string): ArtistDetail | null {
   return artistCache.peek(browseId);
+}
+
+export function invalidateArtistDetail(browseId: string): void {
+  artistCache.delete(browseId);
 }
 
 /**
@@ -264,33 +458,464 @@ export async function getWatchPlaylist(
   );
 }
 
-export async function getSyncedLyricsByMeta(fields: {
+type LyricsPrefetchTrack = Pick<
+  MediaTrack,
+  | "id"
+  | "videoId"
+  | "resolvedVideoId"
+  | "source"
+  | "title"
+  | "artist"
+  | "album"
+  | "durationSeconds"
+  | "findLyrics"
+>;
+
+function lyricsTrackExhaustionKey(track: LyricsPrefetchTrack): string | null {
+  if (track.source === "stream") {
+    const identityIds = streamIdentityVideoIds(track);
+    if (identityIds.length === 0) return null;
+    return `stream:${identityIds.sort().join("\0")}`;
+  }
+  if (track.source === "upload" && track.findLyrics) {
+    return `upload:${track.id}`;
+  }
+  return null;
+}
+
+function recordLyricsFailureForTrack(track: LyricsPrefetchTrack): void {
+  const key = lyricsTrackExhaustionKey(track);
+  if (!key) return;
+  const nextCount = (lyricsFailureCounts.get(key) ?? 0) + 1;
+  if (nextCount >= LYRICS_EXHAUSTION_THRESHOLD) {
+    lyricsFailureCounts.delete(key);
+    lyricsExhaustedKeys.add(key);
+    return;
+  }
+  lyricsFailureCounts.set(key, nextCount);
+}
+
+function clearLyricsExhaustionForTrack(track: LyricsPrefetchTrack): void {
+  const key = lyricsTrackExhaustionKey(track);
+  if (!key) return;
+  lyricsFailureCounts.delete(key);
+  lyricsExhaustedKeys.delete(key);
+}
+
+/** Whether repeated prefetch / fetch attempts have given up on this track. */
+export function isLyricsExhaustedForTrack(track: LyricsPrefetchTrack): boolean {
+  const key = lyricsTrackExhaustionKey(track);
+  return key !== null && lyricsExhaustedKeys.has(key);
+}
+
+function syncedLyricsMetaCacheKey(fields: {
   title: string;
   artist: string;
   album?: string | null;
   durationSeconds?: number | null;
-}): Promise<SyncedLyricsResponse | null> {
-  return invokeCommand<SyncedLyricsResponse | null>("get_synced_lyrics_by_meta", {
-    title: fields.title,
-    artist: fields.artist,
-    album: fields.album,
-    durationSeconds: fields.durationSeconds,
-  });
+}): string {
+  return [
+    fields.title.trim().toLowerCase(),
+    fields.artist.trim().toLowerCase(),
+    (fields.album ?? "").trim().toLowerCase(),
+    fields.durationSeconds ?? "",
+  ].join("\0");
 }
 
-export async function getSyncedLyrics(videoId: string): Promise<SyncedLyricsResponse | null> {
+export async function getSyncedLyricsByMeta(
+  fields: {
+    title: string;
+    artist: string;
+    album?: string | null;
+    durationSeconds?: number | null;
+    videoId?: string | null;
+  },
+  options?: { exhaustionTrack?: LyricsPrefetchTrack },
+): Promise<SyncedLyricsResponse | null> {
+  const exhaustionTrack = options?.exhaustionTrack;
+  if (exhaustionTrack && isLyricsExhaustedForTrack(exhaustionTrack)) {
+    return null;
+  }
+
+  const key = syncedLyricsMetaCacheKey(fields);
+  try {
+    const result = await syncedLyricsCache.getOrCreate(
+      key,
+      () =>
+        invokeCommand<SyncedLyricsResponse | null>("get_synced_lyrics_by_meta", {
+          title: fields.title,
+          artist: fields.artist,
+          album: fields.album,
+          durationSeconds: fields.durationSeconds,
+          videoId: fields.videoId ?? null,
+        }),
+      (r) => r !== null,
+    );
+    if (exhaustionTrack) {
+      if (result === null) {
+        // Metadata-only misses must not exhaust stream tracks — the active
+        // path still roundtrips through get_synced_lyrics (YTM native).
+        if (exhaustionTrack.source === "upload") {
+          recordLyricsFailureForTrack(exhaustionTrack);
+        }
+      } else {
+        clearLyricsExhaustionForTrack(exhaustionTrack);
+        if (exhaustionTrack.source === "stream") {
+          primeSyncedLyricsForTrack(exhaustionTrack, result);
+        }
+      }
+    }
+    return result;
+  } catch (error) {
+    if (exhaustionTrack?.source === "upload") recordLyricsFailureForTrack(exhaustionTrack);
+    throw error;
+  }
+}
+
+export async function getSyncedLyrics(
+  videoId: string,
+  options?: { persist?: boolean },
+): Promise<SyncedLyricsResponse | null> {
   // A null result means no provider had lyrics this time. Evict it via
   // shouldCache so a later visit retries the (multi-provider) fetch instead
   // of caching the miss for the whole session.
-  return syncedLyricsCache.getOrCreate(
+  //
+  // The order below is in-mem → cross-session localStorage snapshot → backend.
+  // The disk layer exists so a cold launch with a restored session can
+  // skip the multi-provider roundtrip on first paint (LyricsPage shows it
+  // for the first ~10s otherwise). Disk reads here are O(1) on a single
+  // key; the in-mem `prime` lets the very next `peek` AND `get` skip
+  // both disk AND the backend. See `peekPersistedLyrics` /
+  // `evictPersistedLyricsExcept` for the parallel "wipe on track change"
+  // half of the contract.
+  //
+  // Active-track / LyricsPage callers pass `persist: true` and always
+  // roundtrip through `get_synced_lyrics` so we pick up YouTube Music's
+  // native timed lyrics instead of serving a queue-prefetch snapshot that
+  // only went through the metadata providers.
+  const persist = options?.persist === true;
+  if (!persist) {
+    const inMem = syncedLyricsCache.peek(videoId);
+    if (inMem !== null) return inMem;
+
+    // Cross-session lift. We deliberately skip writing a snapshot on the
+    // read path (the prefix is the only invariant) and rely on the
+    // BACKEND branch's `result !== null` write below to (re-)persist.
+    // That keeps a stale "no lyrics here" miss out of localStorage —
+    // re-runs are cheap, and a stale null could mask a lyrics-availability
+    // change after the user toggles providers.
+    const persisted = readPersistedLyrics(videoId);
+    if (persisted !== null) {
+      syncedLyricsCache.prime(videoId, persisted);
+      return persisted;
+    }
+  } else {
+    syncedLyricsCache.delete(videoId);
+  }
+
+  // Backend roundtrip. `getOrCreate` returns the EXISTING in-flight
+  // promise if a prefetch already started (e.g., the queue's next-up
+  // prefetch at `src/player.tsx`'s lyrics-prefetch effect), so we
+  // never double-fire the backend for the same `videoId` from within
+  // the same session.
+  const result = await syncedLyricsCache.getOrCreate(
     videoId,
     () => invokeCommand<SyncedLyricsResponse | null>("get_synced_lyrics", { videoId }),
-    (result) => result !== null,
+    (r) => r !== null,
   );
+  // Persist ONLY when the caller explicitly opted in (active-track
+  // paths — LyricsPage, PlayerBar's lyricsAvailable effect). The
+  // lyrics-prefetch effect and SearchPage click-to-warmboth leave it
+  // off so we never accumulate stale snapshots for tracks the user
+  // isn't listening to. Combined with the track-change eviction in
+  // `src/player.tsx`, this caps disk usage to the currently-playing
+  // track at any moment.
+  if (persist && result !== null) {
+    writePersistedLyrics(videoId, result);
+  }
+  return result;
 }
 
 export function peekSyncedLyrics(videoId: string): SyncedLyricsResponse | null {
-  return syncedLyricsCache.peek(videoId);
+  // Two-layer peek: in-mem cache first, then cross-session localStorage.
+  // We deliberately do NOT prime the in-mem cache from here — `peek`
+  // is by contract synchronous, so any side-effect of mutating the
+  // cache mid-render would be a behavior change for callers that
+  // expect `peek` to be a pure reader. The next `getSyncedLyrics`
+  // picks the disk entry up via `readPersistedLyrics` and primes then.
+  const inMem = syncedLyricsCache.peek(videoId);
+  if (inMem !== null) return inMem;
+  return readPersistedLyrics(videoId);
+}
+
+/**
+ * Lift cross-session lyrics into the in-mem cache for instant first paint.
+ * Safe to call during boot or in effects — not during render.
+ */
+export function hydratePersistedLyricsForTrack(
+  track: Pick<
+    MediaTrack,
+    | "id"
+    | "videoId"
+    | "resolvedVideoId"
+    | "source"
+    | "title"
+    | "artist"
+    | "album"
+    | "durationSeconds"
+  >,
+): SyncedLyricsResponse | null {
+  for (const videoId of streamIdentityVideoIds(track)) {
+    const inMem = syncedLyricsCache.peek(videoId);
+    if (inMem !== null) return inMem;
+    const persisted = readPersistedLyrics(videoId);
+    if (persisted !== null) {
+      syncedLyricsCache.prime(videoId, persisted);
+      return persisted;
+    }
+  }
+  const metaCached = peekSyncedLyricsByMetaForTrack(track);
+  if (metaCached !== null && track.source === "stream") {
+    primeSyncedLyricsForTrack(track, metaCached);
+    return metaCached;
+  }
+  return null;
+}
+
+/** Mirror in-mem lyrics for the active stream track to the cross-session snapshot. */
+export function persistCachedLyricsForTrack(
+  track: Pick<MediaTrack, "id" | "videoId" | "resolvedVideoId" | "source">,
+): void {
+  if (track.source !== "stream") return;
+  const canonicalId = lyricsCacheVideoId(track);
+  if (!canonicalId) return;
+  for (const videoId of streamIdentityVideoIds(track)) {
+    const inMem = syncedLyricsCache.peek(videoId);
+    if (inMem !== null) {
+      writePersistedLyrics(canonicalId, inMem);
+      return;
+    }
+  }
+}
+
+/** Canonical video id for lyrics cache keys — matches stream resolution. */
+export function lyricsCacheVideoId(
+  track: Pick<MediaTrack, "videoId" | "resolvedVideoId" | "source">,
+): string | null {
+  if (track.source !== "stream") return null;
+  return track.resolvedVideoId ?? track.videoId ?? null;
+}
+
+/** Peek every stream identity id so prefetch under `resolvedVideoId` still hits. */
+export function peekSyncedLyricsForTrack(
+  track: Pick<
+    MediaTrack,
+    | "id"
+    | "videoId"
+    | "resolvedVideoId"
+    | "source"
+    | "title"
+    | "artist"
+    | "album"
+    | "durationSeconds"
+  >,
+): SyncedLyricsResponse | null {
+  for (const videoId of streamIdentityVideoIds(track)) {
+    const cached = peekSyncedLyrics(videoId);
+    if (cached !== null) return cached;
+  }
+  return peekSyncedLyricsByMetaForTrack(track);
+}
+
+export function isSyncedLyricsPending(videoId: string): boolean {
+  return syncedLyricsCache.isPending(videoId);
+}
+
+export function isSyncedLyricsPendingForTrack(
+  track: Pick<
+    MediaTrack,
+    | "id"
+    | "videoId"
+    | "resolvedVideoId"
+    | "source"
+    | "title"
+    | "artist"
+    | "album"
+    | "durationSeconds"
+  >,
+): boolean {
+  if (streamIdentityVideoIds(track).some((videoId) => isSyncedLyricsPending(videoId))) {
+    return true;
+  }
+  return isSyncedLyricsMetaPendingForTrack(track);
+}
+
+function hasLyricsPrefetchMeta(
+  track: Pick<MediaTrack, "title" | "artist">,
+): boolean {
+  return Boolean(track.title.trim() && track.artist.trim());
+}
+
+function lyricsPrefetchMetaFields(
+  track: Pick<MediaTrack, "title" | "artist" | "album" | "durationSeconds" | "videoId" | "resolvedVideoId" | "source">,
+) {
+  return {
+    title: track.title,
+    artist: track.artist,
+    album: track.album,
+    durationSeconds: track.durationSeconds,
+    videoId: track.source === "stream" ? (track.resolvedVideoId ?? track.videoId ?? null) : null,
+  };
+}
+
+function peekSyncedLyricsByMetaForTrack(
+  track: Pick<
+    MediaTrack,
+    "source" | "title" | "artist" | "album" | "durationSeconds" | "videoId" | "resolvedVideoId"
+  >,
+): SyncedLyricsResponse | null {
+  if (!hasLyricsPrefetchMeta(track)) return null;
+  const metaFields = lyricsPrefetchMetaFields(track);
+  const metaKey = syncedLyricsMetaCacheKey(metaFields);
+  return syncedLyricsCache.peek(metaKey);
+}
+
+function isSyncedLyricsMetaPendingForTrack(
+  track: Pick<
+    MediaTrack,
+    "source" | "title" | "artist" | "album" | "durationSeconds" | "videoId" | "resolvedVideoId"
+  >,
+): boolean {
+  if (!hasLyricsPrefetchMeta(track)) return false;
+  const metaFields = lyricsPrefetchMetaFields(track);
+  const metaKey = syncedLyricsMetaCacheKey(metaFields);
+  return syncedLyricsCache.isPending(metaKey);
+}
+
+/** Install a lyrics payload under every stream identity id for the track. */
+function primeSyncedLyricsForTrack(
+  track: Pick<MediaTrack, "id" | "videoId" | "resolvedVideoId" | "source">,
+  result: SyncedLyricsResponse,
+): void {
+  for (const videoId of streamIdentityVideoIds(track)) {
+    syncedLyricsCache.prime(videoId, result);
+  }
+}
+
+/**
+ * Best-effort queue prefetch for synced lyrics. Stream tracks with title +
+ * artist warm the metadata-provider cache only. The active track's
+ * LyricsPage fetch uses `get_synced_lyrics` (incl. YouTube Music native
+ * timed lyrics) and bypasses these prefetch snapshots.
+ */
+export function prefetchSyncedLyricsForTrack(track: LyricsPrefetchTrack): void {
+  if (isLyricsExhaustedForTrack(track)) return;
+  if (peekSyncedLyricsForTrack(track)) return;
+  if (isSyncedLyricsPendingForTrack(track)) return;
+
+  if (track.source === "stream") {
+    const identityIds = streamIdentityVideoIds(track);
+    if (identityIds.length === 0) return;
+
+    if (hasLyricsPrefetchMeta(track)) {
+      const metaFields = lyricsPrefetchMetaFields(track);
+      const metaKey = syncedLyricsMetaCacheKey(metaFields);
+      if (syncedLyricsCache.isPending(metaKey)) return;
+      void getSyncedLyricsByMeta(metaFields, { exhaustionTrack: track });
+      return;
+    }
+
+    const videoId = lyricsCacheVideoId(track) ?? identityIds[0];
+    if (videoId) {
+      void getSyncedLyrics(videoId)
+        .then((result) => {
+          if (result === null) recordLyricsFailureForTrack(track);
+          else clearLyricsExhaustionForTrack(track);
+        })
+        .catch(() => {
+          recordLyricsFailureForTrack(track);
+        });
+    }
+    return;
+  }
+
+  if (track.source === "upload" && track.findLyrics && hasLyricsPrefetchMeta(track)) {
+    const metaFields = lyricsPrefetchMetaFields(track);
+    const metaKey = syncedLyricsMetaCacheKey(metaFields);
+    if (syncedLyricsCache.isPending(metaKey)) return;
+    void getSyncedLyricsByMeta(metaFields, { exhaustionTrack: track });
+  }
+}
+
+async function fetchSyncedLyricsForStreamTrack(
+  track: LyricsPrefetchTrack,
+  options?: { persist?: boolean },
+): Promise<SyncedLyricsResponse | null> {
+  // Rejoin a queue prefetch that keyed the in-flight promise under a
+  // sibling identity id (e.g. the pre-resolve `videoId` while the active
+  // path prefers `resolvedVideoId`).
+  for (const videoId of streamIdentityVideoIds(track)) {
+    if (isSyncedLyricsPending(videoId)) {
+      try {
+        const result = await getSyncedLyrics(videoId, options);
+        if (result === null) recordLyricsFailureForTrack(track);
+        else clearLyricsExhaustionForTrack(track);
+        return result;
+      } catch (error) {
+        recordLyricsFailureForTrack(track);
+        throw error;
+      }
+    }
+  }
+
+  if (hasLyricsPrefetchMeta(track)) {
+    const metaFields = lyricsPrefetchMetaFields(track);
+    const metaKey = syncedLyricsMetaCacheKey(metaFields);
+    if (syncedLyricsCache.isPending(metaKey)) {
+      try {
+        const result = await getSyncedLyricsByMeta(metaFields, { exhaustionTrack: track });
+        if (options?.persist) {
+          // Active-track callers still roundtrip through get_synced_lyrics.
+        } else if (result !== null) {
+          return result;
+        }
+      } catch (error) {
+        if (!options?.persist) throw error;
+      }
+    } else if (!options?.persist) {
+      const metaCached = syncedLyricsCache.peek(metaKey);
+      if (metaCached !== null) {
+        primeSyncedLyricsForTrack(track, metaCached);
+        return metaCached;
+      }
+    }
+  }
+
+  const videoId = lyricsCacheVideoId(track);
+  if (!videoId) return null;
+  try {
+    const result = await getSyncedLyrics(videoId, options);
+    if (result === null) recordLyricsFailureForTrack(track);
+    else clearLyricsExhaustionForTrack(track);
+    return result;
+  } catch (error) {
+    recordLyricsFailureForTrack(track);
+    throw error;
+  }
+}
+
+export async function getSyncedLyricsForTrack(
+  track: LyricsPrefetchTrack,
+  options?: { persist?: boolean },
+): Promise<SyncedLyricsResponse | null> {
+  if (!options?.persist) {
+    const cached = hydratePersistedLyricsForTrack(track);
+    if (cached !== null) return cached;
+  }
+
+  if (isLyricsExhaustedForTrack(track)) return null;
+
+  return fetchSyncedLyricsForStreamTrack(track, options);
 }
 
 export async function resolveTrackAlbum(videoId: string): Promise<TrackAlbumResolution> {
@@ -303,6 +928,19 @@ export async function getTrackDuration(videoId: string): Promise<number | null> 
 
 export async function listImportedTracks(): Promise<MediaTrack[]> {
   return invokeCommand<MediaTrack[]>("list_imported_tracks");
+}
+
+/** Restore stripped upload playback fields after context-menu serialization. */
+export async function hydrateUploadTrackForPlayback(track: MediaTrack): Promise<MediaTrack> {
+  if (track.source !== "upload") return track;
+  if (track.filePath) return withResolvedAudioSrc(track);
+  try {
+    const tracks = await listImportedTracks();
+    const match = tracks.find((row) => row.id === track.id);
+    return withResolvedAudioSrc(match ?? track);
+  } catch {
+    return withResolvedAudioSrc(track);
+  }
 }
 
 export async function extractFileMetadata(
@@ -360,6 +998,10 @@ export async function analyzeLoudnessChunk(
   });
 }
 
+export async function detectLeadingSilence(filePath: string): Promise<LeadingSilenceData> {
+  return invokeCommand<LeadingSilenceData>("detect_leading_silence", { filePath });
+}
+
 export async function saveOffline(videoId: string): Promise<void> {
   await invokeCommand("save_offline", { videoId });
 }
@@ -378,6 +1020,34 @@ export async function clearAllOffline(): Promise<void> {
 
 export async function getOfflinePath(videoId: string): Promise<string | null> {
   return invokeCommand<string | null>("get_offline_path", { videoId });
+}
+
+/** Offline files are keyed by videoId — try every identity id on the track. */
+export async function getOfflinePathForTrack(
+  track: Pick<MediaTrack, "id" | "videoId" | "resolvedVideoId" | "source">,
+): Promise<string | null> {
+  for (const videoId of streamIdentityVideoIds(track)) {
+    const path = await getOfflinePath(videoId);
+    if (path) return path;
+  }
+  return null;
+}
+
+/**
+ * Primary + alternate video ids for a "Save to my device" export.
+ * Synchronous — the Rust export path already walks cached audio and
+ * every fallback id through yt-dlp, so blocking on YT Music search here
+ * only left the Saving panel spinning with no backend work in flight.
+ */
+export function deviceExportVideoIds(
+  track: MediaTrack,
+): { videoId: string; fallbackVideoIds: string[] } {
+  const videoId = exportStreamVideoId(track);
+  if (!videoId) {
+    throw new Error("This track has no streamable audio to export.");
+  }
+  const fallbackVideoIds = streamIdentityVideoIds(track).filter((id) => id !== videoId);
+  return { videoId, fallbackVideoIds };
 }
 
 // ── Save to my device (right-click "Save to my device" export) ───────────
@@ -408,6 +1078,8 @@ export type SaveTrackToMp3Request = {
    */
   requestId?: string;
   videoId: string;
+  /** Alternate ids for cached-audio lookup and yt-dlp retries. */
+  fallbackVideoIds?: string[];
   title: string;
   artist: string;
   album?: string | null;
@@ -423,6 +1095,7 @@ export type SaveTrackToMp3Request = {
 
 export type SaveAlbumTrackEntry = {
   videoId: string;
+  fallbackVideoIds?: string[];
   title: string;
   artist: string;
   trackNumber?: number | null;
@@ -471,6 +1144,7 @@ export async function saveAlbumToMp3(
 // by the backend).
 export type SavePlaylistTrackEntry = {
   videoId: string;
+  fallbackVideoIds?: string[];
   title: string;
   artist: string;
   /**
@@ -593,6 +1267,43 @@ export type ExternalPlaylistImport = {
   tracks: ExternalPlaylistTrack[];
 };
 
+const EXTERNAL_PLAYLIST_IMPORT_TIMEOUT_MS = 130_000;
+
 export async function importExternalPlaylist(url: string): Promise<ExternalPlaylistImport> {
-  return invokeCommand<ExternalPlaylistImport>("import_external_playlist", { request: { url } });
+  return Promise.race([
+    invokeCommand<ExternalPlaylistImport>("import_external_playlist", { request: { url } }),
+    new Promise<never>((_, reject) => {
+      setTimeout(
+        () =>
+          reject(
+            new Error(
+              "Playlist import timed out. Large playlists can take a minute — wait a moment and try again.",
+            ),
+          ),
+        EXTERNAL_PLAYLIST_IMPORT_TIMEOUT_MS,
+      );
+    }),
+  ]);
+}
+
+export type DiscordPresencePayload = {
+  enabled: boolean;
+  title?: string | null;
+  artist?: string | null;
+  album?: string | null;
+  state?: string | null;
+  coverUrl?: string | null;
+  videoId?: string | null;
+  /** Paused or buffering — backend clears the progress bar. */
+  paused?: boolean;
+  /** Unix milliseconds: when playback effectively started (now − elapsed). */
+  startedAt?: number | null;
+  /** Unix milliseconds: when the track ends (startedAt + duration). */
+  endsAt?: number | null;
+  /** Monotonic sync id — stale async invokes are ignored by the Rust worker. */
+  generation?: number;
+};
+
+export async function syncDiscordPresence(payload: DiscordPresencePayload): Promise<boolean> {
+  return invokeCommand<boolean>("sync_discord_presence", { payload });
 }

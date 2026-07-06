@@ -34,7 +34,7 @@ import { usePlaylists, DESCRIPTION_MAX_LENGTH, PLAYLIST_TITLE_MAX_LENGTH } from 
 import { usePlayer, type QueueOrigin } from "../player";
 import type { MediaTrack } from "../types";
 import { ArtistCreditText, useArtworkAccent } from "./PagesShared";
-import { formatOptionalDuration, withResolvedAudioSrc } from "../utils/media";
+import { formatOptionalDuration, isSameSongTrack, withResolvedAudioSrc } from "../utils/media";
 import { mixRgb, rgbToCss } from "../utils/artwork-color";
 import type { View } from "./Sidebar";
 import { getDirectArtistBrowseId, resolveArtistBrowseId } from "../utils/navigation";
@@ -262,12 +262,9 @@ export function UserPlaylistPage({
   const [firstTrackHovered, setFirstTrackHovered] = useState(false);
   const firstTrackActive = useMemo(() => {
     const first = tracks[0];
-    if (!first || !player.currentTrack || !playlist) return false;
-    return player.currentTrack.id === first.id && (
-      !playlistOrigin ||
-      (player.queueOrigin?.kind === "user-playlist" && player.queueOrigin.id === playlist.id)
-    );
-  }, [player.currentTrack, player.queueOrigin, tracks, playlistOrigin, playlist]);
+    if (!first) return false;
+    return isSameSongTrack(player.currentTrack, first);
+  }, [player.currentTrack, tracks]);
 
   if (!playlist) {
     return (
@@ -693,18 +690,11 @@ function AlbumTrackRow({
 }) {
   const player = usePlayer();
   const collection = useCollection();
-  const active = (
-    player.currentTrack?.videoId && track.videoId
-      ? player.currentTrack.videoId === track.videoId
-      : player.currentTrack?.id === track.id
-  ) && (
-    !queueOrigin ||
-    (player.queueOrigin?.kind === "user-playlist" && player.queueOrigin.id === (queueOrigin as { kind: "user-playlist"; id: string }).id)
-  );
+  const active = isSameSongTrack(player.currentTrack, track);
   const playingActive = active && player.isPlaying;
   const bufferingActive = active && player.isBuffering;
   const contextPayload = useMemo(() => encodeTrackForContextMenu(track), [track]);
-  const isSaved = collection.isSongSaved(track.id);
+  const isSaved = collection.isTrackSaved(track);
   const directArtistBrowseId = onNavigate ? getDirectArtistBrowseId(track) : null;
   const handleResolveNavigate = useCallback(() => {
     if (!onNavigate) return;
@@ -862,14 +852,7 @@ function CompactTrackRow({
   queueOrigin?: QueueOrigin | null;
 }) {
   const player = usePlayer();
-  const active = (
-    player.currentTrack?.videoId && track.videoId
-      ? player.currentTrack.videoId === track.videoId
-      : player.currentTrack?.id === track.id
-  ) && (
-    !queueOrigin ||
-    (player.queueOrigin?.kind === "user-playlist" && player.queueOrigin.id === (queueOrigin as { kind: "user-playlist"; id: string }).id)
-  );
+  const active = isSameSongTrack(player.currentTrack, track);
   const playingActive = active && player.isPlaying;
   const bufferingActive = active && player.isBuffering;
   const contextPayload = useMemo(() => encodeTrackForContextMenu(track), [track]);

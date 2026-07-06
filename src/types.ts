@@ -29,6 +29,11 @@ export type SearchResponse = {
   results: SearchItem[];
 };
 
+export type SearchSuggestion = {
+  text: string;
+  fromHistory: boolean;
+};
+
 export type QueueOrigin =
   | { kind: "artist"; browseId: string; name?: string }
   | { kind: "album"; browseId: string; name?: string }
@@ -52,6 +57,8 @@ export type MediaTrack = {
   durationSeconds?: number | null;
   playCount?: string | null;
   cover?: string | null;
+  /** On-disk cover path for uploads, preserved before `convertFileSrc`. */
+  coverFilePath?: string | null;
   videoId?: string | null;
   /**
    * The canonical audio-only Topic-upload videoId, set by
@@ -59,10 +66,10 @@ export type MediaTrack = {
    * videoId for a track whose `videoId` points at a music video.
    *
    * Crucially, `videoId` and `id` are NOT changed — they preserve the
-   * track's UI identity so that play-button active-state checks
-   * (`isTrackActive`, `isItemPlaying`) still match the original track
-   * displayed in track lists, artist pages, album pages, and search
-   * results. The load effect and prefetch logic use
+   * track's release-scoped id so list rows keep a stable row identity.
+   * Play-button active-state checks (`isSameSongTrack`, `isItemPlaying`)
+   * match by underlying video id across search, album, playlist, and
+   * artist views. The load effect and prefetch logic use
    * `resolvedVideoId ?? videoId` for actual stream resolution.
    */
   resolvedVideoId?: string | null;
@@ -109,6 +116,8 @@ export type ArtistDetail = {
   banner?: string | null;
   monthlyListeners?: string | null;
   topSongs: MediaTrack[];
+  /** True when YT Music signals more top tracks exist beyond the first page. */
+  topSongsHasMore?: boolean;
   shelves: ArtistShelf[];
 };
 
@@ -134,6 +143,11 @@ export type LoudnessData = {
   loudnessRange?: number | null;
   threshold?: number | null;
   targetOffset?: number | null;
+  analysisVersion?: number | null;
+};
+
+export type LeadingSilenceData = {
+  skipSeconds: number | null;
   analysisVersion?: number | null;
 };
 

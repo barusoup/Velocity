@@ -1,10 +1,52 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { LoaderCircle, X } from "lucide-react";
+import {
+  hydratePersistedLyricsForTrack,
+  isLyricsExhaustedForTrack,
+  lyricsCacheVideoId,
+} from "../api";
 import { fetchSyncedLyrics, fetchSyncedLyricsByMeta, findActiveLyricIndex, type SyncedLyrics } from "../lyrics";
 import { useAccent } from "../accent-context";
+import { useSetting } from "../settings";
 import { currentAudio, usePlayer } from "../player";
 import { rgbToCss, type RgbColor } from "../utils/artwork-color";
 import { type View } from "./Sidebar";
+
+/** Map a bar's horizontal position to the analyser spectrum (log-spaced). */
+function sampleLogFrequencyAt(
+  dataArray: Float32Array,
+  t: number,
+  minDb: number,
+  maxDb: number,
+): number {
+  const bufferLength = dataArray.length;
+  if (bufferLength <= 1) return 0;
+
+  const dbRange = maxDb - minDb;
+  if (dbRange <= 0) return 0;
+
+  const minBin = 1;
+  const maxBin = bufferLength - 1;
+  const logMin = Math.log(minBin);
+  const logMax = Math.log(maxBin);
+  const clampedT = Math.min(1, Math.max(0, t));
+  const center = Math.exp(logMin + clampedT * (logMax - logMin));
+  const left = Math.min(maxBin, Math.max(minBin, Math.floor(center)));
+  const right = Math.min(maxBin, left + 1);
+  const frac = center - left;
+
+  const loDb = dataArray[left] ?? minDb;
+  const hiDb = dataArray[right] ?? minDb;
+  const db = loDb * (1 - frac) + hiDb * frac;
+
+  return Math.max(0, Math.min(1, (db - minDb) / dbRange));
+}
+
+/** Bars ease to flat at full opacity, then the visualizer fades out. */
+const PAUSE_SETTLE_MS = 300;
+const PAUSE_FADE_MS = 200;
+
+type PausePhase = "idle" | "settling" | "fading";
 
 function WaveformVisualizer({
   getAnalyser,
@@ -19,27 +61,33 @@ function WaveformVisualizer({
   const frameRef = useRef<number>(0);
   const analyserRef = useRef<AnalyserNode | null>(null);
   const opacityRef = useRef(0);
-  const targetOpacityRef = useRef(0);
   const isPlayingRef = useRef(isPlaying);
-  const dataArrayRef = useRef<Uint8Array<ArrayBuffer> | null>(null);
-  const lastDrawRef = useRef(0);
+  const wasPlayingRef = useRef(isPlaying);
+  const pausePhaseRef = useRef<PausePhase>("idle");
+  const pausePhaseStartedAtRef = useRef(0);
+  const settleStartHeightsRef = useRef<Float32Array | null>(null);
+  const accentRef = useRef(accent);
+  const dataArrayRef = useRef<Float32Array | null>(null);
+  const smoothedHeightsRef = useRef<Float32Array | null>(null);
+  const smoothedBarCountRef = useRef(0);
   const hiddenRef = useRef(document.hidden);
 
   useEffect(() => {
+    if (isPlaying) {
+      pausePhaseRef.current = "idle";
+      settleStartHeightsRef.current = null;
+    } else if (wasPlayingRef.current) {
+      pausePhaseRef.current = "settling";
+      pausePhaseStartedAtRef.current = performance.now();
+      settleStartHeightsRef.current = null;
+    }
+    wasPlayingRef.current = isPlaying;
     isPlayingRef.current = isPlaying;
-    // The rAF interior below now owns the target decision end-to-end —
-    // it picks a target on every frame from `isPlayingRef.current` and
-    // the analyser output. We deliberately do NOT snap
-    // `targetOpacityRef.current` here on the frame this effect runs:
-    // on resume (false → true) the analyser might briefly read silent
-    // (avg < 1) while the audio context warms up, which would otherwise
-    // tear the bars down to the 0.5 floor on the very first frame of
-    // playback; and on pause/stop (true → false) we now want the
-    // visualizer to ride the analyser buffer's residual audio activity
-    // (avg >= 1) all the way down to a completely flat state before
-    // the target flips to 0 — snapping to 0 here would short-circuit
-    // exactly that "wait-flat" behavior and defeat the whole point.
   }, [isPlaying]);
+
+  useEffect(() => {
+    accentRef.current = accent;
+  }, [accent]);
 
   useEffect(() => {
     const onVisibility = () => {
@@ -56,32 +104,16 @@ function WaveformVisualizer({
     if (!ctx) return;
 
     let running = true;
-    const FRAME_BUDGET_MS = 33; // ~30 fps; enough for a background decoration
 
-    const draw = (now?: number) => {
+    const draw = () => {
       if (!running) return;
       frameRef.current = requestAnimationFrame(draw);
 
-      // Throttle to ~30 fps to keep CPU/GPU headroom on low-end Windows
-      // machines and software-rendered WebView2 contexts. We still use
-      // requestAnimationFrame so the loop pauses in background tabs.
-      if (now !== undefined) {
-        if (now - lastDrawRef.current < FRAME_BUDGET_MS) return;
-        lastDrawRef.current = now;
-      }
-
-      // Skip expensive work when the tab is hidden. The loop keeps
-      // scheduling itself so it resumes instantly on visibilitychange.
       if (hiddenRef.current) {
         ctx.clearRect(0, 0, canvas.width, canvas.height);
         return;
       }
 
-      // The Web Audio graph (and thus the AnalyserNode) is built lazily
-      // inside ensureAudioGraph(), which only runs on the first togglePlay
-      // / track load. So at mount getAnalyser() can legitimately return
-      // null even though playback is about to start. Poll every frame
-      // until the node exists rather than capturing it once at mount.
       const analyser = (analyserRef.current = getAnalyser());
       if (!analyser) {
         ctx.clearRect(0, 0, canvas.width, canvas.height);
@@ -89,53 +121,46 @@ function WaveformVisualizer({
       }
 
       const bufferLength = analyser.frequencyBinCount;
-      let dataArray: Uint8Array<ArrayBuffer> | null = dataArrayRef.current;
+      const minDb = analyser.minDecibels;
+      const maxDb = analyser.maxDecibels;
+      let dataArray = dataArrayRef.current;
       if (!dataArray || dataArray.length !== bufferLength) {
-        dataArray = new Uint8Array(bufferLength) as Uint8Array<ArrayBuffer>;
+        dataArray = new Float32Array(bufferLength);
         dataArrayRef.current = dataArray;
       }
-      analyser.getByteFrequencyData(dataArray);
+      analyser.getFloatFrequencyData(dataArray as Float32Array<ArrayBuffer>);
 
-      let sum = 0;
-      for (let i = 0; i < bufferLength; i++) sum += dataArray[i];
-      const avg = sum / bufferLength;
-      // `targetOpacityRef.current` is the opacity the visualizer eases
-      // toward over a few frames (controlled by `speed` below).
-      //
-      // Playing branch: keep the bars at full intensity while the
-      // signal is present, and FLOOR them at ~0.5 only on the brief
-      // silent passages (intro / outro / edits where avg < 1) so the
-      // bars never completely empty out mid-track.
-      //
-      // Paused/stopped branch: we deliberately do NOT snap the target
-      // to 0 the instant playback stops. The AnalyserNode's internal
-      // buffer still holds the tail of whatever was playing when the
-      // user pressed pause or hit the end of the queue, and we want
-      // the visualizer to actually show that audio tail as it drains
-      // — gives the user a felt sense that the song just stopped
-      // rather than the bars vanishing on the same frame as the
-      // pause. The target therefore stays at 1 while there is ANY
-      // signal at all in the analyser (avg >= 1), and only flips to 0
-      // once the analyser has fully settled into a completely flat
-      // silence (avg < 1). At that point the speed differential below
-      // (0.08 toward 0) drives the actual fade-out. Earlier revisions
-      // either pinned the visualizer at ~0.7 when paused (reported as
-      // distracting) or skipped directly to fade-on-pause, which now
-      // explicitly waits for the audio to actually decay out first.
-      const isSilent = avg < 1;
+      const now = performance.now();
+      let globalAlpha = opacityRef.current;
+
       if (isPlayingRef.current) {
-        targetOpacityRef.current = isSilent ? 0.5 : 1;
+        opacityRef.current = 1;
+        globalAlpha = 1;
       } else {
-        targetOpacityRef.current = isSilent ? 0 : 1;
+        const phase = pausePhaseRef.current;
+        if (phase === "settling") {
+          const elapsed = now - pausePhaseStartedAtRef.current;
+          globalAlpha = 1;
+          opacityRef.current = 1;
+          if (elapsed >= PAUSE_SETTLE_MS) {
+            pausePhaseRef.current = "fading";
+            pausePhaseStartedAtRef.current = now;
+          }
+        } else if (phase === "fading") {
+          const elapsed = now - pausePhaseStartedAtRef.current;
+          const t = Math.min(1, elapsed / PAUSE_FADE_MS);
+          globalAlpha = 1 - t;
+          opacityRef.current = globalAlpha;
+          if (t >= 1) {
+            pausePhaseRef.current = "idle";
+          }
+        } else {
+          globalAlpha = 0;
+          opacityRef.current = 0;
+        }
       }
 
-      const opacity = opacityRef.current;
-      const target = targetOpacityRef.current;
-      const speed = target > opacity ? 0.15 : 0.08;
-      const nextOpacity = opacity + (target - opacity) * speed;
-      opacityRef.current = Math.abs(nextOpacity - target) < 0.005 ? target : nextOpacity;
-
-      if (opacityRef.current <= 0.005) {
+      if (globalAlpha <= 0.005) {
         ctx.clearRect(0, 0, canvas.width, canvas.height);
         return;
       }
@@ -151,27 +176,44 @@ function WaveformVisualizer({
 
       ctx.clearRect(0, 0, w, h);
 
-      // Scale bar density with display width so narrow windows don't pay
-      // for a full 64-bar analysis/draw loop, while wide windows keep the
-      // detailed look.
-      const barCount = Math.min(bufferLength, Math.max(32, Math.floor(w / 14)));
+      const barCount = Math.max(32, Math.floor(w / 14));
       const totalBarWidth = w / barCount;
       const gap = 2;
-      const globalAlpha = opacityRef.current;
+      const settling = !isPlayingRef.current && pausePhaseRef.current === "settling";
+
+      let smoothedHeights = smoothedHeightsRef.current;
+      if (!smoothedHeights || smoothedBarCountRef.current !== barCount) {
+        smoothedHeights = new Float32Array(barCount);
+        smoothedHeightsRef.current = smoothedHeights;
+        smoothedBarCountRef.current = barCount;
+      }
+
+      if (settling) {
+        let snapshot = settleStartHeightsRef.current;
+        if (!snapshot || snapshot.length !== barCount) {
+          snapshot = new Float32Array(smoothedHeights);
+          settleStartHeightsRef.current = snapshot;
+        }
+        const elapsed = now - pausePhaseStartedAtRef.current;
+        const t = Math.min(1, elapsed / PAUSE_SETTLE_MS);
+        const eased = 1 - (1 - t) * (1 - t);
+        const scale = 1 - eased;
+        for (let i = 0; i < barCount; i++) {
+          smoothedHeights[i] = (snapshot[i] ?? 0) * scale;
+        }
+      } else if (isPlayingRef.current) {
+        for (let i = 0; i < barCount; i++) {
+          smoothedHeights[i] = sampleLogFrequencyAt(dataArray, (i + 0.5) / barCount, minDb, maxDb);
+        }
+      }
 
       for (let i = 0; i < barCount; i++) {
-        const value = dataArray[i] / 255;
+        const value = smoothedHeights[i] ?? 0;
         const barHeight = Math.max(2, value * h * 0.7);
         const x = i * totalBarWidth;
         const y = (h - barHeight) / 2;
-
-        // Floor the per-bar alpha at 0.75 instead of 0.55 so even the
-        // quietest bins stay clearly visible. Combined with the silence
-        // floor above, every bar is on screen at >= ~37% opacity whenever
-        // audio is playing, which keeps the visualizer reading as the
-        // intentional background decoration even on barely-active tracks.
-        const alpha = (0.75 + value * 0.25) * globalAlpha;
-        ctx.fillStyle = rgbToCss(accent, alpha);
+        const alpha = 0.8 * globalAlpha;
+        ctx.fillStyle = rgbToCss(accentRef.current, alpha);
         ctx.beginPath();
         const radius = Math.min(Math.max(0, (totalBarWidth - gap) / 2), 2);
         const bw = Math.max(1, totalBarWidth - gap);
@@ -185,56 +227,11 @@ function WaveformVisualizer({
       running = false;
       cancelAnimationFrame(frameRef.current);
       dataArrayRef.current = null;
-      lastDrawRef.current = 0;
+      smoothedHeightsRef.current = null;
+      smoothedBarCountRef.current = 0;
     };
-  }, [accent, getAnalyser]);
+  }, [getAnalyser]);
 
-  // Both the canvas and the tint use `position: fixed inset-0` so they
-  // cover the FULL viewport — including the sidebar's column to the
-  // left of main. With the previous `position: absolute` host inside
-  // `.lyrics-page`, the canvas only painted to `.lyrics-page`'s column
-  // width, which sits to the right of the sidebar. The sidebar then
-  // read as fully opaque regardless of its bg alpha, because there
-  // was nothing visually painted behind it for translucency to reveal.
-  // `position: fixed inset-0` makes the canvas span the whole viewport
-  // so when the (translucent) sidebar overlays it at z-40, the bars
-  // literally show through the chrome.
-  //
-  // Fixed positioning is now safe because the ancestors that COULD
-  // trap a `fixed` descendant (`transform`/`perspective`/`filter`/
-  // `contain: paint`) are clean. `.page-content` no longer carries
-  // `contain: paint` (see `index.css`). Its `animation: page-enter
-  // ... both` ends with `transform: none`, so once the 180ms entrance
-  // is over `.page-content` does not establish a containing block for
-  // fixed descendants. `.lyrics-page` / the wrapper have no transform,
-  // perspective, or filter either. The canvas's containing block for
-  // fixed is therefore the App viewport.
-  //
-  // Layer architecture (inside `.page-content`'s `isolation: isolate`
-  // stacking context):
-  //
-  //   <div fixed inset-0 z-0>               ← covers the entire viewport
-  //     <canvas block h-[100dvh] w-full>    ← bars across viewport (NOT
-  //                                              just .lyrics-page's
-  //                                              column width), so the
-  //                                              sidebar column shows
-  //                                              bars through it.
-  //     <div absolute inset-0 bg-black/40>  ← tint, paints OVER the
-  //                                              canvas (DOM order
-  //                                              resolves tint-after-
-  //                                              canvas inside the z=0
-  //                                              wrapper's stacking
-  //                                              context).
-  //   </div>
-  //   <div.lyrics-scroll-area z-10>         ← lyrics, on top.
-  //   <aside z-40>                          ← sidebar, paints over main
-  //                                              with its own translucent
-  //                                              bg (currently bg-black/55,
-  //                                              ~45% bars visible
-  //                                              through the chrome).
-  //
-  // Bar peek-through the lyric glyphs is still physically impossible
-  // because the lyric text paints ON TOP of the canvas+tint stack.
   return (
     <>
       <canvas
@@ -254,8 +251,16 @@ export function LyricsPage({
 }) {
   const player = usePlayer();
   const track = player.currentTrack;
-  const [lyrics, setLyrics] = useState<SyncedLyrics | null>(null);
-  const [loading, setLoading] = useState(false);
+  const [lyrics, setLyrics] = useState<SyncedLyrics | null>(() =>
+    track?.source === "stream" && track ? hydratePersistedLyricsForTrack(track) : null,
+  );
+  const [loading, setLoading] = useState(() => {
+    if (!track) return false;
+    if (track.source === "upload") return Boolean(track.findLyrics);
+    return track.source === "stream"
+      ? hydratePersistedLyricsForTrack(track) === null
+      : false;
+  });
   const [timedOut, setTimedOut] = useState(false);
   const accent = useAccent();
   const [displayProgress, setDisplayProgress] = useState(0);
@@ -263,11 +268,143 @@ export function LyricsPage({
   const lastScrolledIndexRef = useRef(-1);
   const displayProgressRef = useRef(0);
   const playerProgressRef = useRef(player.progress);
+  const seekScrubProgressRef = useRef(player.seekScrubProgress);
   const isProgrammaticScrollRef = useRef(false);
   const autoScrollTimeoutRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const scrollContainerRef = useRef<HTMLElement | null>(null);
+  const topSpacerRef = useRef<HTMLDivElement>(null);
   const bottomSpacerRef = useRef<HTMLDivElement>(null);
   const activeLyricIndexRef = useRef(-1);
+  const hoveredLineIndexRef = useRef(-1);
+  const isReducedMotionRef = useRef(false);
+  const lyricsDistanceFade = useSetting("lyricsDistanceFade");
+  const hideSearchOnLyrics = useSetting("hideSearchOnLyrics");
+  const hidePlayerOnLyrics = useSetting("hidePlayerOnLyrics");
+  const lyricsViewportParts = ["100dvh"];
+  if (!hideSearchOnLyrics) lyricsViewportParts.push("var(--ui-topbar-height)");
+  if (!hidePlayerOnLyrics) {
+    lyricsViewportParts.push("var(--ui-player-bottom)");
+    lyricsViewportParts.push("var(--ui-player-height)");
+  }
+  const lyricsViewportMinHeight =
+    lyricsViewportParts.length === 1
+      ? lyricsViewportParts[0]
+      : `calc(${lyricsViewportParts[0]} - ${lyricsViewportParts.slice(1).join(" - ")})`;
+  const lyricsScrollPaddingTop = hideSearchOnLyrics
+    ? "clamp(2rem, 4vw, 3rem)"
+    : "var(--ui-topbar-height)";
+
+  const updateLineOpacities = useCallback(() => {
+    const container = scrollContainerRef.current;
+    const lineEls = lyricLineRefs.current;
+    if (isReducedMotionRef.current || !lyricsDistanceFade) {
+      lineEls.forEach((el) => { if (el) el.style.opacity = ''; });
+      return;
+    }
+    if (!container || lineEls.length === 0) return;
+
+    const containerRect = container.getBoundingClientRect();
+    const viewportCenter = containerRect.top + container.clientHeight / 2;
+    const maxDistance = container.clientHeight / 2;
+
+    lineEls.forEach((el, index) => {
+      if (!el) return;
+      const rect = el.getBoundingClientRect();
+      const lineCenter = rect.top + rect.height / 2;
+      const distance = Math.abs(lineCenter - viewportCenter);
+      const t = Math.min(distance / maxDistance, 1);
+      const easeOut = t * (2 - t);
+      let opacity = 1 - 0.75 * easeOut;
+      if (hoveredLineIndexRef.current === index) {
+        opacity = Math.min(opacity + 0.12, 0.9);
+      }
+      el.style.opacity = String(opacity);
+    });
+  }, [lyricsDistanceFade]);
+
+  useEffect(() => {
+    const mq = window.matchMedia('(prefers-reduced-motion: reduce)');
+    isReducedMotionRef.current = mq.matches;
+    const onChange = (e: MediaQueryListEvent) => {
+      isReducedMotionRef.current = e.matches;
+      updateLineOpacities();
+    };
+    mq.addEventListener('change', onChange);
+    return () => mq.removeEventListener('change', onChange);
+  }, [updateLineOpacities]);
+
+  useEffect(() => {
+    const container = scrollContainerRef.current;
+    if (!container) return;
+    let rafId = 0;
+    const onScroll = () => {
+      if (rafId) return;
+      rafId = requestAnimationFrame(() => {
+        rafId = 0;
+        updateLineOpacities();
+      });
+    };
+    container.addEventListener('scroll', onScroll, { passive: true });
+    window.addEventListener('resize', onScroll);
+    updateLineOpacities();
+    return () => {
+      container.removeEventListener('scroll', onScroll);
+      window.removeEventListener('resize', onScroll);
+      if (rafId) cancelAnimationFrame(rafId);
+    };
+  }, [updateLineOpacities]);
+
+  const updateLyricsSpacers = useCallback(() => {
+    const viewport = scrollContainerRef.current;
+    if (!viewport || !lyrics || lyrics.lines.length === 0) return;
+
+    const vh = viewport.clientHeight;
+    const scrollStyle = window.getComputedStyle(viewport);
+    const scrollPadTop = parseFloat(scrollStyle.paddingTop) || 0;
+    const scrollPadBottom = parseFloat(scrollStyle.paddingBottom) || 0;
+    const areaEl = document.querySelector(".lyrics-scroll-area");
+    const areaStyle = areaEl ? window.getComputedStyle(areaEl) : null;
+    const areaPadTop = areaStyle ? parseFloat(areaStyle.paddingTop) || 0 : 0;
+    const areaPadBottom = areaStyle ? parseFloat(areaStyle.paddingBottom) || 0 : 0;
+
+    const firstEl = lyricLineRefs.current[0];
+    if (firstEl && topSpacerRef.current) {
+      const firstHeight = firstEl.offsetHeight;
+      const idealTop = Math.max(0, (vh - firstHeight) / 2 - scrollPadTop - areaPadTop);
+      topSpacerRef.current.style.height = `${idealTop}px`;
+    }
+
+    const lastIndex = lyrics.lines.length - 1;
+    const lastEl = lyricLineRefs.current[lastIndex];
+    if (lastEl && bottomSpacerRef.current) {
+      const lastHeight = lastEl.offsetHeight;
+      const idealBottom = Math.max(0, (vh - lastHeight) / 2 - scrollPadBottom - areaPadBottom);
+      bottomSpacerRef.current.style.height = `${idealBottom}px`;
+    }
+  }, [lyrics]);
+
+  const recenterActiveLyric = useCallback((behavior: ScrollBehavior = "instant") => {
+    const index = activeLyricIndexRef.current;
+    if (index < 0) return;
+    const el = lyricLineRefs.current[index];
+    if (!el) return;
+    isProgrammaticScrollRef.current = true;
+    el.scrollIntoView({ block: "center", behavior });
+    setTimeout(() => {
+      isProgrammaticScrollRef.current = false;
+    }, 0);
+  }, []);
+
+  const handleLyricsLayoutChange = useCallback(() => {
+    updateLyricsSpacers();
+    recenterActiveLyric("instant");
+    updateLineOpacities();
+  }, [updateLyricsSpacers, recenterActiveLyric, updateLineOpacities]);
+
+  useEffect(() => {
+    const id = requestAnimationFrame(updateLineOpacities);
+    return () => cancelAnimationFrame(id);
+  }, [lyrics, updateLineOpacities]);
 
   // Keep the fallback ref in sync with the coarse player.progress (used
   // only when currentAudio.current is unavailable inside the rAF loop).
@@ -280,11 +417,27 @@ export function LyricsPage({
     playerProgressRef.current = player.progress;
   }, [player.progress]);
 
-  // Reset the display position when the track changes. The first lyric
-  // line will be centered once lyrics load (see the lyrics-loaded effect
-  // below). The rAF loop then refines the active line position from
-  // audio.currentTime.
   useEffect(() => {
+    seekScrubProgressRef.current = player.seekScrubProgress;
+  }, [player.seekScrubProgress]);
+
+  // Reset scroll position and display progress when the track changes.
+  // Jump to the top immediately so we are not still scrolled to the
+  // previous song's active line while the new track's lyrics load or
+  // before its first timed line becomes active. The lyrics-loaded effect
+  // recenters on the active line once the new lyrics are in place.
+  useEffect(() => {
+    lyricLineRefs.current = [];
+    lastScrolledIndexRef.current = -1;
+    if (autoScrollTimeoutRef.current) clearTimeout(autoScrollTimeoutRef.current);
+
+    const container = scrollContainerRef.current;
+    if (container) {
+      isProgrammaticScrollRef.current = true;
+      container.scrollTo({ top: 0, behavior: "instant" });
+      setTimeout(() => { isProgrammaticScrollRef.current = false; }, 0);
+    }
+
     const initial = playerProgressRef.current;
     displayProgressRef.current = initial;
     setDisplayProgress(initial);
@@ -315,14 +468,11 @@ export function LyricsPage({
 
     let frameId = 0;
     let running = true;
-    const FRAME_BUDGET_MS = 33;
-    let lastSync = 0;
 
-    const syncProgress = (now?: number) => {
+    const syncProgress = () => {
       if (!running) return;
       frameId = window.requestAnimationFrame(syncProgress);
-      if (now !== undefined && now - lastSync < FRAME_BUDGET_MS) return;
-      lastSync = now ?? performance.now();
+      if (seekScrubProgressRef.current !== null) return;
       const liveProgress = currentAudio.current?.currentTime;
       const nextProgress = Number.isFinite(liveProgress) ? liveProgress ?? 0 : playerProgressRef.current;
       if (Math.abs(nextProgress - displayProgressRef.current) >= 0.01) {
@@ -338,10 +488,12 @@ export function LyricsPage({
     };
   }, [track?.id]);
 
+  const progressForLyrics = player.seekScrubProgress ?? displayProgress;
+
   const activeLyricIndex = useMemo(() => {
     if (!lyrics || !track) return -1;
-    return findActiveLyricIndex(lyrics.lines, displayProgress);
-  }, [lyrics, track, displayProgress]);
+    return findActiveLyricIndex(lyrics.lines, progressForLyrics);
+  }, [lyrics, track, progressForLyrics]);
 
   useEffect(() => {
     activeLyricIndexRef.current = activeLyricIndex;
@@ -384,12 +536,6 @@ export function LyricsPage({
   }, []);
 
   useEffect(() => {
-    return () => {
-      if (autoScrollTimeoutRef.current) clearTimeout(autoScrollTimeoutRef.current);
-    };
-  }, [track?.id]);
-
-  useEffect(() => {
     if (!track) {
       setLyrics(null);
       setLoading(false);
@@ -397,94 +543,103 @@ export function LyricsPage({
       return;
     }
 
-    if (track.source === "stream") {
-      if (!track.videoId) {
-        setLyrics(null);
-        setLoading(false);
-        setTimedOut(true);
-        return;
-      }
+    const isStream = track.source === "stream";
+    const isUploadWithLyrics = track.source === "upload" && track.findLyrics;
+    const effectiveVideoId = isStream ? lyricsCacheVideoId(track) : null;
 
-      let cancelled = false;
-      setLoading(true);
+    if (isStream && !effectiveVideoId) {
       setLyrics(null);
-      setTimedOut(false);
+      setLoading(false);
+      setTimedOut(true);
+      return;
+    }
+    if (!isStream && !isUploadWithLyrics) {
+      setLyrics(null);
+      setLoading(false);
+      setTimedOut(true);
+      return;
+    }
 
-      const timeoutId = setTimeout(() => {
-        if (cancelled || player.currentTrack?.id !== track.id) return;
-        setTimedOut(true);
-      }, 7000);
+    if (isLyricsExhaustedForTrack(track)) {
+      setLyrics(null);
+      setLoading(false);
+      setTimedOut(true);
+      return;
+    }
 
-      void fetchSyncedLyrics(track.videoId)
+    let cancelled = false;
+    let retryTimer: ReturnType<typeof setTimeout> | null = null;
+    let attempt = 0;
+    const MAX_ERROR_RETRIES = 2;
+    const ERROR_RETRY_DELAY_MS = 800;
+
+    const cachedStreamLyrics = isStream ? hydratePersistedLyricsForTrack(track) : null;
+
+    setLyrics(cachedStreamLyrics);
+    setLoading(!cachedStreamLyrics);
+    setTimedOut(false);
+
+    const loadLyrics = () => {
+      const request = isStream
+        ? fetchSyncedLyrics(track, { persist: true })
+        : fetchSyncedLyricsByMeta(track);
+
+      void request
         .then((nextLyrics) => {
           if (cancelled || player.currentTrack?.id !== track.id) return;
-          clearTimeout(timeoutId);
-          setLyrics(nextLyrics);
+          if (nextLyrics) {
+            setLyrics(nextLyrics);
+            setLoading(false);
+            setTimedOut(false);
+            return;
+          }
+          // Keep any cached/persisted lyrics on screen when a background
+          // refresh misses — wiping here made the page flash "no lyrics"
+          // after showing a stale-but-readable snapshot.
+          if (!cachedStreamLyrics) {
+            setLyrics(null);
+            setTimedOut(true);
+          }
           setLoading(false);
-          if (!nextLyrics) setTimedOut(true);
         })
         .catch(() => {
           if (cancelled || player.currentTrack?.id !== track.id) return;
-          clearTimeout(timeoutId);
-          setLyrics(null);
+          attempt += 1;
+          if (attempt < MAX_ERROR_RETRIES) {
+            retryTimer = setTimeout(loadLyrics, ERROR_RETRY_DELAY_MS);
+            return;
+          }
+          if (!cachedStreamLyrics) {
+            setLyrics(null);
+            setTimedOut(true);
+          }
           setLoading(false);
-          setTimedOut(true);
         });
+    };
 
-      return () => {
-        cancelled = true;
-        clearTimeout(timeoutId);
-      };
-    }
+    // Always refresh in the background so the active track picks up the
+    // full `get_synced_lyrics` resolution (incl. YouTube Music native
+    // timed lyrics). Cached/persisted lyrics above are only for instant
+    // first paint — skipping the fetch left stale prefetch snapshots
+    // (metadata-only providers + wrong offsets) on screen indefinitely.
+    loadLyrics();
 
-    // Upload track — only try lyrics if the user opted in.
-    if (track.source === "upload" && track.findLyrics) {
-      let cancelled = false;
-      setLoading(true);
-      setLyrics(null);
-      setTimedOut(false);
-
-      const timeoutId = setTimeout(() => {
-        if (cancelled || player.currentTrack?.id !== track.id) return;
-        setTimedOut(true);
-      }, 7000);
-
-      void fetchSyncedLyricsByMeta(track)
-        .then((nextLyrics) => {
-          if (cancelled || player.currentTrack?.id !== track.id) return;
-          clearTimeout(timeoutId);
-          setLyrics(nextLyrics);
-          setLoading(false);
-          if (!nextLyrics) setTimedOut(true);
-        })
-        .catch(() => {
-          if (cancelled || player.currentTrack?.id !== track.id) return;
-          clearTimeout(timeoutId);
-          setLyrics(null);
-          setLoading(false);
-          setTimedOut(true);
-        });
-
-      return () => {
-        cancelled = true;
-        clearTimeout(timeoutId);
-      };
-    }
-
-    setLyrics(null);
-    setLoading(false);
-    setTimedOut(true);
+    return () => {
+      cancelled = true;
+      if (retryTimer) clearTimeout(retryTimer);
+    };
   }, [
     // Derive a stable primitive key from the exact fields that should
     // force a lyrics refetch. Tracking every individual field would
     // re-fire the request on any unrelated metadata tweak (e.g. a
     // upload track's `durationSeconds` hydrating in after the page
-    // mounted). Stream tracks are uniquely identified by `videoId`;
-    // upload tracks are identified by (id, findLyrics, title, artist,
-    // album, durationSeconds) so a re-import that corrected the title
-    // (or async duration hydration) still picks up the new lyrics.
+    // mounted). Stream tracks are uniquely identified by the effective
+    // lyrics video id (`resolvedVideoId ?? videoId`); upload tracks are
+    // identified by (id, findLyrics, title, artist, album, durationSeconds)
+    // so a re-import that corrected the title (or async duration hydration)
+    // still picks up the new lyrics.
     track?.source === "stream"
-      ? `stream-${track?.videoId ?? ""}`
+      ? `stream-${lyricsCacheVideoId(track) ?? ""}`
       : `upload-${track?.id ?? ""}-${track?.findLyrics ? 1 : 0}-${track?.title ?? ""}-${track?.artist ?? ""}-${track?.album ?? ""}-${track?.durationSeconds ?? ""}`,
   ]);
 
@@ -497,75 +652,61 @@ export function LyricsPage({
   }, [activeLyricIndex]);
 
   const prevLyricsRef = useRef<SyncedLyrics | null>(null);
-  useEffect(() => {
-    // Clear the per-line DOM ref array on every track change. Without
-    // this, a 100-line track followed by a 20-line track leaves indices
-    // 20-99 holding stale DOM nodes from the previous track. The array
-    // is rebuilt naturally as the new `<button ref>` callbacks fire.
-    lyricLineRefs.current = [];
-    lastScrolledIndexRef.current = -1;
-  }, [track?.id]);
-  // When lyrics first load, scroll to the active lyric line (if the song
-  // is mid-play) or to the first line (if the song is just starting).
-  // The top 50dvh spacer gives the scroll container enough room to center
-  // the first line. The bottom spacer is calculated dynamically so the
-  // last lyric centers exactly at the maximum scroll position, preventing
-  // overscroll past the end of the lyrics.
+  // When lyrics load or change for a new track, scroll to the active
+  // lyric line (if the song is mid-play) or to the first line (if the
+  // song is just starting).
+  // Top and bottom spacers are sized dynamically so the first and last
+  // lines can scroll to the viewport center without overscroll past the
+  // ends. Both are recalculated on layout changes (see below).
   // We read progress from the rAF-ref (not React state) because the
   // state may lag behind during initial mount batching, causing us to
   // scroll to line 0 and then snap to the real active line a frame later.
   useEffect(() => {
-    const hadLyrics = prevLyricsRef.current;
+    const previousLyrics = prevLyricsRef.current;
     prevLyricsRef.current = lyrics;
-    if (!hadLyrics && lyrics && lyrics.lines.length > 0) {
-      // Calculate bottom spacer so the last lyric can be centered but
-      // not scrolled past: spacer = (viewportHeight - lastLineHeight) / 2
-      // minus any existing padding below the spacer (lyrics-scroll-area pb
-      // + scroll container pb) so those don't add extra overscroll.
-      const viewport = scrollContainerRef.current;
-      const lastIndex = lyrics.lines.length - 1;
-      if (viewport && bottomSpacerRef.current) {
-        const lastEl = lyricLineRefs.current[lastIndex];
-        if (lastEl) {
-          const vh = viewport.clientHeight;
-          const lh = lastEl.offsetHeight;
-          const scrollPad = parseFloat(window.getComputedStyle(viewport).paddingBottom) || 0;
-          const areaEl = document.querySelector('.lyrics-scroll-area');
-          const areaPad = areaEl ? parseFloat(window.getComputedStyle(areaEl).paddingBottom) || 0 : 0;
-          const ideal = Math.max(0, (vh - lh) / 2 - scrollPad - areaPad);
-          bottomSpacerRef.current.style.height = `${ideal}px`;
-        }
-      }
-      const index = findActiveLyricIndex(lyrics.lines, displayProgressRef.current);
-      const targetIndex = index >= 0 ? index : 0;
-      lastScrolledIndexRef.current = targetIndex;
-      isProgrammaticScrollRef.current = true;
-      lyricLineRefs.current[targetIndex]?.scrollIntoView({ block: "center", behavior: "instant" });
-      setTimeout(() => { isProgrammaticScrollRef.current = false; }, 0);
+    if (!lyrics || lyrics.lines.length === 0 || lyrics === previousLyrics) return;
+    updateLyricsSpacers();
+    const index = findActiveLyricIndex(lyrics.lines, displayProgressRef.current);
+    if (index < 0) {
+      // Before the first timed line — keep the track-change scroll-to-top
+      // position and let the active-lyric effect take over once playback
+      // reaches a real line.
+      lastScrolledIndexRef.current = -1;
+      return;
     }
-  }, [lyrics]);
+    lastScrolledIndexRef.current = index;
+    isProgrammaticScrollRef.current = true;
+    lyricLineRefs.current[index]?.scrollIntoView({ block: "center", behavior: "instant" });
+    setTimeout(() => { isProgrammaticScrollRef.current = false; }, 0);
+  }, [lyrics, updateLyricsSpacers]);
 
-  // Recalculate bottom spacer on window resize
+  // Keep the active lyric centered when the scrollport changes size (window
+  // resize, monitor move, DPI change, or --app-height refresh). A fixed
+  // scrollTop drifts off-center once viewport height or spacer sizes change.
   useEffect(() => {
     if (!lyrics || lyrics.lines.length === 0) return;
     const viewport = scrollContainerRef.current;
-    const lastIndex = lyrics.lines.length - 1;
-    if (!viewport || !bottomSpacerRef.current) return;
-    const recalc = () => {
-      const lastEl = lyricLineRefs.current[lastIndex];
-      const spacer = bottomSpacerRef.current;
-      if (!lastEl || !spacer) return;
-      const vh = viewport.clientHeight;
-      const lh = lastEl.offsetHeight;
-      const scrollPad = parseFloat(window.getComputedStyle(viewport).paddingBottom) || 0;
-      const areaEl = document.querySelector('.lyrics-scroll-area');
-      const areaPad = areaEl ? parseFloat(window.getComputedStyle(areaEl).paddingBottom) || 0 : 0;
-      const ideal = Math.max(0, (vh - lh) / 2 - scrollPad - areaPad);
-      spacer.style.height = `${ideal}px`;
+    if (!viewport) return;
+
+    let rafId = 0;
+    const onLayoutChange = () => {
+      if (rafId) return;
+      rafId = requestAnimationFrame(() => {
+        rafId = 0;
+        handleLyricsLayoutChange();
+      });
     };
-    window.addEventListener('resize', recalc);
-    return () => window.removeEventListener('resize', recalc);
-  }, [lyrics]);
+
+    const resizeObserver = new ResizeObserver(onLayoutChange);
+    resizeObserver.observe(viewport);
+    window.addEventListener("resize", onLayoutChange);
+
+    return () => {
+      resizeObserver.disconnect();
+      window.removeEventListener("resize", onLayoutChange);
+      if (rafId) cancelAnimationFrame(rafId);
+    };
+  }, [lyrics, handleLyricsLayoutChange]);
 
   const handleSeek = useCallback((seconds: number) => {
     player.seek(seconds);
@@ -579,25 +720,11 @@ export function LyricsPage({
     );
   }
 
-  // The waveform canvas (WaveformVisualizer) is rendered inline here
-  // (no body portal) as a scoped descendant of `.lyrics-page`. Lyrics
-  // paints physically on top of the canvas/tint stack, so there is no
-  // bleed-through text glyphs and no halo/stroke/font-weight trick is
-  // needed to "seal" inter-letter gaps. See the comment block inside
-  // WaveformVisualizer for the full architectural reasoning.
-  //
-  // The soft black tint sits between the canvas and the lyrics as a
-  // dedicated sibling div inside the WaveformVisualizer stack (NOT as
-  // `.lyrics-page`'s own background, which would paint BEHIND the
-  // canvas and fail the user's "tint eases the bars while keeping them
-  // visible" requirement).
-  //
-  // The lyric lines themselves carry NO pill, NO rounded background,
-  // NO stroke, NO halo — strictly bare text on the wash, with active
-  // vs inactive differentiated by text color plus a hover brighten
-  // (the original behavior the user asked for).
   return (
-    <div className="lyrics-page relative min-h-[calc(100dvh-var(--ui-topbar-height)-var(--ui-player-bottom)-var(--ui-player-height))] bg-transparent">
+    <div
+      className="lyrics-page relative bg-transparent"
+      style={{ minHeight: lyricsViewportMinHeight }}
+    >
       <WaveformVisualizer
         getAnalyser={player.getAnalyser}
         accent={accent}
@@ -605,20 +732,27 @@ export function LyricsPage({
       />
 
       <div
-        className="lyrics-scroll-area nice-scroll relative z-10 mx-auto max-w-3xl px-4 pt-[var(--ui-topbar-height)] pb-[clamp(2rem,4vw,3rem)] sm:px-6"
+        className="lyrics-scroll-area nice-scroll relative z-10 mx-auto max-w-3xl px-4 pb-[clamp(2rem,4vw,3rem)] sm:px-6"
+        style={{ paddingTop: lyricsScrollPaddingTop }}
       >
         <div className="relative mx-auto max-w-2xl">
           <div
             className="relative flex flex-col gap-3"
           >
           {loading && !timedOut && (
-            <div className="flex min-h-[calc(100dvh-var(--ui-topbar-height)-var(--ui-player-bottom)-var(--ui-player-height))] -mt-12 flex-col items-center justify-center gap-4">
+            <div
+              className="-mt-12 flex min-h-0 flex-col items-center justify-center gap-4"
+              style={{ minHeight: lyricsViewportMinHeight }}
+            >
               <LoaderCircle size={48} className="animate-spin text-neutral-300" />
               <span className="text-base text-neutral-300">Loading lyrics...</span>
             </div>
           )}
           {timedOut && !loading && (
-            <div className="flex min-h-[calc(100dvh-var(--ui-topbar-height)-var(--ui-player-bottom)-var(--ui-player-height))] -mt-12 flex-col items-center justify-center gap-4">
+            <div
+              className="animate-no-lyrics-fadeout -mt-12 flex min-h-0 flex-col items-center justify-center gap-4"
+              style={{ minHeight: lyricsViewportMinHeight }}
+            >
               <X size={48} className="text-neutral-300" />
               <span className="text-base text-neutral-300">No synced lyrics available</span>
             </div>
@@ -626,7 +760,7 @@ export function LyricsPage({
           {lyrics && (
             <>
               {/* Spacer to allow first lyric to scroll to center of viewport */}
-              <div aria-hidden="true" className="h-[50dvh] pointer-events-none" />
+              <div aria-hidden="true" ref={topSpacerRef} className="pointer-events-none" />
               {lyrics.lines.map((line, index) => {
                 const active = index === activeLyricIndex;
                 return (
@@ -636,7 +770,24 @@ export function LyricsPage({
                     ref={(node) => {
                       lyricLineRefs.current[index] = node;
                     }}
+                    onMouseDown={(event) => {
+                      // Keep focus on the scroll container so the browser
+                      // doesn't scroll the clicked line into view on its
+                      // own — that fights the active-line centering logic
+                      // and reads as a jittery double-scroll after seek.
+                      event.preventDefault();
+                    }}
                     onClick={() => handleSeek(line.startTimeMs / 1000)}
+                    onMouseEnter={() => {
+                      hoveredLineIndexRef.current = index;
+                      updateLineOpacities();
+                    }}
+                    onMouseLeave={() => {
+                      if (hoveredLineIndexRef.current === index) {
+                        hoveredLineIndexRef.current = -1;
+                        updateLineOpacities();
+                      }
+                    }}
                     /*
                      * Loose lyrics, NO decoration: bare centered text on a
                      * transparent button. NO rounded-2xl, NO bg-black/*, NO

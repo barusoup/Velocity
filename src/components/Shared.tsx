@@ -6,14 +6,31 @@ import { useCollection } from "../collection";
 import { usePlayer } from "../player";
 import type { MediaTrack } from "../types";
 import type { QueueOrigin } from "../player";
-import { formatOptionalDuration } from "../utils/media";
+import { formatOptionalDuration, isSameSongTrack } from "../utils/media";
 import { getDirectArtistBrowseId, resolveArtistBrowseId } from "../utils/navigation";
 import type { View } from "./Sidebar";
 import { ArtistCreditText } from "./PagesShared";
 import { SaveButton } from "./SaveButton";
+import { Marquee } from "./Marquee";
 
 export function getArtworkRoundedClass(shape: "square" | "circle" = "square") {
   return shape === "circle" ? "rounded-full" : "rounded-[4px]";
+}
+
+/** Transition + pointer-event gating for artwork-card play buttons that slide up on group hover. */
+export const cardHoverPlayTransitionClass =
+  "transition-all duration-200 ease-out pointer-events-none group-hover:pointer-events-auto animate-none";
+
+export function cardHoverPlayRevealClass(visible = false): string {
+  return visible
+    ? "translate-y-0 opacity-100 pointer-events-auto"
+    : "translate-y-2 opacity-0 group-hover:translate-y-0 group-hover:opacity-100";
+}
+
+export function cardPlayButtonSizing(size: "sm" | "md" | "lg" = "md") {
+  if (size === "lg") return { buttonClass: "h-14 w-14", iconSize: 24 };
+  if (size === "sm") return { buttonClass: "h-10 w-10", iconSize: 16 };
+  return { buttonClass: "h-12 w-12", iconSize: 20 };
 }
 
 function artworkCandidates(src?: string | null): string[] {
@@ -149,31 +166,6 @@ export function ArtworkImage({
   );
 }
 
-function isTrackActive(
-  currentTrack: MediaTrack | null,
-  track: MediaTrack,
-  contextOrigin?: QueueOrigin | null,
-  activeOrigin?: QueueOrigin | null,
-): boolean {
-  if (!currentTrack) return false;
-  if (
-    currentTrack.videoId && track.videoId
-      ? currentTrack.videoId !== track.videoId
-      : currentTrack.id !== track.id
-  ) return false;
-  if (contextOrigin) {
-    if (!activeOrigin) return false;
-    if (contextOrigin.kind !== activeOrigin.kind) return false;
-    if ("browseId" in contextOrigin && "browseId" in activeOrigin) {
-      return contextOrigin.browseId === activeOrigin.browseId;
-    }
-    if ("id" in contextOrigin && "id" in activeOrigin) {
-      return contextOrigin.id === activeOrigin.id;
-    }
-  }
-  return true;
-}
-
 export function TrackRow({
   track,
   index,
@@ -197,12 +189,12 @@ export function TrackRow({
   onNavigate?: (view: View) => void;
   queueOrigin?: QueueOrigin | null;
 }) {
-  const { isPlaying, isBuffering, currentTrack, togglePlay, queueOrigin: activeOrigin } = usePlayer();
+  const { isPlaying, isBuffering, currentTrack, togglePlay } = usePlayer();
   const collection = useCollection();
-  const active = isTrackActive(currentTrack, track, queueOrigin, activeOrigin);
+  const active = isSameSongTrack(currentTrack, track);
   const playingActive = active && isPlaying;
   const bufferingActive = active && isBuffering;
-  const isSaved = collection.isSongSaved(track.id);
+  const isSaved = collection.isTrackSaved(track);
   const directArtistBrowseId = onNavigate ? getDirectArtistBrowseId(track) : null;
   const handleResolveNavigate = useCallback(() => {
     if (!onNavigate) return;
@@ -282,14 +274,14 @@ export function TrackRow({
                 event.stopPropagation();
                 onNavigateToAlbum();
               }}
-              className={`block w-full truncate text-left font-medium transition focus-visible:outline-none ${
+              className={`block w-full text-left font-medium transition focus-visible:outline-none ${
                 active ? "text-white/80 hover:text-white/95" : "text-neutral-100 hover:text-white/95"
               }`}
             >
-              {track.title}
+              <Marquee className="font-medium text-inherit">{track.title}</Marquee>
             </button>
           ) : (
-            <div className={`truncate font-medium ${active ? "text-white" : "text-neutral-100"}`}>{track.title}</div>
+            <Marquee className={`font-medium ${active ? "text-white" : "text-neutral-100"}`}>{track.title}</Marquee>
           )}
           {showArtist && (
             <div>
@@ -374,20 +366,27 @@ export function Card({
   cover,
   title,
   subtitle,
+  subtitleContent,
   onClick,
+  onTitleClick,
   onPlay,
   type = "album",
   playing = false,
+  playButtonSize = "md",
 }: {
   cover?: string | null;
   title: string;
   subtitle?: string;
+  subtitleContent?: ReactNode;
   onClick?: () => void;
+  onTitleClick?: () => void;
   onPlay?: () => void;
   type?: "album" | "playlist" | "artist";
   playing?: boolean;
+  playButtonSize?: "sm" | "md" | "lg";
 }) {
   const rounded = getArtworkRoundedClass(type === "artist" ? "circle" : "square");
+  const { buttonClass, iconSize } = cardPlayButtonSizing(playButtonSize);
   return (
     <div
       className="group cursor-pointer rounded-xl p-3 transition-colors hover:bg-neutral-900"
@@ -406,20 +405,34 @@ export function Card({
               event.stopPropagation();
               onPlay();
             }}
-            className={`absolute bottom-3 right-3 flex h-[var(--ui-control)] w-[var(--ui-control)] items-center justify-center rounded-full bg-white text-black shadow-lg transition-all duration-200 hover:scale-105 ${
-              playing
-                ? "translate-y-0 opacity-100"
-                : "translate-y-2 opacity-0 group-hover:translate-y-0 group-hover:opacity-100"
-            }`}
+            className={`absolute bottom-2 right-2 flex ${buttonClass} items-center justify-center rounded-full bg-white text-black shadow-lg hover:scale-105 ${cardHoverPlayTransitionClass} ${cardHoverPlayRevealClass(playing)}`}
             aria-label={playing ? "Pause" : "Play"}
           >
-            {playing ? <Pause size={16} /> : <Play size={16} fill="currentColor" />}
+            {playing ? (
+              <Pause size={iconSize} fill="currentColor" strokeWidth={0} />
+            ) : (
+              <Play size={iconSize} fill="currentColor" strokeWidth={0} className="translate-x-[1.5px]" />
+            )}
           </button>
         )}
       </div>
       <div className="mt-3 min-w-0">
-        <div className="truncate text-sm font-semibold text-neutral-100">{title}</div>
-        {subtitle && <div className="mt-0.5 truncate text-xs text-neutral-400">{subtitle}</div>}
+        {onTitleClick ? (
+          <button
+            type="button"
+            onClick={(event) => {
+              event.stopPropagation();
+              onTitleClick();
+            }}
+            className="block w-full text-left text-sm font-semibold text-neutral-100 transition hover:text-white/85 focus-visible:outline-none animate-none"
+          >
+            <Marquee className="text-sm font-semibold text-inherit">{title}</Marquee>
+          </button>
+        ) : (
+          <Marquee className="text-sm font-semibold text-neutral-100">{title}</Marquee>
+        )}
+        {subtitleContent ??
+          (subtitle ? <div className="mt-0.5 truncate text-xs text-neutral-400">{subtitle}</div> : null)}
       </div>
     </div>
   );

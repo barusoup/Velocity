@@ -8,13 +8,27 @@ export type Settings = {
   launchOnStartup: boolean;
   startMinimized: boolean;
   alwaysShowSearch: boolean;
+  searchSuggestions: boolean;
   audioNormalization: boolean;
   crossfade: boolean;
   masterVolume: number;
   equalizerBands: number[];
   hidePlayerOnLyrics: boolean;
+  hideSearchOnLyrics: boolean;
   saveTimestamp: boolean;
   offlineSync: boolean;
+  lyricsDistanceFade: boolean;
+  discordRichPresence: boolean;
+  showHomeMenu: boolean;
+  showHomeTopSongs: boolean;
+  showHomeTodaysPicks: boolean;
+  // Consolidated into the settings blob instead of a per-key
+  // `velocity-autoplay` echo so the persistence is atomic per-tick
+  // (one IPC write per settings change rather than a fire-and-forget
+  // per-key race). Default is `true` so fresh installs ship autoplay
+  // ON out of the box — if no saved value is present, `getSettings()`
+  // spreads `DEFAULTS` and serves `autoplay: true`.
+  autoplay: boolean;
   viewModeCollectionSongs: ViewMode;
   viewModeCollectionLocal: ViewMode;
   viewModeAlbum: ViewMode;
@@ -22,24 +36,38 @@ export type Settings = {
   viewModeDiscography: DiscographyViewMode;
 };
 
-const SETTINGS_KEY = "velocity-settings";
+// Exported so callers (e.g. `player.tsx`'s autoplay migration) can
+// distinguish between "the saved-settings blob has its own autoplay
+// key" and "getSettings()'s DEFAULTS spread is masking the absence
+// of a user-saved value". `getSettings()` always returns a fully
+// populated object (DEFAULTS + saved), so it can't tell those two
+// states apart on its own.
+export const SETTINGS_KEY = "velocity-settings";
 
 const DEFAULTS: Settings = {
   launchOnStartup: false,
   startMinimized: false,
   alwaysShowSearch: false,
+  searchSuggestions: true,
   audioNormalization: true,
   crossfade: true,
   masterVolume: 0,
   equalizerBands: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-  hidePlayerOnLyrics: true,
+  hidePlayerOnLyrics: false,
+  hideSearchOnLyrics: false,
   saveTimestamp: true,
   offlineSync: true,
+  lyricsDistanceFade: true,
+  discordRichPresence: true,
+  showHomeMenu: true,
+  showHomeTopSongs: true,
+  showHomeTodaysPicks: true,
   viewModeCollectionSongs: "list",
   viewModeCollectionLocal: "list",
   viewModeAlbum: "list",
   viewModePlaylist: "list",
   viewModeDiscography: "list",
+  autoplay: true,
 };
 
 export function getSettings(): Settings {
@@ -92,9 +120,10 @@ function notifyListeners(key: string, value: unknown): void {
 // Reactive variant of getSetting: subscribes to local changes so the
 // consuming component re-renders with the up-to-date value. Components
 // that need to react to setting changes (e.g. player.tsx re-applying the
-// output gain when masterVolume changes, PlayerBar updating its
-// lyrics-hidden state when hidePlayerOnLyrics is toggled, Sidebar/TopBar
-// keeping the search bar visible when alwaysShowSearch is toggled) should
+// output gain when masterVolume changes, PlayerBar omitting itself when
+// hidePlayerOnLyrics is toggled, Sidebar/TopBar suppressing the search
+// bar when hideSearchOnLyrics is toggled or keeping it visible when
+// alwaysShowSearch is toggled) should
 // use this hook instead of `getSetting`, which only returns a snapshot.
 export function useSetting<K extends keyof Settings>(key: K): Settings[K] {
   const [value, setValue] = useState<Settings[K]>(() => getSettings()[key]);

@@ -5,20 +5,22 @@ import {
   Disc,
   HardDriveDownload,
   List,
-  LoaderCircle,
+  ListMusic,
   PanelRightOpen,
-  Plus,
   Trash2,
   User,
 } from "lucide-react";
-import { useCallback, useEffect, useRef, useState } from "react";
-import { createPortal } from "react-dom";
+import { useEffect, useRef, useState } from "react";
 import { save as saveDialog } from "@tauri-apps/plugin-dialog";
 import { useCollection } from "../collection";
 import { usePlayer } from "../player";
 import type { MediaTrack } from "../types";
-import { cancelSaveExport, makeSaveExportRequestId, saveTrackToMp3 } from "../api";
+import { deviceExportVideoIds, hydrateUploadTrackForPlayback, saveTrackToMp3 } from "../api";
+import { useDeviceExport } from "../hooks/useDeviceExport";
 import { getDirectAlbumBrowseId, getDirectArtistBrowseId } from "../utils/navigation";
+import { isSameSongTrack, sanitizeFilename } from "../utils/media";
+import { NestedSubMenuPanel } from "./NestedSubMenuPanel";
+import { SavingPanel } from "./SavingPanel";
 import {
   ContextMenu,
   ContextMenuItem,
@@ -40,16 +42,6 @@ export type AddToPlaylistResolver = {
     Array<{ browseId: string; title: string; subtitle?: string | null; cover?: string | null }>
   >;
   addTracksToPlaylist: (browseId: string, tracks: MediaTrack[]) => Promise<void>;
-  /**
-   * Optional: spin up a fresh user playlist and seed it with the supplied
-   * tracks in one step. Surfaced as an inline "Create new playlist" affordance
-   * inside the submenu's empty-state copy so a fresh user can land their
-   * first track into a brand-new playlist without detouring to the sidebar.
-   * Returning the new playlist's `browseId` lets callers confirm the add.
-   */
-  createPlaylistAndAddTracks?: (
-    tracks: MediaTrack[],
-  ) => Promise<{ browseId: string; title: string }>;
 };
 
 type SongContextMenuProps = {
@@ -64,6 +56,14 @@ type SongContextMenuProps = {
    * whose source is uploaded — stream tracks never expose the option.
    */
   onRemoveTrack?: (trackId: string) => void;
+  /**
+   * Invoked when the user flips the per-track \"Find lyrics\" toggle on
+   * a locally uploaded song. The new value is passed as the second
+   * argument (true = lyrics fetching enabled). Only mounted by App for
+   * `source === "upload"` rows; stream tracks never expose the option
+   * because lyrics fetching is already implicit for them.
+   */
+  onToggleUploadLyrics?: (trackId: string, nextValue: boolean) => void;
   onRemoveFromPlaylist?: (playlistId: string, trackId: string) => void;
   onClose: () => void;
   /**
@@ -94,6 +94,7 @@ export function SongContextMenu({
   onNavigate,
   addToPlaylistResolver,
   onRemoveTrack,
+  onToggleUploadLyrics,
   onRemoveFromPlaylist,
   onClose,
   currentAlbumBrowseId,
@@ -109,6 +110,7 @@ export function SongContextMenu({
       onNavigate={onNavigate}
       addToPlaylistResolver={addToPlaylistResolver}
       onRemoveTrack={onRemoveTrack}
+      onToggleUploadLyrics={onToggleUploadLyrics}
       onRemoveFromPlaylist={onRemoveFromPlaylist}
       onClose={onClose}
       currentAlbumBrowseId={currentAlbumBrowseId}
@@ -125,6 +127,7 @@ function SongContextMenuContent({
   onNavigate,
   addToPlaylistResolver,
   onRemoveTrack,
+  onToggleUploadLyrics,
   onRemoveFromPlaylist,
   onClose,
   currentAlbumBrowseId,
@@ -135,7 +138,7 @@ function SongContextMenuContent({
   const collection = useCollection();
   const directAlbumId = getDirectAlbumBrowseId(track);
   const directArtistId = getDirectArtistBrowseId(track);
-  const isSaved = collection.isSongSaved(track.id);
+  const isSaved = collection.isTrackSaved(track);
   const isCurrentAlbum = directAlbumId && currentAlbumBrowseId && directAlbumId === currentAlbumBrowseId;
   const isCurrentArtist = directArtistId && currentArtistBrowseId && directArtistId === currentArtistBrowseId;
   const isInQueue = player.queue.some((t) => t.id === track.id);
@@ -144,34 +147,20 @@ function SongContextMenuContent({
   // two-button confirmation panel instead of the standard row list.
   const [confirmingDelete, setConfirmingDelete] = useState(false);
   const [deleteConfirmPosition, setDeleteConfirmPosition] = useState<{ x: number; y: number } | null>(null);
-  // "Save to my device" runs through yt-dlp + ffmpeg, which can take a
-  // few seconds. We swap the menu rows to a "saving…" panel with a
-  // spinner + cancel so the right-click site itself stays interactive
-  // (the user can still see the menu, just not click any other item
-  // until the export finishes or fails).
-  const [savingState, setSavingState] = useState<{
-    label: string;
-  } | null>(null);
-  const [saveError, setSaveError] = useState<string | null>(null);
-  // Tracks the in-flight export's backend request id so the Cancel
-  // button can route to the right cancellation sender. `null` means
-  // no export is currently in flight, so the Cancel button is
-  // disabled.
-  const [activeRequestId, setActiveRequestId] = useState<string | null>(null);
 
-  // Reset the confirmation any time the menu re-targets a different row.
-  // Without this, prop-only re-renders (the parent keeps the same
-  // SongContextMenu instance and just swaps `track`) would leave
-  // `confirmingDelete` true across targets — so confirming would delete
-  // whichever track the closure currently sees, not the one the user
-  // agreed to delete.
+  // Re-target the menu to a different row? Drop the delete-confirmation
+  // state so a stale panel doesn't follow the new row. The device-export
+  // hook manages its own cross-row cleanup, so no state reset is needed
+  // for that slice here.
   useEffect(() => {
     setConfirmingDelete(false);
     setDeleteConfirmPosition(null);
-    setSavingState(null);
-    setSaveError(null);
-    setActiveRequestId(null);
   }, [track.id]);
+
+  const handleToggleFindLyrics = () => {
+    onToggleUploadLyrics?.(track.id, !track.findLyrics);
+    onClose();
+  };
 
   const handleGoToAlbum = () => {
     if (directAlbumId) {
@@ -188,8 +177,12 @@ function SongContextMenuContent({
   };
 
   const handleAddToQueue = () => {
-    player.appendToQueue([track]);
-    onClose();
+    void hydrateUploadTrackForPlayback(track)
+      .then((hydrated) => {
+        player.appendToQueue([hydrated]);
+        onClose();
+      })
+      .catch(() => onClose());
   };
 
   const handleToggleSave = () => {
@@ -227,12 +220,22 @@ function SongContextMenuContent({
     onRemoveTrack?.(id);
   };
 
+  const exportTrack = enrichTrackForDeviceExport(track, player.currentTrack, player.queue);
+  const deviceExport = useDeviceExport({ onClose });
+  const {
+    status: savingState,
+    error: saveError,
+    canCancel,
+    cancel: handleCancelSave,
+    start: startDeviceExport,
+    dismiss: dismissDeviceExport,
+  } = deviceExport;
+
   // "Save to my device" — opens a native save dialog, then hands the
   // chosen path + track metadata to the Rust pipeline. The dialog
-  // returns `null` when the user cancels, in which case we just close
-  // the menu without doing anything. The export itself happens
-  // in-flight (the spinner is shown until the Rust command resolves).
-  const handleSaveToDevice = useCallback(async () => {
+  // returns `null` when the user cancels, in which case we leave the
+  // menu untouched (no save started).
+  const handleSaveToDevice = async () => {
     const safeTitle = sanitizeFilename(track.title || "track");
     const defaultName = `${safeTitle}.mp3`;
     let targetPath: string | null = null;
@@ -243,9 +246,14 @@ function SongContextMenuContent({
         filters: [{ name: "MP3 audio", extensions: ["mp3"] }],
       });
     } catch (error) {
-      setSaveError(
-        error instanceof Error ? error.message : "Could not open the save dialog.",
-      );
+      // Surface dialog errors through the same panel state machine as
+      // export failures so the user gets one consistent error UI.
+      await startDeviceExport({
+        label: "",
+        runExport: () => {
+          throw error instanceof Error ? error : new Error("Could not open the save dialog.");
+        },
+      }).catch(() => {});
       return;
     }
     if (!targetPath) {
@@ -255,66 +263,36 @@ function SongContextMenuContent({
     }
     const split = splitDirAndName(targetPath);
     if (!split) {
-      setSaveError("That save location isn't valid. Please pick a folder on your computer.");
+      await startDeviceExport({
+        label: "",
+        runExport: () => {
+          throw new Error("That save location isn't valid. Please pick a folder on your computer.");
+        },
+      }).catch(() => {});
       return;
     }
     const { dir, stem } = split;
-    const requestId = makeSaveExportRequestId();
-    setActiveRequestId(requestId);
-    setSavingState({ label: `Saving "${track.title || "track"}"…` });
-    try {
-      await saveTrackToMp3({
-        requestId,
-        videoId: track.videoId ?? track.id,
-        title: track.title,
-        artist: track.artist,
-        album: track.album ?? null,
-        trackNumber: null,
-        trackTotal: null,
-        year: null,
-        coverUrl: track.cover ?? null,
-        targetDir: dir,
-        fileName: stem,
-      });
-      // Success: dismiss the menu so the row can refresh without
-      // fighting the open popout.
-      onClose();
-    } catch (error) {
-      const message =
-        error instanceof Error ? error.message : "Failed to save the track to your device.";
-      // The backend returns a friendly "Save cancelled." when the
-      // user aborted; we don't want that to surface as a red error
-      // — just close the menu silently like a successful completion
-      // so the UX feels like a deliberate cancel, not a failure.
-      if (message === "Save cancelled.") {
-        onClose();
-        return;
-      }
-      setSaveError(message);
-      setSavingState(null);
-    } finally {
-      setActiveRequestId(null);
-    }
-  }, [track, onClose]);
-
-  // Pull the ripcord on the in-flight save. We don't await the
-  // `cancelSaveExport` call — the backend command is fire-and-forget
-  // and the corresponding save command will reject on its own when
-  // the cancellation signal lands (which `handleSaveToDevice`
-  // recognizes and uses to close the menu cleanly).
-  const handleCancelSave = useCallback(() => {
-    const id = activeRequestId;
-    if (!id) return;
-    setSavingState({ label: "Cancelling…" });
-    setSaveError(null);
-    void cancelSaveExport(id).catch(() => {
-      // The cancel command itself is best-effort. If it fails (e.g.
-      // the backend already removed the entry because the export
-      // just finished), the save promise will still resolve
-      // normally and the user lands on a normal success / error
-      // path. Swallow the cancel error so we don't double up.
-    });
-  }, [activeRequestId]);
+    await startDeviceExport({
+      label: `Saving "${track.title || "track"}"…`,
+      runExport: async (requestId) => {
+        const { videoId, fallbackVideoIds } = deviceExportVideoIds(exportTrack);
+        return saveTrackToMp3({
+          requestId,
+          videoId,
+          fallbackVideoIds,
+          title: exportTrack.title,
+          artist: exportTrack.artist,
+          album: exportTrack.album ?? null,
+          trackNumber: null,
+          trackTotal: null,
+          year: null,
+          coverUrl: exportTrack.cover ?? null,
+          targetDir: dir,
+          fileName: stem,
+        });
+      },
+    }).catch(() => {});
+  };
 
   const effectivePosition = confirmingDelete && deleteConfirmPosition ? deleteConfirmPosition : position;
 
@@ -330,18 +308,18 @@ function SongContextMenuContent({
           onCancel={handleCancelDelete}
           onConfirm={handleConfirmDelete}
         />
-      ) : savingState ? (
-        <SavingSection
-          label={savingState.label}
+      ) : savingState || saveError ? (
+        <SavingPanel
+          status={savingState?.label ?? ""}
           error={saveError}
-          onClose={onClose}
           // The cancel button is enabled while the export is in
-          // flight (i.e. the active request id is set). Once the
-          // user clicks it we set `savingState` to a "Cancelling…"
-          // variant that swaps the label but keeps the cancel
-          // button hidden so the user can't double-cancel.
-          canCancel={activeRequestId !== null && saveError === null}
+          // flight (the active request id is set). Once the user
+          // clicks it we set the panel's status to "Cancelling…"
+          // and hide the Cancel button so the user can't double-cancel.
+          canCancel={canCancel}
           onCancel={handleCancelSave}
+          onDismiss={dismissDeviceExport}
+          errorTitle="Couldn't save track"
         />
       ) : (
         <>
@@ -420,6 +398,14 @@ function SongContextMenuContent({
               label={isSaved ? "Saved to collection" : "Save to collection"}
               icon={isSaved ? <Check size={16} strokeWidth={2.2} /> : <CirclePlus size={16} strokeWidth={1.6} />}
               onClick={handleToggleSave}
+            />
+          )}
+          {track.source === "upload" && onToggleUploadLyrics && (
+            <ContextMenuItem
+              label="Find lyrics"
+              icon={<ListMusic size={16} strokeWidth={1.6} />}
+              active={track.findLyrics === true}
+              onClick={handleToggleFindLyrics}
             />
           )}
           {track.source === "upload" && onRemoveTrack && (
@@ -506,7 +492,6 @@ function AddToPlaylistRow({
             resolver.addTracksToPlaylist(playlist.browseId, [track]);
           }}
           resolver={resolver}
-          track={track}
         />
       )}
     </>
@@ -518,13 +503,11 @@ function PlaylistSearchSubMenu({
   onClose,
   onPick,
   resolver,
-  track,
 }: {
   anchorRef: { current: HTMLElement | null };
   onClose: () => void;
   onPick: (playlist: { browseId: string; title: string }) => void;
   resolver: AddToPlaylistResolver;
-  track: MediaTrack;
 }) {
   const [query, setQuery] = useState("");
   const [results, setResults] = useState<
@@ -553,7 +536,7 @@ function PlaylistSearchSubMenu({
   }, [query, resolver]);
 
   return (
-    <NestedMenuMount anchorRef={anchorRef} onClose={onClose}>
+    <NestedSubMenuPanel anchorRef={anchorRef} onClose={onClose}>
       <ContextMenuSection label="Search playlists">
         <div className="px-3 pb-2">
           <input
@@ -569,26 +552,9 @@ function PlaylistSearchSubMenu({
         {loading && results.length === 0 ? (
           <div className="px-4 py-3 text-xs text-white/40">Searching…</div>
         ) : results.length === 0 ? (
-          resolver.createPlaylistAndAddTracks ? (
-            <>
-              <div className="px-4 py-2 text-xs text-white/46">
-                No playlists yet.
-              </div>
-              <ContextMenuItem
-                label="Create new playlist"
-                icon={<Plus size={14} strokeWidth={1.8} />}
-                onClick={async () => {
-                  if (!resolver.createPlaylistAndAddTracks) return;
-                  await resolver.createPlaylistAndAddTracks([track]);
-                  onClose();
-                }}
-              />
-            </>
-          ) : (
-            <div className="px-4 py-3 text-xs text-white/40">
-              No playlists yet. Create one from the sidebar.
-            </div>
-          )
+          <div className="px-4 py-3 text-xs text-white/40">
+            No playlists yet. Create one from the sidebar.
+          </div>
         ) : (
           results.map((playlist) => (
             <ContextMenuItem
@@ -599,88 +565,24 @@ function PlaylistSearchSubMenu({
           ))
         )}
       </div>
-    </NestedMenuMount>
+    </NestedSubMenuPanel>
   );
 }
 
-function NestedMenuMount({
-  anchorRef,
-  onClose,
-  children,
-}: {
-  anchorRef: { current: HTMLElement | null };
-  onClose: () => void;
-  children: React.ReactNode;
-}) {
-  const panelRef = useRef<HTMLDivElement | null>(null);
-  const [coords, setCoords] = useState<{ top: number; left: number } | null>(
-    null,
+/** Borrow resolved playback ids from the player when this row is the same song. */
+function enrichTrackForDeviceExport(
+  track: MediaTrack,
+  currentTrack: MediaTrack | null,
+  queue: readonly MediaTrack[],
+): MediaTrack {
+  const candidates = [currentTrack, ...queue].filter(
+    (entry): entry is MediaTrack => entry != null,
   );
-
-  useEffect(() => {
-    const measure = () => {
-      const anchor = anchorRef.current;
-      if (!anchor) return;
-      const rect = anchor.getBoundingClientRect();
-      const panel = panelRef.current;
-      const panelWidth = panel?.offsetWidth ?? 220;
-      const panelHeight = panel?.offsetHeight ?? 220;
-      const viewportH = window.innerHeight;
-      const viewportW = window.innerWidth;
-      let top = rect.top;
-      let left = rect.right + 6;
-      if (left + panelWidth > viewportW - 12) {
-        left = Math.max(8, rect.left - panelWidth - 6);
-      }
-      if (top + panelHeight > viewportH - 8) {
-        top = Math.max(8, viewportH - panelHeight - 8);
-      }
-      if (top < 8) top = 8;
-      setCoords({ top, left });
-    };
-    const frame = requestAnimationFrame(measure);
-    window.addEventListener("resize", measure);
-    window.addEventListener("scroll", measure, true);
-    return () => {
-      cancelAnimationFrame(frame);
-      window.removeEventListener("resize", measure);
-      window.removeEventListener("scroll", measure, true);
-    };
-  }, [anchorRef]);
-
-  const closeIfOutside = useCallback(
-    (event: PointerEvent) => {
-      if (panelRef.current?.contains(event.target as Node)) return;
-      if (anchorRef.current?.contains(event.target as Node)) return;
-      onClose();
-    },
-    [anchorRef, onClose],
-  );
-
-  useEffect(() => {
-    document.addEventListener("pointerdown", closeIfOutside);
-    return () => document.removeEventListener("pointerdown", closeIfOutside);
-  }, [closeIfOutside]);
-
-  if (typeof document === "undefined") return null;
-
-  return createPortal(
-    <div
-      ref={panelRef}
-      role="menu"
-      data-context-menu="true"
-      style={{
-        position: "fixed",
-        top: coords?.top ?? -9999,
-        left: coords?.left ?? -9999,
-        zIndex: 65,
-      }}
-      className="artist-menu-pop overflow-hidden rounded-[4px] border border-white/10 bg-neutral-950 shadow-[0_18px_48px_rgba(0,0,0,0.48)] min-w-[14rem] max-w-[18rem]"
-    >
-      {children}
-    </div>,
-    document.body,
-  );
+  for (const candidate of candidates) {
+    if (!candidate.resolvedVideoId || !isSameSongTrack(candidate, track)) continue;
+    return { ...track, resolvedVideoId: candidate.resolvedVideoId };
+  }
+  return track;
 }
 
 // ── "Save to my device" helpers ────────────────────────────────────────
@@ -715,90 +617,3 @@ function stripExtension(name: string): string {
   return name.slice(0, dot);
 }
 
-// Lightweight FS-safe sanitizer for the suggested default file name.
-// We duplicate a thin version of the Rust-side rule so the dialog's
-// pre-filled name is readable; the Rust side still applies its own
-// sanitizer as a defense in depth.
-function sanitizeFilename(name: string): string {
-  const cleaned = name
-    .replace(/[<>:"/\\|?*\x00-\x1F]/g, "")
-    .replace(/[\s.]+$/g, "")
-    .trim();
-  return cleaned || "track";
-}
-
-// Inline "Saving…" panel. We swap the menu's children for a
-// spinner + status so the user gets feedback the click did something
-// while the (potentially slow) yt-dlp + ffmpeg pipeline runs. If the
-// backend rejects, the same panel turns into an error message + dismiss
-// button.
-function SavingSection({
-  label,
-  error,
-  onClose,
-  canCancel,
-  onCancel,
-}: {
-  label: string;
-  error: string | null;
-  onClose: () => void;
-  /**
-   * Whether the Cancel button is enabled. The parent flips this on
-   * while the export is in flight and off once cancellation is in
-   * progress (so the user can't double-cancel) or after the export
-   * has settled.
-   */
-  canCancel: boolean;
-  /**
-   * Fires when the user clicks Cancel. The parent is responsible
-   * for routing this to the backend's `cancelSaveExport` command.
-   */
-  onCancel: () => void;
-}) {
-  return (
-    <div className="flex flex-col gap-1 px-4 py-3 text-sm text-white/72">
-      <div className="flex items-center gap-3">
-        {error ? (
-          <span className="shrink-0 text-red-400">
-            <Trash2 size={16} strokeWidth={1.6} />
-          </span>
-        ) : (
-          <span className="shrink-0 text-white/72">
-            <LoaderCircle size={16} className="animate-spin" />
-          </span>
-        )}
-        <span className="min-w-0 flex-1 truncate font-semibold">
-          {error ? "Couldn't save track" : label}
-        </span>
-        {canCancel && (
-          <button
-            type="button"
-            onClick={onCancel}
-            // The Cancel button sits in the same row as the status
-            // label so the user can pull the ripcord without
-            // re-reading any copy. Hover matches the destructive
-            // row treatment used elsewhere in the menu so it reads
-            // as the "stop" affordance.
-            className="shrink-0 rounded-md border border-white/10 bg-white/5 px-2.5 py-1 text-xs font-semibold text-white/72 transition-colors hover:border-red-400/40 hover:bg-red-500/15 hover:text-red-200"
-          >
-            Cancel
-          </button>
-        )}
-      </div>
-      {error && (
-        <>
-          <p className="pl-7 text-xs leading-relaxed text-red-300/90">
-            {error}
-          </p>
-          <button
-            type="button"
-            onClick={onClose}
-            className="mt-1 self-start rounded-md border border-white/10 bg-white/5 px-3 py-1 text-xs font-semibold text-white/72 transition-colors hover:bg-white/10 hover:text-white"
-          >
-            Dismiss
-          </button>
-        </>
-      )}
-    </div>
-  );
-}

@@ -3,7 +3,7 @@
 //
 // Opt-in client-side guardrail. Wire once:
 //   git config core.hooksPath .githooks
-//   chmod +x .githooks/pre-commit          # macOS / Linux only
+//   chmod +x .githooks/pre-commit          # macOS only
 //
 // The hook mirrors the same icon-system regression checks as
 // scripts/verify-release-assets.mjs but blocks them BEFORE git writes

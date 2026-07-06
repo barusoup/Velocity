@@ -1,6 +1,6 @@
 name: release
 
-# Builds Velocity for Windows, macOS (arm64 + x86_64), and Linux on every
+# Builds Velocity for Windows and macOS Apple Silicon (arm64) on every
 # annotated `vX.Y.Z` tag, signs the auto-updater bundles, and publishes the
 # installers + a Tauri v2 updater manifest to the PUBLIC repository
 # (barusoup/Velocity-Public) as a GitHub Release. Source code lives only in
@@ -15,6 +15,10 @@ on:
       version:
         description: "Version to build and publish (e.g. 0.0.1)"
         required: true
+      experimental:
+        description: "Publish as a pre-release (skips latest.json updater manifest)"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -56,14 +60,6 @@ jobs:
           node-version: 20
           cache: npm
 
-      - name: Install Linux system deps
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev \
-            libssl-dev libglib2.0-dev libgtk-3-dev dpkg file
-
       - name: Install JS deps
         run: npm ci
 
@@ -97,18 +93,6 @@ jobs:
               cp "$tgz.sig" "$REL/Velocity-macOS-arm64.app.tar.gz.sig"
               dmg=$(find src-tauri/target/aarch64-apple-darwin/release/bundle/dmg -name '*.dmg' | head -1)
               cp "$dmg" "$REL/Velocity-macOS-arm64.dmg"
-              ;;
-            macos-x64)
-              tgz=$(find src-tauri/target/x86_64-apple-darwin/release/bundle/macos -name '*.app.tar.gz' | head -1)
-              cp "$tgz"     "$REL/Velocity-macOS-x64.app.tar.gz"
-              cp "$tgz.sig" "$REL/Velocity-macOS-x64.app.tar.gz.sig"
-              dmg=$(find src-tauri/target/x86_64-apple-darwin/release/bundle/dmg -name '*.dmg' | head -1)
-              cp "$dmg" "$REL/Velocity-macOS-x64.dmg"
-              ;;
-            linux)
-              img=$(find src-tauri/target/release/bundle/appimage -name '*.AppImage' ! -name '*.sig' | head -1)
-              cp "$img"     "$REL/Velocity-Linux-x86_64.AppImage"
-              cp "$img.sig" "$REL/Velocity-Linux-x86_64.AppImage.sig"
               ;;
           esac
           echo "--- staged ---"
@@ -173,45 +157,60 @@ jobs:
           NOTES=$(git tag -l --format='%(contents:subject)%0a%0a%(contents:body)' "$TAG" 2>/dev/null | tr -d '\000' | head -c 60000 || true)
           if [ -z "$NOTES" ]; then NOTES="Velocity $VER"; fi
 
+          # Experimental / pre-release: workflow_dispatch flag, or tag
+          # annotation containing "experimental" (case-insensitive).
+          EXPERIMENTAL="${{ github.event.inputs.experimental }}"
+          if [ "$EXPERIMENTAL" != "true" ]; then
+            if echo "$NOTES" | grep -qi 'experimental'; then
+              EXPERIMENTAL=true
+            fi
+          fi
+
+          RELEASE_TITLE="Velocity $VER"
+          PRERELEASE_FLAG=()
+          if [ "$EXPERIMENTAL" = "true" ]; then
+            RELEASE_TITLE="Velocity $VER Experimental"
+            PRERELEASE_FLAG=(--prerelease)
+            echo "Publishing as experimental pre-release (latest.json skipped)"
+          fi
+
           sig_of() { cat "$1" 2>/dev/null | tr -d '\r\n' || true; }
           export VER PUB_DATE NOTES BASE
           export WIN_SIG=$(sig_of "_assets/build-windows/Velocity-Setup-x64.exe.sig")
           export MAC_A_SIG=$(sig_of "_assets/build-macos-arm64/Velocity-macOS-arm64.app.tar.gz.sig")
-          export MAC_X_SIG=$(sig_of "_assets/build-macos-x64/Velocity-macOS-x64.app.tar.gz.sig")
-          export LIN_SIG=$(sig_of "_assets/build-linux/Velocity-Linux-x86_64.AppImage.sig")
 
-          # node reads the values from env so JSON.stringify handles all
-          # escaping (release notes carry newlines/quotes; signatures are base64).
-          # Platforms with no signature (skipped in the build matrix) are
-          # omitted from the manifest entirely, so the Tauri updater on
-          # those platforms never tries to validate an empty signature and
-          # users stay on their current build.
-          node <<'JS' > latest.json
-          const env = process.env;
-          const trim = (v) => (v || "").replace(/\r?\n/g, "");
-          const platform = (sig, url) => sig ? { signature: sig, url } : null;
-          const all = {
-            "windows-x86_64": platform(trim(env.WIN_SIG),  env.BASE + "/Velocity-Setup-x64.exe"),
-            "darwin-aarch64": platform(trim(env.MAC_A_SIG), env.BASE + "/Velocity-macOS-arm64.app.tar.gz"),
-            "darwin-x86_64":  platform(trim(env.MAC_X_SIG), env.BASE + "/Velocity-macOS-x64.app.tar.gz"),
-            "linux-x86_64":   platform(trim(env.LIN_SIG),   env.BASE + "/Velocity-Linux-x86_64.AppImage")
-          };
-          const platforms = Object.fromEntries(Object.entries(all).filter(([, v]) => v !== null));
-          const m = {
-            version: env.VER,
-            notes: env.NOTES,
-            pub_date: env.PUB_DATE,
-            platforms
-          };
-          process.stdout.write(JSON.stringify(m, null, 2));
-          JS
+          if [ "$EXPERIMENTAL" != "true" ]; then
+            # node reads the values from env so JSON.stringify handles all
+            # escaping (release notes carry newlines/quotes; signatures are base64).
+            # Platforms with no signature (skipped in the build matrix) are
+            # omitted from the manifest entirely, so the Tauri updater on
+            # those platforms never tries to validate an empty signature and
+            # users stay on their current build.
+            node <<'JS' > latest.json
+            const env = process.env;
+            const trim = (v) => (v || "").replace(/\r?\n/g, "");
+            const platform = (sig, url) => sig ? { signature: sig, url } : null;
+            const all = {
+              "windows-x86_64": platform(trim(env.WIN_SIG),  env.BASE + "/Velocity-Setup-x64.exe"),
+              "darwin-aarch64": platform(trim(env.MAC_A_SIG), env.BASE + "/Velocity-macOS-arm64.app.tar.gz")
+            };
+            const platforms = Object.fromEntries(Object.entries(all).filter(([, v]) => v !== null));
+            const m = {
+              version: env.VER,
+              notes: env.NOTES,
+              pub_date: env.PUB_DATE,
+              platforms
+            };
+            process.stdout.write(JSON.stringify(m, null, 2));
+            JS
 
-          echo "--- manifest ---"
-          cat latest.json
+            echo "--- manifest ---"
+            cat latest.json
 
-          # Upload the manifest too so the app can always reach it at
-          # releases/latest/download/latest.json (future-proof across releases).
-          cp latest.json "_assets/build-windows/latest.json" 2>/dev/null || true
+            # Upload the manifest too so the app can always reach it at
+            # releases/latest/download/latest.json (future-proof across releases).
+            cp latest.json "_assets/build-windows/latest.json" 2>/dev/null || true
+          fi
 
           # The public repo must have at least one commit for gh release create
           # to anchor the release tag. Initialize it with a README on the first
@@ -230,13 +229,12 @@ jobs:
           ASSETS=(
             _assets/build-windows/*
             _assets/build-macos-arm64/*
-            _assets/build-macos-x64/*
-            _assets/build-linux/*
           )
           gh release create "$TAG" \
             --repo "$PUB_REPO" \
-            --title "Velocity $VER" \
+            --title "$RELEASE_TITLE" \
             --notes "$NOTES" \
+            "${PRERELEASE_FLAG[@]}" \
             "${ASSETS[@]}"
 
       - name: Verify

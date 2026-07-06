@@ -3,8 +3,9 @@ import { CircleAlert, LoaderCircle } from "lucide-react";
 import { getArtistDetail, getEntityDetail, cacheArtwork } from "../api";
 import type { QueueOrigin } from "../player";
 import type { MediaTrack, SearchItem } from "../types";
-import { buildArtistLineParts, buildArtistNameParts } from "../utils/artist-links";
-import { getDirectArtistBrowseId } from "../utils/navigation";
+import { buildArtistDisplayParts, buildArtistNameParts } from "../utils/artist-links";
+import { getDirectArtistBrowseId, resolveArtistBrowseId } from "../utils/navigation";
+import { isSameSongTrack } from "../utils/media";
 import { getSearchItemArtist } from "../utils/search";
 import { extractInterestingArtworkColor, peekArtworkAccent, type RgbColor } from "../utils/artwork-color";
 import { convertFileSrc } from "@tauri-apps/api/core";
@@ -32,7 +33,7 @@ export function LoadingPanel({ label }: { label: string }) {
 
 export function ErrorPanel({ message }: { message: string }) {
   return (
-    <div className="rounded-2xl border border-neutral-900 bg-black p-16 text-center">
+    <div className="rounded-2xl bg-black p-16 text-center">
       <div className="mx-auto mb-4 flex h-10 w-10 items-center justify-center rounded-full bg-neutral-900 text-neutral-300">
         <CircleAlert size={18} />
       </div>
@@ -55,7 +56,7 @@ export function CardGrid({ children, small }: { children: ReactNode; small?: boo
 }
 
 export function isPlayable(item: SearchItem): boolean {
-  return item.kind === "song";
+  return item.kind === "song" && !!item.videoId;
 }
 
 export function formatSearchItemMeta(item: SearchItem): string {
@@ -111,10 +112,12 @@ export function ArtistCreditText({
   onResolveNavigate?: (() => void) | null;
   onResolveArtistName?: ((artistName: string) => void) | null;
 }) {
-  const parts = buildArtistLineParts(artist, artistCredits ?? []);
+  const parts = buildArtistDisplayParts(artist, artistCredits ?? []);
+  const fallbackNameParts = !parts && onResolveArtistName ? buildArtistNameParts(artist) : null;
   const fallbackArtistBrowseId =
-    (artistCredits?.length ?? 0) <= 1 ? getDirectArtistBrowseId({ artistBrowseId, artistCredits }) : null;
-  const fallbackNameParts = onResolveArtistName ? buildArtistNameParts(artist) : null;
+    parts || fallbackNameParts
+      ? null
+      : getDirectArtistBrowseId({ artistBrowseId, artistCredits });
 
   if (parts) {
     return (
@@ -197,6 +200,29 @@ export function ArtistCreditText({
   return <span>{artist}</span>;
 }
 
+function resolveSearchArtistName(artistName: string, onNavigate: (view: View) => void) {
+  void resolveArtistBrowseId({ artist: artistName })
+    .then((browseId) => {
+      if (!browseId) return;
+      onNavigate({ name: "artist", browseId, context: "search" });
+    })
+    .catch(() => undefined);
+}
+
+function resolveSearchArtistLine(item: Pick<SearchItem, "artist" | "artistBrowseId" | "artistCredits" | "videoId">, onNavigate: (view: View) => void) {
+  void resolveArtistBrowseId({
+    artist: item.artist ?? undefined,
+    artistBrowseId: item.artistBrowseId,
+    artistCredits: item.artistCredits,
+    videoId: item.videoId,
+  })
+    .then((browseId) => {
+      if (!browseId) return;
+      onNavigate({ name: "artist", browseId, context: "search" });
+    })
+    .catch(() => undefined);
+}
+
 export function SearchItemMeta({
   item,
   onNavigate,
@@ -214,6 +240,8 @@ export function SearchItemMeta({
           artistCredits={item.artistCredits}
           context="search"
           onNavigate={onNavigate}
+          onResolveNavigate={() => resolveSearchArtistLine(item, onNavigate)}
+          onResolveArtistName={(artistName) => resolveSearchArtistName(artistName, onNavigate)}
         />
       </>
     );
@@ -229,6 +257,8 @@ export function SearchItemMeta({
           artistCredits={item.artistCredits}
           context="search"
           onNavigate={onNavigate}
+          onResolveNavigate={() => resolveSearchArtistLine(item, onNavigate)}
+          onResolveArtistName={(artistName) => resolveSearchArtistName(artistName, onNavigate)}
         />
       </>
     );
@@ -238,7 +268,7 @@ export function SearchItemMeta({
 }
 
 export function toTrack(item: SearchItem): MediaTrack | null {
-  if (!item.videoId) return null;
+  if (item.kind !== "song" || !item.videoId) return null;
   // Encode the release/album so identical songs that appear under multiple
   // YouTube Music releases (single vs. parent album) get distinct ids. This
   // mirrors the Rust-side `track_id` and `trackFromSearchItem` so every
@@ -248,6 +278,7 @@ export function toTrack(item: SearchItem): MediaTrack | null {
     : `yt:${item.videoId}`;
   return {
     id,
+    kind: item.kind,
     title: item.title,
     artist: getSearchItemArtist(item),
     album: item.album ?? null,
@@ -271,14 +302,12 @@ export function isItemPlaying(
 ): boolean {
   if (!currentTrack) return false;
   if (item.kind === "song") {
-    // Match by videoId (or id for uploads), but only if no specific
-    // queue origin is active — a song played from an album, playlist,
-    // or artist context should not show as playing in search results.
-    if (queueOrigin) return false;
-    if (currentTrack.videoId && item.videoId) {
-      return currentTrack.videoId === item.videoId;
-    }
-    return currentTrack.id === item.id;
+    if (!item.videoId) return false;
+    return isSameSongTrack(currentTrack, {
+      id: item.id,
+      videoId: item.videoId,
+      source: "stream",
+    });
   }
   if (item.kind === "album" || item.kind === "playlist") {
     const expectedKind = item.kind === "album" ? "album" : "playlist";

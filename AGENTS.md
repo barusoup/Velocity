@@ -53,11 +53,6 @@ newest release:
 | `Velocity-macOS-arm64.dmg`            | macOS Apple Silicon installer       |
 | `Velocity-macOS-arm64.app.tar.gz`     | macOS arm64 updater target          |
 | `Velocity-macOS-arm64.app.tar.gz.sig` | macOS arm64 updater signature       |
-| `Velocity-macOS-x64.dmg`              | macOS Intel installer               |
-| `Velocity-macOS-x64.app.tar.gz`       | macOS x86_64 updater target         |
-| `Velocity-macOS-x64.app.tar.gz.sig`   | macOS x86_64 updater signature      |
-| `Velocity-Linux-x86_64.AppImage`      | Linux installer (= linux updater target) |
-| `Velocity-Linux-x86_64.AppImage.sig`   | Linux updater signature           |
 | `latest.json`                         | Tauri updater manifest (version, notes, pub_date, per-platform signature + url) |
 
 The manifest's per-platform `url`s also use `releases/latest/download/...` so
@@ -72,9 +67,7 @@ the manifest stays valid even across cached GitHub release redirects.
   "pub_date": "2026-06-29T00:00:00Z",
   "platforms": {
     "windows-x86_64": { "signature": "...", "url": ".../Velocity-Setup-x64.exe" },
-    "darwin-aarch64": { "signature": "...", "url": ".../Velocity-macOS-arm64.app.tar.gz" },
-    "darwin-x86_64":  { "signature": "...", "url": ".../Velocity-macOS-x64.app.tar.gz" },
-    "linux-x86_64":   { "signature": "...", "url": ".../Velocity-Linux-x86_64.AppImage" }
+    "darwin-aarch64": { "signature": "...", "url": ".../Velocity-macOS-arm64.app.tar.gz" }
   }
 }
 ```
@@ -94,9 +87,9 @@ must perform every step below. This is the **only** supported release path.
    `barusoup/Velocity-Public`). The release workflow uses it to create the
    release and upload assets on the public repo.
 3. `src-tauri/tauri.conf.json` has the Updater plugin configured
-   (`plugins.updater`), bundle targets including `nsis` / `dmg` / `app` /
-   `appimage`, `bundle.createUpdaterArtifacts: true`, and the endpoint
-   pointing at the manifest URL.
+   (`plugins.updater`), bundle targets including `nsis` / `dmg` / `app`,
+   `bundle.createUpdaterArtifacts: true`, and the endpoint pointing at the
+   manifest URL.
 4. `.github/workflows/release.yml` on the private repo is the CI/CD workflow.
    It triggers automatically on an annotated tag `vX.Y.Z`. Its `build`
    matrix runs `npm run verify-release` as a fail-fast gate before any
@@ -178,8 +171,8 @@ must perform every step below. This is the **only** supported release path.
    - Runs `npm run verify-release` on every matrix build as a fail-fast
      gate. A non-zero exit there means a bad commit slipped past the local
      verify — cancel / drop the tag, fix, and re-push.
-    - Builds Windows + macOS arm64 + Linux x86_64 with `tauri build`, signing the updater
-     bundles (produces `.sig` sidecars and updater targets).
+    - Builds Windows + macOS Apple Silicon (arm64) with `tauri build`, signing the
+     updater bundles (produces `.sig` sidecars and updater targets).
    - Stages every asset under its fixed name (see the fixed-asset-names table
      above).
    - In the `publish` job: reads each `.sig`, composes `latest.json`
@@ -210,9 +203,6 @@ must perform every step below. This is the **only** supported release path.
      ```
    - **macOS**: drag the installed `.app` out of `/Applications`, drag it
      back. The Dock re-reads the icon at relaunch time.
-   - **Linux** (varies by desktop environment): rebuild the icon theme
-     cache. Most: `update-desktop-database ~/.local/share/applications`.
-     KDE: `kbuildsycoca5 --noincremental`.
 
 ### Removing an existing tag on the public repo
 
@@ -265,7 +255,7 @@ It's not auto-enabled. Wire it once per checkout:
 
 ```
 git config core.hooksPath .githooks
-chmod +x .githooks/pre-commit   # macOS / Linux only; Windows Git Bash picks up the executable bit when the hook ships executable in the index.
+chmod +x .githooks/pre-commit   # macOS only; Windows Git Bash picks up the executable bit when the hook ships executable in the index.
 ```
 
 After that, every local commit runs the same ICONDIR/bundle.icon checks as
@@ -278,16 +268,16 @@ before git writes the commit object, the CI gate runs after tag-and-push.
 
 For belt-and-suspenders, after `npm run tauri -- build` produces a real
 installer, run `npm run verify-bundled-installer`. The script uses `7z`
-(p7zip on macOS / Linux, 7-Zip standalone on Windows) to extract the
-produced artifacts — NSIS `.exe`, `.dmg`, `.app.tar.gz`, or `.AppImage` —
-and re-runs the ICONDIR / icns-magic / hicolor-PNG checks against the
-EMBEDDED icon resources. This catches the failure class where the
-pre-build verifier says green but Tauri's bundler still ships a broken
-icon (the registry of issues that wiped out the previous release).
+(p7zip on macOS, 7-Zip standalone on Windows) to extract the produced
+artifacts — NSIS `.exe`, `.dmg`, or `.app.tar.gz` — and re-runs the
+ICONDIR / icns-magic checks against the EMBEDDED icon resources. This
+catches the failure class where the pre-build verifier says green but
+Tauri's bundler still ships a broken icon (the registry of issues that
+wiped out the previous release).
 
 Without `7z` on PATH the script refuses to run with a clear install
-message: `brew install p7zip` (macOS), `apt install p7zip-full` (Linux),
-or install 7-Zip standalone (Windows) unblocks it.
+message: `brew install p7zip` (macOS) or install 7-Zip standalone
+(Windows) unblocks it.
 
 ## Don't
 - Don't commit `dist/`, `src-tauri/target/`, or `src-tauri/gen/` to the

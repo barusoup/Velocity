@@ -11,11 +11,18 @@ import {
 import { importExternalPlaylist, type ExternalPlaylistImport } from "../api";
 import { usePlaylists, DESCRIPTION_MAX_LENGTH, type UserPlaylist } from "../playlists";
 import type { MediaTrack } from "../types";
-import { getArtworkRoundedClass, ArtworkImage, DefaultArtwork } from "./Shared";
+import {
+  cardHoverPlayRevealClass,
+  cardHoverPlayTransitionClass,
+  getArtworkRoundedClass,
+  ArtworkImage,
+  DefaultArtwork,
+} from "./Shared";
 import { usePlayer } from "../player";
 import type { View } from "./Sidebar";
 import { IconSearch, IconX, IconYoutube, IconSpotify, IconAppleMusic } from "../wrapped-icons";
 import { PlaylistContextMenu } from "./PlaylistContextMenu";
+import { Marquee } from "./Marquee";
 import {
   downloadAndEncodeCover,
   matchExternalTracksInParallel,
@@ -1011,7 +1018,7 @@ function PlaylistCard({
         <button
           type="button"
           onClick={handlePlayClick}
-          className="absolute bottom-2 right-2 flex h-14 w-14 translate-y-2 items-center justify-center rounded-full bg-white text-black shadow-lg opacity-0 transition-all group-hover:translate-y-0 group-hover:opacity-100 animate-none"
+          className={`absolute bottom-2 right-2 flex h-14 w-14 items-center justify-center rounded-full bg-white text-black shadow-lg ${cardHoverPlayTransitionClass} ${cardHoverPlayRevealClass()}`}
           aria-label={isBuffering ? "Loading" : isPlaying ? "Pause" : "Play"}
         >
           {isBuffering ? (
@@ -1024,9 +1031,9 @@ function PlaylistCard({
         </button>
       </div>
       <div className="px-1 pt-2">
-        <div className="truncate text-[0.6875rem] font-semibold text-white">
+        <Marquee className="text-[0.6875rem] font-semibold text-white">
           {playlist.title}
-        </div>
+        </Marquee>
         <div className="truncate text-sm font-medium text-neutral-400">
           {subtitle}
         </div>

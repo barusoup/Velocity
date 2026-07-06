@@ -14,7 +14,11 @@ use std::{
 };
 
 mod data_store;
-use data_store::DataFileLock;
+mod discord_cover_publish;
+mod discord_presence;
+mod lyrics;
+mod text_utils;
+mod window_drag;
 
 use base64::Engine;
 use lofty::config::{ParseOptions, WriteOptions};
@@ -26,7 +30,7 @@ use lofty::prelude::Accessor;
 use lofty::probe::Probe;
 use lofty::TextEncoding;
 use once_cell::sync::Lazy;
-use md5::{Md5, Digest};
+
 use regex::Regex;
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT_LANGUAGE, CONTENT_TYPE, ORIGIN, REFERER};
 use serde::{Deserialize, Serialize};
@@ -43,8 +47,16 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const USER_AGENT: &str =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36";
 const YT_DLP_URL: &str = "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe";
+/// Static Windows ffmpeg/ffprobe pair used by yt-dlp's MP3 postprocessor.
+/// Playback only needs yt-dlp; exports also need this bundle.
+#[cfg(target_os = "windows")]
+const FFMPEG_WIN_ZIP_URL: &str = "https://github.com/yt-dlp/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip";
 const CLIENT_CACHE_TTL: Duration = Duration::from_secs(60 * 60 * 6);
 const STREAM_CACHE_TTL: Duration = Duration::from_secs(60 * 45);
+/// Per-invocation bound for yt-dlp audio fetches (offline save + export).
+/// Without this, a rate-limited or wedged child process left the Saving
+/// panel spinning indefinitely with no error to dismiss.
+const YT_DLP_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(120);
 const WATCH_PLAYLIST_CACHE_TTL: Duration = Duration::from_secs(60 * 30);
 const TRACK_DURATION_CACHE_TTL: Duration = Duration::from_secs(60 * 60 * 24 * 7);
 const PREFERRED_THUMBNAIL_WIDTH: u64 = 640;
@@ -53,6 +65,11 @@ const ARTIST_BANNER_WIDTH: u64 = 2880;
 const ARTIST_BANNER_HEIGHT: u64 = 1200;
 const MAX_CACHED_ARTWORK_BYTES: usize = 8 * 1024 * 1024;
 const ARTIST_TOP_SONG_LIMIT: usize = 10;
+// Imported playlists may be arbitrarily long; paginate until the shelf
+// runs out or we hit a generous safety bound.
+const PLAYLIST_IMPORT_TRACK_LIMIT: usize = 10_000;
+// Spotify's public embed page inlines at most this many tracks per fetch.
+const SPOTIFY_EMBED_TRACK_PAGE_CAP: usize = 100;
 const ARTIST_MONTHLY_LISTENERS_MAX_ATTEMPTS: u32 = 3;
 // Exponential-ish backoff (in milliseconds) between focused retry attempts.
 // The Rust side handles the retry loop so each retry hits YouTube Music with
@@ -94,17 +111,7 @@ static YT_PLAYLIST_ID_RE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r#"[?&]list=([A-Za-z0-9_-]+)"#).expect("yt playlist id regex")
 });
 
-static LRC_TIMESTAMP_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"^\[(\d+):(\d{1,2})(?:[.:](\d{1,3}))?]").expect("lrc timestamp regex")
-});
 
-const LYRIC_PROVIDER_TIMEOUT: Duration = Duration::from_secs(6);
-
-struct MusixmatchTokenCache {
-    token: String,
-    cookies: String,
-    expires_at: Instant,
-}
 
 #[derive(Default)]
 struct AppState {
@@ -113,8 +120,7 @@ struct AppState {
     watch_playlist_cache: Mutex<HashMap<String, CachedWatchPlaylist>>,
     track_duration_cache: Mutex<HashMap<String, CachedTrackDuration>>,
     import_library: Mutex<()>,
-    musixmatch_token: Mutex<Option<MusixmatchTokenCache>>,
-    data_lock: DataFileLock,
+    musixmatch_token: Mutex<Option<lyrics::MusixmatchTokenCache>>,
     /// Active "Save to my device" exports, keyed by the frontend's
     /// `request_id`. When the user clicks Cancel the frontend fires
     /// `cancel_save_export(request_id)`, which pulls the sender out
@@ -130,7 +136,7 @@ struct InnerTubeConfig {
     visitor_data: String,
     fetched_at: Instant,
 }
-struct CachedStream {
+pub(crate) struct CachedStream {
     source: String,
     fetched_at: Instant,
 }
@@ -146,41 +152,8 @@ struct CachedTrackDuration {
     fetched_at: Instant,
 }
 
-const MUSIXMATCH_APP_ID: &str = "web-desktop-app-v1.0";
-
-#[derive(Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct TimedLyricWord {
-    text: String,
-    start_time_ms: u32,
-    end_time_ms: u32,
-}
-
-#[derive(Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct TimedLyricLine {
-    id: u32,
-    text: String,
-    start_time_ms: u32,
-    end_time_ms: Option<u32>,
-    words: Option<Vec<TimedLyricWord>>,
-}
-
-#[derive(Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct SyncedLyricsResponse {
-    lines: Vec<TimedLyricLine>,
-    source: Option<String>,
-    has_per_word_sync: Option<bool>,
-}
-
-#[derive(Clone)]
-struct LyricTrack {
-    title: String,
-    artist: String,
-    album: Option<String>,
-    duration_seconds: Option<u32>,
-}
+type SyncedLyricsResponse = lyrics::SyncedLyricsResponse;
+type LyricTrack = lyrics::LyricTrack;
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -215,6 +188,13 @@ struct SearchResponse {
     query: String,
     top_result: Option<SearchItem>,
     results: Vec<SearchItem>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SearchSuggestion {
+    text: String,
+    from_history: bool,
 }
 
 #[derive(Clone, Serialize)]
@@ -278,6 +258,8 @@ struct ArtistDetail {
     banner: Option<String>,
     monthly_listeners: Option<String>,
     top_songs: Vec<MediaTrack>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    top_songs_has_more: bool,
     shelves: Vec<ArtistShelf>,
 }
 
@@ -319,6 +301,13 @@ struct LoudnessData {
     loudness_range: Option<f64>,
     threshold: Option<f64>,
     target_offset: Option<f64>,
+    analysis_version: u8,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LeadingSilenceData {
+    skip_seconds: Option<f64>,
     analysis_version: u8,
 }
 
@@ -390,6 +379,11 @@ struct SaveTrackToMp3Request {
     request_id: String,
     /// The YouTube Music `videoId` — passed to yt-dlp to grab the audio.
     video_id: String,
+    /// Alternate ids to consult when looking up cached playback/offline
+    /// audio or when the primary id fails yt-dlp (music-video vs Topic
+    /// upload, album-shelf remaster rows, etc.).
+    #[serde(default)]
+    fallback_video_ids: Vec<String>,
     /// Authoritative title for the ID3 tag. May differ from yt-dlp's view.
     title: String,
     /// Authoritative artist for the ID3 tag.
@@ -445,6 +439,8 @@ struct SaveAlbumToMp3Request {
 #[serde(rename_all = "camelCase")]
 struct SaveAlbumTrackEntry {
     video_id: String,
+    #[serde(default)]
+    fallback_video_ids: Vec<String>,
     title: String,
     artist: String,
     track_number: Option<u32>,
@@ -506,6 +502,8 @@ struct SavePlaylistToMp3Request {
 #[serde(rename_all = "camelCase")]
 struct SavePlaylistTrackEntry {
     video_id: String,
+    #[serde(default)]
+    fallback_video_ids: Vec<String>,
     title: String,
     artist: String,
     /// Per-track album. Stamped on the file as `TALB`.
@@ -801,7 +799,7 @@ fn normalize_flat_uploader(uploader: &str) -> String {
     if trimmed.eq_ignore_ascii_case("na") || trimmed.eq_ignore_ascii_case("n/a") {
         return String::new();
     }
-    strip_artist_noise(trimmed)
+    text_utils::strip_artist_noise(trimmed)
 }
 
 fn first_video_id_from_playlist_header(value: &Value) -> Option<String> {
@@ -851,10 +849,30 @@ async fn fetch_ytm_playlist_via_browse(
 ) -> Result<Option<EntityDetail>, String> {
     let browse_id = format!("VL{playlist_id}");
     let response = post_ytmusic(state, "browse", json!({ "browseId": &browse_id })).await?;
-    let detail = parse_entity_detail(&browse_id, &response)?;
+    let mut detail = parse_entity_detail(&browse_id, &response)?;
     if detail.tracks.is_empty() {
         return Ok(None);
     }
+
+    if let Some(shelf) = find_track_shelf_in_browse_response(&response) {
+        let fallback_artist = detail
+            .byline
+            .as_deref()
+            .and_then(|value| infer_artist_from_text(value, false));
+        let tracks = fetch_playlist_shelf_tracks_with_continuations(
+            state,
+            shelf,
+            &detail.title,
+            fallback_artist.as_deref(),
+            detail.cover.as_deref(),
+            PLAYLIST_IMPORT_TRACK_LIMIT,
+        )
+        .await?;
+        if tracks.len() > detail.tracks.len() {
+            detail.tracks = tracks;
+        }
+    }
+
     Ok(Some(detail))
 }
 
@@ -1035,6 +1053,13 @@ static SPOTIFY_ACCESS_TOKEN_RE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r#"window\.__spotify_webplayer_access_token\s*=\s*"([^"]+)""#)
         .expect("spotify access token")
 });
+static SPOTIFY_JSON_ACCESS_TOKEN_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r#""accessToken":"([^"]+)""#).expect("spotify json access token")
+});
+static SPOTIFY_OG_ITEM_COUNT_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r#"(?is)<meta\s+property="og:description"\s+content="[^"]*?\b(\d+)\s+items?\b"#)
+        .expect("spotify og item count")
+});
 // `<script id="initialState">` holds a base64 JSON blob carrying the
 // full playlist state (entities keyed by `spotify:track:` and
 // `spotify:playlist:` URIs). Used as the *primary* Spotify import
@@ -1045,13 +1070,11 @@ static SPOTIFY_INITIAL_STATE_RE: Lazy<Regex> = Lazy::new(|| {
         .expect("spotify initialState")
 });
 // The Spotify EMBED page (open.spotify.com/embed/playlist/<id>)
-// ships the full track list inside a Next.js <script id="__NEXT_DATA__">
-// JSON blob, so we can read 98-track (or larger) public playlists in a
-// single fetch. The main web-player's initialState blob only inlines
-// the first 30 tracks + a pagingInfo cursor, and the anonymous token
-// endpoint we would need to keep paginating via the public Web API is
-// currently 403-blocked at the edge. Embed is the only path that
-// reliably hands us every track for an anonymous public playlist.
+// ships up to ~100 tracks inside a Next.js <script id="__NEXT_DATA__">
+// JSON blob. Larger playlists require the public Web API with the
+// anonymous session token embedded in that same payload (or the main
+// web-player page). The main web-player's initialState blob only
+// inlines the first ~30 tracks.
 static SPOTIFY_NEXT_DATA_RE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r#"(?is)<script[^>]+id="__NEXT_DATA__"[^>]*>(.+?)</script>"#)
         .expect("spotify next data")
@@ -1070,6 +1093,67 @@ static SPOTIFY_ARTIST_RE: Lazy<Regex> = Lazy::new(|| {
         .expect("spotify artist")
 });
 
+fn spotify_token_looks_usable(access_token: &str) -> bool {
+    !access_token.is_empty()
+        && access_token != "null"
+        && access_token != "undefined"
+        && access_token.len() >= 40
+        && access_token
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+// Pull an anonymous session token out of any Spotify HTML we already
+// fetched (main web player or embed). The embed page currently stores
+// the token both inline in __NEXT_DATA__ and in the serialized session
+// settings blob.
+fn spotify_access_token_from_html(html: &str) -> Option<String> {
+    let mut candidates: Vec<String> = Vec::new();
+    if let Some(token) = SPOTIFY_ACCESS_TOKEN_RE
+        .captures(html)
+        .and_then(|caps| caps.get(1))
+        .map(|m| m.as_str().to_string())
+    {
+        candidates.push(token);
+    }
+    if let Some(token) = SPOTIFY_JSON_ACCESS_TOKEN_RE
+        .captures(html)
+        .and_then(|caps| caps.get(1))
+        .map(|m| m.as_str().to_string())
+    {
+        candidates.push(token);
+    }
+    if let Some(token) = decode_spotify_next_data(html).and_then(|root| {
+        root.pointer("/props/pageProps/state/settings/session/accessToken")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    }) {
+        candidates.push(token);
+    }
+
+    candidates
+        .into_iter()
+        .find(|token| spotify_token_looks_usable(token))
+}
+
+// Spotify's og:description is a template ("Playlist · owner · N items ·
+// M saves") but the item count is accurate enough to tell when the
+// embed page handed us a capped first page.
+fn parse_spotify_og_track_count(html: &str) -> Option<usize> {
+    SPOTIFY_OG_ITEM_COUNT_RE
+        .captures(html)
+        .and_then(|caps| caps.get(1))
+        .and_then(|m| m.as_str().parse::<usize>().ok())
+        .filter(|count| *count > 0)
+}
+
+fn spotify_import_track_count_sufficient(fetched: usize, expected: Option<usize>) -> bool {
+    match expected {
+        Some(total) => fetched + 5 >= total,
+        None => fetched < SPOTIFY_EMBED_TRACK_PAGE_CAP,
+    }
+}
+
 // Hit the Spotify anonymous-token endpoint and return a sanitized
 // token, or `None` for any failure (network, non-2xx, malformed body,
 // missing `accessToken` key). Centralized so the upfront fallback and
@@ -1087,11 +1171,8 @@ async fn fetch_spotify_access_token() -> Option<String> {
         return None;
     }
     let token_body: Value = token_response.json().await.ok()?;
-    let token = token_body.get("accessToken")?.as_str()?.trim().to_string();
-    if token.is_empty() || token == "null" || token.len() < 40 {
-        return None;
-    }
-    Some(token)
+    let token = token_body.get("accessToken")?.as_str()?.trim();
+    spotify_token_looks_usable(token).then(|| token.to_string())
 }
 
 // Decode Spotify's `initialState` base64 JSON blob to a `Value`.
@@ -1119,34 +1200,20 @@ fn decode_spotify_initial_state(html: &str) -> Option<Value> {
 // failure that the caller should treat as "try the next path".
 async fn fetch_spotify_tracks_via_api(
     url: &str,
-    html: &str,
+    html_sources: &[&str],
 ) -> Option<Vec<ExternalPlaylistTrack>> {
     let playlist_id = SPOTIFY_PLAYLIST_ID_RE.captures(url)?.get(1)?.as_str().to_string();
 
-    // Extract anonymous token; the `?` chain is intentionally NOT
-    // used -- a regex miss must fall through to fetch_spotify_access_token()
-    // below, not abort the whole function. The previous `?`-chain
-    // silently dropped every auth-miss to a 30-track SSR scrape (the
-    // user-facing "cap at 30" bug).
-    let mut access_token = SPOTIFY_ACCESS_TOKEN_RE
-        .captures(html)
-        .and_then(|c| c.get(1))
-        .map(|m| m.as_str().to_string())
+    // Extract anonymous token from every HTML source we already
+    // fetched (main web player + embed page). A miss must fall through
+    // to `fetch_spotify_access_token()` below, not abort the whole
+    // function.
+    let mut access_token = html_sources
+        .iter()
+        .find_map(|html| spotify_access_token_from_html(html))
         .unwrap_or_default();
 
-    // Reject empty / "null" / "undefined" / too-short / non-token-
-    // charset values; fetch a fresh token explicitly. Spotify BQ
-    // tokens are ~150–250 chars of `[A-Za-z0-9_-]`, so 100 chars +
-    // charset is comfortably below the real floor and above any
-    // padded-sentinel attack ("null" x 100, etc.).
-    let looks_usable = !access_token.is_empty()
-        && access_token != "null"
-        && access_token != "undefined"
-        && access_token.len() >= 100
-        && access_token
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
-    if !looks_usable {
+    if !spotify_token_looks_usable(&access_token) {
         access_token = match fetch_spotify_access_token().await {
             Some(token) => token,
             None => return None,
@@ -1165,10 +1232,18 @@ async fn fetch_spotify_tracks_via_api(
     let mut refresh_attempts: u8 = 0;
 
     loop {
+        if offset > 0 {
+            // Gentle pacing between pages so anonymous imports on large
+            // playlists don't trip Spotify's rate limiter mid-pagination.
+            tokio::time::sleep(Duration::from_millis(150)).await;
+        }
+
         let page_url = format!("{api_base}?limit={limit}&offset={offset}");
         let response = HTTP
             .get(&page_url)
             .header("Authorization", format!("Bearer {access_token}"))
+            .header(ORIGIN, HeaderValue::from_static("https://open.spotify.com"))
+            .header(REFERER, HeaderValue::from_static("https://open.spotify.com/"))
             .header(ACCEPT_LANGUAGE, HeaderValue::from_static("en-US,en;q=0.9"))
             .send()
             .await
@@ -1256,6 +1331,305 @@ async fn fetch_spotify_tracks_via_api(
     }
 
     if all_tracks.is_empty() { None } else { Some(all_tracks) }
+}
+
+const SPOTIFY_PATHFINDER_PLAYLIST_HASH: &str =
+    "91d4c2bc3e0cd1bc672281c4f1f59f43ff55ba726ca04a45810d99bd091f3f0e";
+const SPOTIFY_PATHFINDER_PAGE_LIMIT: u32 = 100;
+const SPOTIFY_PLAYLIST_IMPORT_TIMEOUT: Duration = Duration::from_secs(120);
+const SPOTIFY_EXTEND_BEYOND_EMBED_TIMEOUT: Duration = Duration::from_secs(75);
+const SPOTIFY_EMBED_TRACK_FETCH_CHUNK_DELAY_MS: u64 = 120;
+const SPOTIFY_EMBED_TRACK_FETCH_MAX_DURATION: Duration = Duration::from_secs(70);
+const SPOTIFY_EMBED_TRACK_FETCH_TIMEOUT: Duration = Duration::from_secs(8);
+const SPOTIFY_EMBED_TRACK_429_BACKOFF_MS: [u64; 2] = [400, 1200];
+const SPOTIFY_API_429_BACKOFF_MS: [u64; 4] = [500, 1200, 2500, 5000];
+
+fn spotify_api_request_headers(access_token: &str) -> Vec<(reqwest::header::HeaderName, HeaderValue)> {
+    vec![
+        (
+            reqwest::header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {access_token}"))
+                .unwrap_or_else(|_| HeaderValue::from_static("Bearer ")),
+        ),
+        (
+            ORIGIN,
+            HeaderValue::from_static("https://open.spotify.com"),
+        ),
+        (
+            REFERER,
+            HeaderValue::from_static("https://open.spotify.com/"),
+        ),
+        (
+            ACCEPT_LANGUAGE,
+            HeaderValue::from_static("en-US,en;q=0.9"),
+        ),
+    ]
+}
+
+fn parse_spotify_pathfinder_playlist_items(body: &Value) -> Vec<(String, Option<u32>)> {
+    let Some(items) = body
+        .pointer("/data/playlistV2/content/items")
+        .and_then(Value::as_array)
+    else {
+        return Vec::new();
+    };
+
+    items
+        .iter()
+        .filter_map(|item| {
+            let data = item.pointer("/itemV2/data")?;
+            let uri = data.get("uri").and_then(Value::as_str)?.to_string();
+            let duration_seconds = data
+                .pointer("/trackDuration/totalMilliseconds")
+                .and_then(Value::as_f64)
+                .map(|ms| (ms / 1000.0) as u32)
+                .filter(|seconds| *seconds > 0);
+            Some((uri, duration_seconds))
+        })
+        .collect()
+}
+
+async fn fetch_spotify_pathfinder_playlist_items(
+    playlist_id: &str,
+    access_token: &str,
+    expected_total: Option<usize>,
+) -> Option<Vec<(String, Option<u32>)>> {
+    let mut all_items: Vec<(String, Option<u32>)> = Vec::new();
+    let mut offset: u32 = 0;
+
+    loop {
+        if offset > 0 {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+        }
+
+        let remaining = expected_total
+            .map(|total| total.saturating_sub(all_items.len()))
+            .unwrap_or(SPOTIFY_PATHFINDER_PAGE_LIMIT as usize)
+            .min(PLAYLIST_IMPORT_TRACK_LIMIT.saturating_sub(all_items.len()));
+        if remaining == 0 {
+            break;
+        }
+        let page_limit = (remaining as u32).clamp(1, SPOTIFY_PATHFINDER_PAGE_LIMIT);
+
+        let variables = json!({
+            "uri": format!("spotify:playlist:{playlist_id}"),
+            "offset": offset,
+            "limit": page_limit,
+        });
+        let extensions = json!({
+            "persistedQuery": {
+                "version": 1,
+                "sha256Hash": SPOTIFY_PATHFINDER_PLAYLIST_HASH,
+            }
+        });
+        let query = format!(
+            "https://api-partner.spotify.com/pathfinder/v1/query?operationName=fetchPlaylistMetadata&variables={}&extensions={}",
+            urlencoding::encode(&variables.to_string()),
+            urlencoding::encode(&extensions.to_string()),
+        );
+
+        let mut request = HTTP.get(&query).header(
+            reqwest::header::ACCEPT,
+            HeaderValue::from_static("application/json"),
+        );
+        for (name, value) in spotify_api_request_headers(access_token) {
+            request = request.header(name, value);
+        }
+
+        let response = request.send().await.ok()?;
+        if !response.status().is_success() {
+            break;
+        }
+
+        let body: Value = response.json().await.ok()?;
+        let page = parse_spotify_pathfinder_playlist_items(&body);
+        if page.is_empty() {
+            break;
+        }
+
+        let page_count = page.len();
+        all_items.extend(page);
+        if page_count == 0 {
+            break;
+        }
+        offset += page_count as u32;
+
+        if expected_total.is_some_and(|total| all_items.len() >= total) {
+            break;
+        }
+        if page_count < page_limit as usize {
+            break;
+        }
+    }
+
+    if all_items.is_empty() {
+        None
+    } else {
+        Some(all_items)
+    }
+}
+
+fn parse_spotify_embed_track_entity(entity: &Value) -> Option<ExternalPlaylistTrack> {
+    let title = entity
+        .get("name")
+        .or_else(|| entity.get("title"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)?;
+    let artist = entity
+        .get("artists")
+        .and_then(Value::as_array)
+        .and_then(|artists| artists.first())
+        .and_then(|entry| entry.get("name"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)?;
+    let duration_seconds = entity
+        .get("duration")
+        .and_then(Value::as_f64)
+        .map(|ms| (ms / 1000.0) as u32)
+        .filter(|seconds| *seconds > 0);
+    Some(ExternalPlaylistTrack {
+        title,
+        artist,
+        album: None,
+        duration_seconds,
+    })
+}
+
+async fn fetch_spotify_track_metadata_from_embed_page(
+    track_id: &str,
+) -> Option<ExternalPlaylistTrack> {
+    let url = format!("https://open.spotify.com/embed/track/{track_id}");
+
+    for attempt in 0..=SPOTIFY_EMBED_TRACK_429_BACKOFF_MS.len() {
+        if attempt > 0 {
+            let backoff = SPOTIFY_EMBED_TRACK_429_BACKOFF_MS[attempt - 1];
+            tokio::time::sleep(Duration::from_millis(backoff)).await;
+        }
+
+        let response = HTTP
+            .get(&url)
+            .header(reqwest::header::USER_AGENT, HeaderValue::from_static(USER_AGENT))
+            .header(ACCEPT_LANGUAGE, HeaderValue::from_static("en-US,en;q=0.9"))
+            .timeout(SPOTIFY_EMBED_TRACK_FETCH_TIMEOUT)
+            .send()
+            .await
+            .ok()?;
+        if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            continue;
+        }
+        if !response.status().is_success() {
+            return None;
+        }
+
+        let html = response.text().await.ok()?;
+        let root = decode_spotify_next_data(&html)?;
+        let entity = root.pointer("/props/pageProps/state/data/entity")?;
+        return parse_spotify_embed_track_entity(entity);
+    }
+
+    None
+}
+
+async fn fetch_spotify_tracks_metadata_from_embed_pages(
+    track_ids: &[String],
+) -> std::collections::HashMap<String, ExternalPlaylistTrack> {
+    let mut tracks_by_id = std::collections::HashMap::new();
+    let started = Instant::now();
+
+    // Fetch one track at a time on the Tauri command task. Concurrent
+    // `tokio::spawn`/`join_all` batches hung forever at "Calling Spotify…"
+    // for playlists past the 100-track embed cap because nested tasks never
+    // got polled inside the command future. Sequential awaits keep every
+    // request on the same task and let us bail once the extend budget elapses,
+    // returning a partial playlist instead of blocking the modal indefinitely.
+    for (index, track_id) in track_ids.iter().enumerate() {
+        if started.elapsed() >= SPOTIFY_EMBED_TRACK_FETCH_MAX_DURATION {
+            break;
+        }
+        if index > 0 {
+            tokio::time::sleep(Duration::from_millis(
+                SPOTIFY_EMBED_TRACK_FETCH_CHUNK_DELAY_MS,
+            ))
+            .await;
+        }
+
+        let metadata = match tokio::time::timeout(
+            SPOTIFY_EMBED_TRACK_FETCH_TIMEOUT,
+            fetch_spotify_track_metadata_from_embed_page(track_id),
+        )
+        .await
+        {
+            Ok(track) => track,
+            Err(_) => None,
+        };
+        if let Some(track) = metadata {
+            tracks_by_id.insert(track_id.clone(), track);
+        }
+    }
+
+    tracks_by_id
+}
+
+async fn extend_spotify_tracks_beyond_embed_cap(
+    embed_tracks: &[ExternalPlaylistTrack],
+    playlist_id: &str,
+    access_token: &str,
+    expected_total: Option<usize>,
+    pathfinder_items: Option<&[(String, Option<u32>)]>,
+) -> Option<Vec<ExternalPlaylistTrack>> {
+    if spotify_import_track_count_sufficient(embed_tracks.len(), expected_total) {
+        return None;
+    }
+
+    let pathfinder_items = match pathfinder_items {
+        Some(items) if !items.is_empty() => items.to_vec(),
+        _ => fetch_spotify_pathfinder_playlist_items(playlist_id, access_token, expected_total)
+            .await?,
+    };
+    if pathfinder_items.len() <= embed_tracks.len() {
+        return None;
+    }
+
+    let missing_ids: Vec<String> = pathfinder_items
+        .iter()
+        .skip(embed_tracks.len())
+        .filter_map(|(uri, _)| uri.strip_prefix("spotify:track:").map(str::to_string))
+        .collect();
+    // The anonymous Web API is aggressively rate-limited during large
+    // imports. Embed track pages carry the same title/artist metadata
+    // without burning the API quota we need for pathfinder pagination.
+    let fetched_by_id = fetch_spotify_tracks_metadata_from_embed_pages(&missing_ids).await;
+    if fetched_by_id.is_empty() {
+        return None;
+    }
+
+    let mut rebuilt = Vec::with_capacity(pathfinder_items.len().max(embed_tracks.len()));
+    for (index, (uri, duration)) in pathfinder_items.iter().enumerate() {
+        if index < embed_tracks.len() {
+            rebuilt.push(embed_tracks[index].clone());
+            continue;
+        }
+        let Some(id) = uri.strip_prefix("spotify:track:") else {
+            continue;
+        };
+        let Some(mut track) = fetched_by_id.get(id).cloned() else {
+            continue;
+        };
+        if track.duration_seconds.is_none() {
+            track.duration_seconds = *duration;
+        }
+        rebuilt.push(track);
+    }
+
+    if rebuilt.len() > embed_tracks.len() {
+        Some(rebuilt)
+    } else {
+        None
+    }
 }
 
 // --- Spotify initialState helpers ---------------------------------
@@ -1491,9 +1865,13 @@ fn embed_entity_cover(entity: &Value) -> Option<String> {
 // case.
 async fn scrape_playlist_via_embed_page(
     url: &str,
+    embed_html: Option<&str>,
 ) -> Option<ExternalPlaylistImport> {
     let playlist_id = SPOTIFY_PLAYLIST_ID_RE.captures(url)?.get(1)?.as_str();
-    let embed_html = fetch_spotify_embed_html(playlist_id).await?;
+    let embed_html = match embed_html {
+        Some(html) => html.to_string(),
+        None => fetch_spotify_embed_html(playlist_id).await?,
+    };
     let root = decode_spotify_next_data(&embed_html)?;
     let (entity, _track_list_len) = find_embed_playlist_entity(&root)?;
 
@@ -1685,12 +2063,12 @@ fn scrape_playlist_via_initial_state(
         Value::Object(_) => d
             .get("text")
             .and_then(Value::as_str)
-            .map(|s| decode_html_entities(s).trim().to_string())
+            .map(|s| text_utils::decode_html_entities(s).trim().to_string())
             .filter(|s| !s.is_empty())
             .or_else(|| {
                 d.get("html")
                     .and_then(Value::as_str)
-                    .map(|s| decode_html_entities(s).trim().to_string())
+                    .map(|s| text_utils::decode_html_entities(s).trim().to_string())
                     .filter(|s| !s.is_empty())
             }),
         _ => None,
@@ -1721,11 +2099,11 @@ fn extract_spotify_tracks_from_ssr(html: &str) -> Vec<ExternalPlaylistTrack> {
         let track_title = SPOTIFY_TRACK_TITLE_RE
             .captures(row)
             .and_then(|c| c.get(1))
-            .map(|m| decode_html_entities(m.as_str()));
+            .map(|m| text_utils::decode_html_entities(m.as_str()));
         let artist = SPOTIFY_ARTIST_RE
             .captures(row)
             .and_then(|c| c.get(1))
-            .map(|m| decode_html_entities(m.as_str()));
+            .map(|m| text_utils::decode_html_entities(m.as_str()));
         if let (Some(title), Some(artist)) = (track_title, artist) {
             let trimmed_title = title.trim();
             let trimmed_artist = artist.trim();
@@ -1749,11 +2127,11 @@ fn extract_spotify_tracks_from_ssr(html: &str) -> Vec<ExternalPlaylistTrack> {
         let track_title = SPOTIFY_TRACK_TITLE_RE
             .captures(row)
             .and_then(|c| c.get(1))
-            .map(|m| decode_html_entities(m.as_str()));
+            .map(|m| text_utils::decode_html_entities(m.as_str()));
         let artist = SPOTIFY_ARTIST_RE
             .captures(row)
             .and_then(|c| c.get(1))
-            .map(|m| decode_html_entities(m.as_str()));
+            .map(|m| text_utils::decode_html_entities(m.as_str()));
         if let (Some(title), Some(artist)) = (track_title, artist) {
             let trimmed_title = title.trim();
             let trimmed_artist = artist.trim();
@@ -1771,34 +2149,66 @@ fn extract_spotify_tracks_from_ssr(html: &str) -> Vec<ExternalPlaylistTrack> {
     tracks
 }
 
+async fn fetch_spotify_main_page_html(url: &str) -> String {
+    for attempt in 0..=SPOTIFY_API_429_BACKOFF_MS.len() {
+        if attempt > 0 {
+            let backoff = SPOTIFY_API_429_BACKOFF_MS[attempt - 1];
+            tokio::time::sleep(Duration::from_millis(backoff)).await;
+        }
+
+        let Ok(response) = HTTP_NO_REDIRECT
+            .get(url)
+            .header(
+                reqwest::header::USER_AGENT,
+                HeaderValue::from_static("Mozilla/5.0"),
+            )
+            .header(ACCEPT_LANGUAGE, HeaderValue::from_static("en-US,en;q=0.9"))
+            .send()
+            .await
+        else {
+            continue;
+        };
+
+        if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            continue;
+        }
+        if !response.status().is_success() {
+            break;
+        }
+        if let Ok(html) = response.text().await {
+            if !html.is_empty() {
+                return html;
+            }
+        }
+    }
+
+    String::new()
+}
+
 async fn scrape_spotify_playlist(url: &str) -> Result<ExternalPlaylistImport, String> {
+    match tokio::time::timeout(
+        SPOTIFY_PLAYLIST_IMPORT_TIMEOUT,
+        scrape_spotify_playlist_inner(url),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => Err(
+            "Spotify playlist import timed out. Wait a moment and try again.".to_string(),
+        ),
+    }
+}
+
+async fn scrape_spotify_playlist_inner(url: &str) -> Result<ExternalPlaylistImport, String> {
     // A barebones User-Agent triggers Spotify's server-side rendering
     // branch which embeds the playlist metadata in OG tags and often
     // includes the anonymous access token in a script tag.
-    let response = HTTP_NO_REDIRECT
-        .get(url)
-        .header(
-            reqwest::header::USER_AGENT,
-            HeaderValue::from_static("Mozilla/5.0"),
-        )
-        .header(ACCEPT_LANGUAGE, HeaderValue::from_static("en-US,en;q=0.9"))
-        .send()
-        .await
-        .map_err(|error| format!("Spotify request failed: {error}"))?;
+    let html = fetch_spotify_main_page_html(url).await;
 
-    if !response.status().is_success() {
-        return Err(format!("Spotify returned HTTP {}", response.status()));
-    }
-
-    let html = response
-        .text()
-        .await
-        .map_err(|error| format!("Spotify response read failed: {error}"))?;
-
-    let title = SPOTIFY_OG_TITLE_RE
+    let mut title = SPOTIFY_OG_TITLE_RE
         .captures(&html)
         .and_then(|c| c.get(1))
-        .map(|m| decode_html_entities(m.as_str()))
+        .map(|m| text_utils::decode_html_entities(m.as_str()))
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "Imported playlist".to_string());
 
@@ -1816,36 +2226,48 @@ async fn scrape_spotify_playlist(url: &str) -> Result<ExternalPlaylistImport, St
         .map(|m| m.as_str().to_string())
         .filter(|s| !s.is_empty());
 
-    // Four-leg fallback chain. Order matters: each leg returns the
-    // full track list when it works, otherwise hands off to the
-    // next. The previous implementation silently dropped the API
-    // path's auth failures to a 30-track SSR scrape (the
-    // "cap at 30" bug).
-    //   1. Embed page __NEXT_DATA__. The public embed page inlines
-    //      every track of a public playlist in one Next.js JSON
-    //      payload; this is the only path that reliably hands us
-    //      98+ tracks for an anonymous import. The trade-off is
-    //      the per-track items don't carry album info, so we
-    //      cross-enrich below using whatever the initialState
-    //      blob happens to also know about.
-    //   2. initialState blob. The main web-player's hydration
-    //      carries album metadata for the first 30 tracks and is
-    //      used both as a track source AND as the album-info
-    //      enrichment for the embed path.
-    //   3. Spotify Web API. Backed by the implicit anonymous
-    //      token. The previous `?`-early-return bug is fixed.
+    // Fallback chain for the first page of tracks. The embed page caps
+    // at ~100 tracks, so once we have a candidate list we compare it
+    // against the og:description item count and upgrade via the
+    // paginated Web API when the list looks incomplete.
+    //   1. Embed page __NEXT_DATA__ (fast, up to 100 tracks).
+    //   2. initialState blob (album metadata + up to ~30 tracks).
+    //   3. Spotify Web API pagination (complete list when token works).
     //   4. SSR scrape. Last resort.
+    let playlist_id = SPOTIFY_PLAYLIST_ID_RE
+        .captures(url)
+        .and_then(|caps| caps.get(1))
+        .map(|m| m.as_str().to_string());
+    let embed_html = if let Some(ref id) = playlist_id {
+        fetch_spotify_embed_html(id).await
+    } else {
+        None
+    };
+    let expected_total = parse_spotify_og_track_count(&html);
+    let html_sources: Vec<&str> = {
+        let mut sources = vec![html.as_str()];
+        if let Some(ref embed) = embed_html {
+            sources.push(embed.as_str());
+        }
+        sources
+    };
+
     let mut tracks: Vec<ExternalPlaylistTrack>;
     let mut last_error: Option<String> = None;
     let mut embed_import: Option<ExternalPlaylistImport> = None;
     let mut initial_state_import: Option<ExternalPlaylistImport> = None;
 
-    if let Some(mut import) = scrape_playlist_via_embed_page(url).await {
+    if let Some(mut import) =
+        scrape_playlist_via_embed_page(url, embed_html.as_deref()).await
+    {
         // `mem::take` moves the `tracks` Vec out of `import` without
         // cloning it. `import` itself stays owned, just with an empty
         // tracks Vec -- that's what gets stored in `embed_import` for
         // the cover-url fallback below.
         tracks = std::mem::take(&mut import.tracks);
+        if title == "Imported playlist" {
+            title = import.title.clone();
+        }
         embed_import = Some(import);
         // Cross-enrich the embed tracks (which lack album info) with
         // whatever the initialState happens to also know. Reuse the
@@ -1856,7 +2278,7 @@ async fn scrape_spotify_playlist(url: &str) -> Result<ExternalPlaylistImport, St
     } else if let Some(mut import) = scrape_playlist_via_initial_state(url, &html) {
         tracks = std::mem::take(&mut import.tracks);
         initial_state_import = Some(import);
-    } else if let Some(api_tracks) = fetch_spotify_tracks_via_api(url, &html).await {
+    } else if let Some(api_tracks) = fetch_spotify_tracks_via_api(url, &html_sources).await {
         tracks = api_tracks;
     } else {
         tracks = extract_spotify_tracks_from_ssr(&html);
@@ -1865,6 +2287,53 @@ async fn scrape_spotify_playlist(url: &str) -> Result<ExternalPlaylistImport, St
                 "We couldn't read any songs from that Spotify playlist. Some playlists require sign-in or are region-locked."
                     .to_string(),
             );
+        }
+    }
+
+    if !spotify_import_track_count_sufficient(tracks.len(), expected_total)
+        && embed_import.is_none()
+    {
+        if let Some(api_tracks) = fetch_spotify_tracks_via_api(url, &html_sources).await {
+            if api_tracks.len() > tracks.len() {
+                tracks = api_tracks;
+                enrich_tracks_with_album_info(&mut tracks, initial_state_import.as_ref());
+            }
+        }
+    }
+
+    if !spotify_import_track_count_sufficient(tracks.len(), expected_total) {
+        if let (Some(playlist_id), Some(access_token)) = (
+            playlist_id.as_deref(),
+            html_sources
+                .iter()
+                .find_map(|html| spotify_access_token_from_html(html)),
+        ) {
+            let pathfinder_items = fetch_spotify_pathfinder_playlist_items(
+                playlist_id,
+                &access_token,
+                expected_total,
+            )
+            .await;
+            let extend_expected = expected_total.or_else(|| {
+                pathfinder_items
+                    .as_ref()
+                    .map(|items| items.len())
+            });
+            if let Ok(Some(extended)) = tokio::time::timeout(
+                SPOTIFY_EXTEND_BEYOND_EMBED_TIMEOUT,
+                extend_spotify_tracks_beyond_embed_cap(
+                    &tracks,
+                    playlist_id,
+                    &access_token,
+                    extend_expected,
+                    pathfinder_items.as_deref(),
+                ),
+            )
+            .await
+            {
+                tracks = extended;
+                enrich_tracks_with_album_info(&mut tracks, initial_state_import.as_ref());
+            }
         }
     }
 
@@ -2081,83 +2550,14 @@ async fn scrape_apple_music_playlist(url: &str) -> Result<ExternalPlaylistImport
         tracks,
     })
 }
-
-// Minimal HTML-entity decoder for the handful of escapes Spotify/Apple
-// emit in their server-rendered markup (`&amp;`, `&quot;`, the U+FFFD
-// replacement char the players insert between long metadata strings).
-// The full HTML5 entity list is overkill for what we parse — these
-// three cover every value we actually pull from the page.
-fn decode_html_entities(value: &str) -> String {
-    let mut result = String::with_capacity(value.len());
-    let mut chars = value.chars().peekable();
-    while let Some(ch) = chars.next() {
-        if ch != '&' {
-            result.push(ch);
-            continue;
-        }
-        let mut entity = String::new();
-        while let Some(&next) = chars.peek() {
-            if next == ';' {
-                chars.next();
-                break;
-            }
-            if entity.len() >= 8 {
-                break;
-            }
-            entity.push(next);
-            chars.next();
-        }
-        let decoded: Option<String> = match entity.as_str() {
-            "amp" => Some("&".to_string()),
-            "lt" => Some("<".to_string()),
-            "gt" => Some(">".to_string()),
-            "quot" => Some("\"".to_string()),
-            "apos" => Some("'".to_string()),
-            "nbsp" => Some(" ".to_string()),
-            _ if entity.starts_with("#x") || entity.starts_with("#X") => {
-                let hex = &entity[2..];
-                u32::from_str_radix(hex, 16)
-                    .ok()
-                    .and_then(char::from_u32)
-                    .map(|c| c.to_string())
-            }
-            _ if entity.starts_with('#') => entity[1..]
-                .parse::<u32>()
-                .ok()
-                .and_then(char::from_u32)
-                .map(|c| c.to_string()),
-            _ => None,
-        };
-        if let Some(replacement) = decoded {
-            result.push_str(&replacement);
-        } else {
-            result.push('&');
-            result.push_str(&entity);
-        }
-    }
-    result
-}
-
 // yt-dlp's `uploader` for YT Music channels often reads
-// "The Beatles - Topic". Strip the trailing " - Topic" / " - VEVO" /
-// similar noise so the title-vs-source title compare is meaningful.
-// Other platforms put the artist in `artist` directly so this is a
-// no-op for them.
-fn strip_artist_noise(value: &str) -> String {
-    let noise_suffixes = [" - Topic", " - VEVO", " - Vevo", " - Official"];
-    let mut result = value.to_string();
-    for suffix in noise_suffixes {
-        if let Some(stripped) = result.strip_suffix(suffix) {
-            result = stripped.to_string();
-            break;
-        }
-    }
-    result
-}
-
 #[tauri::command]
 async fn ensure_streaming_backend(app: AppHandle) -> Result<BackendStatus, String> {
     let path = ensure_yt_dlp(&app).await?;
+    // MP3 exports need ffmpeg; warming it during backend setup avoids a
+    // long "Saving…" stall on the user's first right-click export while
+    // the portable bundle downloads.
+    let _ = ensure_ffmpeg(&app).await;
     let version = yt_dlp_version(&path).await.ok();
     Ok(BackendStatus {
         yt_dlp_ready: true,
@@ -2174,6 +2574,20 @@ async fn search_music(state: State<'_, AppState>, query: String) -> Result<Searc
 }
 
 #[tauri::command]
+async fn search_suggestions(
+    state: State<'_, AppState>,
+    query: String,
+) -> Result<Vec<SearchSuggestion>, String> {
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        return Ok(Vec::new());
+    }
+    let payload = json!({ "input": trimmed });
+    let response = post_ytmusic(&state, "music/get_search_suggestions", payload).await?;
+    Ok(parse_search_suggestions(&response))
+}
+
+#[tauri::command]
 async fn cache_artwork(app: AppHandle, url: String) -> Result<String, String> {
     cache_remote_artwork(&app, &url).await
 }
@@ -2184,7 +2598,7 @@ async fn get_entity_detail(
     browse_id: String,
 ) -> Result<EntityDetail, String> {
     let response = post_ytmusic(&state, "browse", json!({ "browseId": browse_id })).await?;
-    parse_entity_detail(&browse_id, &response)
+    Ok(parse_entity_detail(&browse_id, &response)?)
 }
 
 fn parse_playlist_panel_video(value: &Value) -> Option<MediaTrack> {
@@ -2195,24 +2609,24 @@ fn parse_playlist_panel_video(value: &Value) -> Option<MediaTrack> {
         .get("longBylineText")
         .or_else(|| video.get("shortBylineText"))?;
     let parsed_runs = extract_run_meta_from_runs(byline_value);
-    // Drop podcast episodes out at the parse level so they never reach the
-    // autoplay queue in the frontend. Videos are kept; the React layer
-    // substitutes them with a same-name song match.
-    let lower_label = parsed_runs
-        .type_label
-        .as_deref()
-        .map(|value| value.trim().to_ascii_lowercase());
-    if lower_label.as_deref() == Some("episode") || lower_label.as_deref() == Some("podcast") {
+    // Drop podcast episodes and other non-music media at parse time. Music
+    // videos (`kind == "video"`) are kept; the React layer resolves them to
+    // studio song uploads by name.
+    let byline = text_from_value(byline_value).unwrap_or_default();
+    let meta_parts = split_bullets_fixed(&byline);
+    let kind_label = effective_type_label(
+        parsed_runs.type_label.as_deref(),
+        meta_parts.first().map(String::as_str),
+    );
+    let normalized_kind = normalize_kind(kind_label, false, true);
+    if normalized_kind == "unknown" {
         return None;
     }
-    let kind = lower_label.filter(|value| !value.is_empty());
     let artist = parsed_runs.artist_text.unwrap_or_else(|| {
-        let byline = text_from_value(byline_value).unwrap_or_default();
         infer_artist_from_text(&byline, true).unwrap_or_else(|| "Unknown artist".to_string())
     });
     let album = parsed_runs.album_text.filter(|value| parse_duration(value).is_none()).or_else(|| {
-        let byline = text_from_value(byline_value).unwrap_or_default();
-        let parts = split_bullets_fixed(&byline);
+        let parts = &meta_parts;
         // Reject any bullet-segment that looks like a duration ("3:45", "12:30:01")
         // so the Album column never inherits a track's running time when the
         // structured byline didn't carry an album link. Without this filter the
@@ -2239,7 +2653,7 @@ fn parse_playlist_panel_video(value: &Value) -> Option<MediaTrack> {
 
     Some(MediaTrack {
         id: track_id(&video_id, album_browse_id.as_deref()),
-        kind: kind.or_else(|| Some("song".to_string())),
+        kind: Some(normalized_kind),
         title,
         artist,
         album,
@@ -2314,38 +2728,74 @@ async fn get_artist_detail(
 ) -> Result<ArtistDetail, String> {
     let response = post_ytmusic(&state, "browse", json!({ "browseId": browse_id })).await?;
     let mut detail = parse_artist_detail(&browse_id, &response)?;
+    let has_more_hint = extract_top_songs_continuation(&response).is_some()
+        || artist_overview_sections(&response)
+            .and_then(top_songs_shelf)
+            .and_then(top_songs_playlist_browse_id)
+            .is_some();
+    let extended =
+        load_extended_artist_top_songs(&state, &response, &detail.title, detail.cover.as_deref())
+            .await?;
+    if extended.len() > detail.top_songs.len() {
+        detail.top_songs = extended;
+    }
+    detail.top_songs.truncate(ARTIST_TOP_SONG_LIMIT);
+    detail.top_songs_has_more = detail.top_songs.len() < ARTIST_TOP_SONG_LIMIT && has_more_hint;
+    Ok(detail)
+}
 
-    if let Some(token) = extract_top_songs_continuation(&response) {
-        let cont_response =
-            post_ytmusic(&state, "browse", json!({ "continuation": token })).await?;
-        let cont_items = cont_response
-            .get("continuationContents")
-            .and_then(|c| {
-                c.get("musicShelfContinuation")
-                    .or(c.get("musicPlaylistShelfContinuation"))
-            })
-            .and_then(|s| s.get("contents"))
-            .and_then(Value::as_array);
+#[tauri::command]
+async fn get_artist_top_songs_extended(
+    state: State<'_, AppState>,
+    browse_id: String,
+) -> Result<Vec<MediaTrack>, String> {
+    let response = post_ytmusic(&state, "browse", json!({ "browseId": browse_id })).await?;
+    let detail = parse_artist_detail(&browse_id, &response)?;
+    let mut tracks =
+        load_extended_artist_top_songs(&state, &response, &detail.title, detail.cover.as_deref())
+            .await?;
+    tracks.truncate(ARTIST_TOP_SONG_LIMIT);
+    Ok(tracks)
+}
 
-        if let Some(items) = cont_items {
-            let extra_tracks: Vec<MediaTrack> = items
-                .iter()
-                .filter_map(|item| {
-                    parse_track(
-                        item,
-                        None,
-                        Some(detail.title.as_str()),
-                        detail.cover.as_deref(),
-                    )
-                })
-                .collect();
-            detail.top_songs.extend(extra_tracks);
+async fn load_extended_artist_top_songs(
+    state: &State<'_, AppState>,
+    artist_response: &Value,
+    artist_title: &str,
+    cover: Option<&str>,
+) -> Result<Vec<MediaTrack>, String> {
+    let sections = match artist_overview_sections(artist_response) {
+        Some(sections) => sections,
+        None => return Ok(Vec::new()),
+    };
+    let shelf = match top_songs_shelf(sections) {
+        Some(shelf) => shelf,
+        None => return Ok(Vec::new()),
+    };
+
+    let mut tracks =
+        fetch_shelf_tracks_with_continuations(state, shelf, artist_title, cover, ARTIST_TOP_SONG_LIMIT)
+            .await?;
+
+    if tracks.len() < ARTIST_TOP_SONG_LIMIT {
+        if let Some(playlist_browse_id) = top_songs_playlist_browse_id(shelf) {
+            let playlist_response =
+                post_ytmusic(state, "browse", json!({ "browseId": playlist_browse_id })).await?;
+            if let Some(playlist_shelf) = find_track_shelf_in_browse_response(&playlist_response) {
+                let playlist_tracks = fetch_shelf_tracks_with_continuations(
+                    state,
+                    playlist_shelf,
+                    artist_title,
+                    cover,
+                    ARTIST_TOP_SONG_LIMIT,
+                )
+                .await?;
+                merge_top_songs(&mut tracks, playlist_tracks, ARTIST_TOP_SONG_LIMIT);
+            }
         }
     }
 
-    enrich_artist_top_songs(&state, &mut detail).await;
-
-    Ok(detail)
+    Ok(tracks)
 }
 
 #[tauri::command]
@@ -2476,184 +2926,6 @@ fn parse_monthly_listener_phrase(text: &str) -> Option<String> {
     Some(format!("{token} monthly listeners"))
 }
 
-async fn enrich_artist_top_songs(state: &State<'_, AppState>, detail: &mut ArtistDetail) {
-    let search_tracks = search_artist_song_tracks(state, &detail.title)
-        .await
-        .unwrap_or_default();
-
-    merge_artist_song_metadata(&mut detail.top_songs, &search_tracks);
-    append_unique_artist_songs(&mut detail.top_songs, search_tracks);
-    detail.top_songs.truncate(ARTIST_TOP_SONG_LIMIT);
-
-    for track in detail.top_songs.iter_mut() {
-        if track.duration_seconds.is_some() {
-            continue;
-        }
-        let Some(video_id) = track.video_id.clone() else {
-            continue;
-        };
-        if let Ok(duration) = fetch_track_duration(state, &video_id).await {
-            if let Some(duration) = duration {
-                track.duration_seconds = Some(duration);
-            }
-        }
-    }
-}
-
-async fn search_artist_song_tracks(
-    state: &State<'_, AppState>,
-    artist: &str,
-) -> Result<Vec<MediaTrack>, String> {
-    let artist_key = normalize_lookup_text(artist);
-    let mut tracks = Vec::new();
-
-    for query in [format!("{artist} songs"), artist.to_string()] {
-        let response = post_ytmusic(state, "search", json!({ "query": query })).await?;
-        let parsed = parse_search_response(artist, &response);
-
-        let mut items = Vec::new();
-        if let Some(top_result) = parsed.top_result {
-            items.push(top_result);
-        }
-        items.extend(parsed.results);
-
-        for track in items
-            .into_iter()
-            .filter(|item| item.kind == "song")
-            .filter(|item| {
-                item.artist
-                    .as_deref()
-                    .map(|value| artist_text_matches(value, &artist_key))
-                    .unwrap_or(false)
-            })
-            .filter_map(search_item_to_media_track)
-        {
-            if tracks
-                .iter()
-                .any(|existing| tracks_match_for_metadata(existing, &track))
-            {
-                continue;
-            }
-            tracks.push(track);
-            if tracks.len() >= ARTIST_TOP_SONG_LIMIT {
-                return Ok(tracks);
-            }
-        }
-    }
-
-    Ok(tracks)
-}
-
-fn search_item_to_media_track(item: SearchItem) -> Option<MediaTrack> {
-    let video_id = item.video_id?;
-    let artist = item
-        .artist
-        .clone()
-        .or_else(|| infer_artist_from_text(&item.subtitle, true))
-        .unwrap_or_else(|| "Unknown artist".to_string());
-
-    Some(MediaTrack {
-        id: track_id(&video_id, item.album_browse_id.as_deref()),
-        kind: Some(item.kind),
-        title: item.title,
-        artist,
-        album: item.album,
-        album_browse_id: item.album_browse_id,
-        artist_browse_id: item.artist_browse_id,
-        artist_credits: item.artist_credits,
-        duration_seconds: item.duration_seconds,
-        play_count: item.play_count,
-        cover: item.cover,
-        video_id: Some(video_id),
-        source: "stream",
-        audio_src: None,
-        file_path: None,
-        find_lyrics: false,
-    })
-}
-
-fn merge_artist_song_metadata(tracks: &mut [MediaTrack], candidates: &[MediaTrack]) {
-    for track in tracks {
-        let Some(candidate) = candidates
-            .iter()
-            .find(|candidate| tracks_match_for_metadata(track, candidate))
-        else {
-            continue;
-        };
-
-        merge_track_metadata(track, candidate);
-    }
-}
-
-fn append_unique_artist_songs(tracks: &mut Vec<MediaTrack>, candidates: Vec<MediaTrack>) {
-    for candidate in candidates {
-        if tracks.len() >= ARTIST_TOP_SONG_LIMIT {
-            break;
-        }
-        if tracks
-            .iter()
-            .any(|track| tracks_match_for_metadata(track, &candidate))
-        {
-            continue;
-        }
-        tracks.push(candidate);
-    }
-}
-
-fn merge_track_metadata(track: &mut MediaTrack, candidate: &MediaTrack) {
-    if track.duration_seconds.is_none() {
-        track.duration_seconds = candidate.duration_seconds;
-    }
-    if track.play_count.is_none() {
-        track.play_count = candidate.play_count.clone();
-    }
-    if track.album.is_none() {
-        track.album = candidate.album.clone();
-    }
-    if track.album_browse_id.is_none() {
-        track.album_browse_id = candidate.album_browse_id.clone();
-    }
-    if track.artist_browse_id.is_none() {
-        track.artist_browse_id = candidate.artist_browse_id.clone();
-    }
-    if track.artist_credits.is_none() {
-        track.artist_credits = candidate.artist_credits.clone();
-    }
-    if track.cover.is_none() {
-        track.cover = candidate.cover.clone();
-    }
-}
-
-fn tracks_match_for_metadata(left: &MediaTrack, right: &MediaTrack) -> bool {
-    if left.video_id.is_some() && left.video_id == right.video_id {
-        return true;
-    }
-
-    let left_title = normalize_lookup_text(&left.title);
-    let right_title = normalize_lookup_text(&right.title);
-    if left_title.is_empty() || left_title != right_title {
-        return false;
-    }
-
-    let left_artist = normalize_lookup_text(&left.artist);
-    let right_artist = normalize_lookup_text(&right.artist);
-    left_artist.is_empty()
-        || right_artist.is_empty()
-        || left_artist == right_artist
-        || left_artist.contains(&right_artist)
-        || right_artist.contains(&left_artist)
-}
-
-fn artist_text_matches(candidate: &str, artist_key: &str) -> bool {
-    if artist_key.is_empty() {
-        return false;
-    }
-    let candidate_key = normalize_lookup_text(candidate);
-    candidate_key == artist_key
-        || candidate_key.contains(artist_key)
-        || artist_key.contains(&candidate_key)
-}
-
 async fn fetch_track_duration(
     state: &State<'_, AppState>,
     video_id: &str,
@@ -2731,6 +3003,35 @@ fn cleanup_expired_stream_cache(cache: &mut HashMap<String, CachedStream>) {
 
 fn cleanup_expired_watch_playlist_cache(cache: &mut HashMap<String, CachedWatchPlaylist>) {
     cache.retain(|_, entry| entry.fetched_at.elapsed() < WATCH_PLAYLIST_CACHE_TTL);
+}
+
+async fn find_disk_stream_cache(cache_dir: &Path, video_id: &str) -> Option<String> {
+    let mut entries = tokio::fs::read_dir(cache_dir).await.ok()?;
+    let prefix = format!("{video_id}.");
+    let cutoff = SystemTime::now() - STREAM_CACHE_TTL;
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        if !name.starts_with(&prefix) {
+            continue;
+        }
+        let Ok(metadata) = entry.metadata().await else {
+            continue;
+        };
+        if !metadata.is_file() || metadata.len() == 0 {
+            continue;
+        }
+        let Ok(modified) = metadata.modified() else {
+            continue;
+        };
+        if modified < cutoff {
+            continue;
+        }
+        return Some(path.to_string_lossy().to_string());
+    }
+    None
 }
 
 async fn cleanup_old_stream_cache_files(cache_dir: &Path) -> Result<(), String> {
@@ -2822,30 +3123,23 @@ async fn resolve_track_album(
 
 #[tauri::command]
 async fn get_synced_lyrics(
+    app: AppHandle,
     state: State<'_, AppState>,
     video_id: String,
 ) -> Result<Option<SyncedLyricsResponse>, String> {
-    // Seed-track metadata powers the providers. Prefer the watch playlist
-    // cache (no network) when the current song is already queued.
     let cached_meta = find_cached_lyric_track(&state, &video_id).await;
 
-    // YouTube Music's "next" response feeds the seed-track metadata for
-    // the lyrics providers. If this fails, we can still try providers that
-    // work with just the video title (extracted from the cache or a best
-    // guess), but most need real title + artist.
-    let ytm_meta = post_ytmusic(&state, "next", watch_next_payload(&video_id, None))
-        .await
-        .ok()
-        .and_then(|response| {
-            cached_meta
-                .clone()
-                .or_else(|| extract_seed_lyric_track(&response, &video_id))
-        });
+    // Always hit `next` for stream tracks so we can reach YouTube Music's
+    // native timed lyrics (same clock as playback). Metadata still comes
+    // from the watch-playlist cache when available.
+    let next_response = post_ytmusic(&state, "next", watch_next_payload(&video_id, None)).await.ok();
 
-    // Fall back to cached metadata alone if the YTM request failed.
-    let seed_meta = ytm_meta.or(cached_meta);
+    let seed_meta = cached_meta.clone().or_else(|| {
+        next_response
+            .as_ref()
+            .and_then(|response| extract_seed_lyric_track(response, &video_id))
+    });
 
-    // Providers need a real title + artist to query.
     let meta = seed_meta.as_ref().filter(|meta| {
         !meta.title.trim().is_empty() && !meta.artist.trim().is_empty()
     });
@@ -2854,24 +3148,32 @@ async fn get_synced_lyrics(
         return Ok(None);
     };
 
-    // 1) Musixmatch richsync (word-level sync) — best quality when correct.
-    if let Some(lyrics) = fetch_musixmatch_lyrics(&state, meta).await {
-        if validate_lyrics(&lyrics.lines, meta.duration_seconds) {
-            return Ok(Some(lyrics));
-        }
-    }
+    let mut ctx = lyrics::build_resolve_context(
+        &app,
+        &state.stream_cache,
+        STREAM_CACHE_TTL,
+        Some(&video_id),
+    )
+    .await;
+    ctx.next_response = next_response.clone();
 
-    // 2) Collect all other provider results and pick the best-scored one.
-    Ok(query_remaining_lyrics_providers(meta).await)
+    let ytm_lyrics = match next_response.as_ref().and_then(lyrics::extract_lyrics_browse_id_from_next) {
+        Some(browse_id) => fetch_ytm_timed_lyrics_browse(&state, &browse_id).await.ok(),
+        None => None,
+    };
+
+    Ok(lyrics::resolve_synced_lyrics(&lyrics_deps(&state), meta, &ctx, ytm_lyrics).await)
 }
 
 #[tauri::command]
 async fn get_synced_lyrics_by_meta(
+    app: AppHandle,
     state: State<'_, AppState>,
     title: String,
     artist: String,
     album: Option<String>,
     duration_seconds: Option<u32>,
+    video_id: Option<String>,
 ) -> Result<Option<SyncedLyricsResponse>, String> {
     let meta = LyricTrack {
         title,
@@ -2884,49 +3186,41 @@ async fn get_synced_lyrics_by_meta(
         return Ok(None);
     }
 
-    // 1) Musixmatch richsync (word-level sync) — best quality when correct.
-    if let Some(lyrics) = fetch_musixmatch_lyrics(&state, &meta).await {
-        if validate_lyrics(&lyrics.lines, meta.duration_seconds) {
-            return Ok(Some(lyrics));
-        }
-    }
+    let ctx = lyrics::build_resolve_context(
+        &app,
+        &state.stream_cache,
+        STREAM_CACHE_TTL,
+        video_id.as_deref(),
+    )
+    .await;
 
-    Ok(query_remaining_lyrics_providers(&meta).await)
+    Ok(lyrics::resolve_synced_lyrics(&lyrics_deps(&state), &meta, &ctx, None).await)
 }
 
-async fn query_remaining_lyrics_providers(meta: &LyricTrack) -> Option<SyncedLyricsResponse> {
-    let mut candidates: Vec<(u32, SyncedLyricsResponse)> = Vec::new();
-
-    if let Some(lyrics) = fetch_lrclib_lyrics(meta).await {
-        let score = score_lyrics(&lyrics.lines, meta.duration_seconds);
-        if score >= 25 {
-            candidates.push((score, lyrics));
-        }
+fn lyrics_deps<'a>(state: &'a State<'_, AppState>) -> lyrics::LyricsDeps<'a> {
+    lyrics::LyricsDeps {
+        http: &HTTP,
+        http_no_redirect: &HTTP_NO_REDIRECT,
+        user_agent: USER_AGENT,
+        musixmatch_token: &state.musixmatch_token,
     }
+}
 
-    if let Some(lyrics) = fetch_kugou_lyrics(meta).await {
-        let score = score_lyrics(&lyrics.lines, meta.duration_seconds);
-        if score >= 25 {
-            candidates.push((score, lyrics));
-        }
-    }
-
-    if let Some(lyrics) = fetch_qq_music_lyrics(meta).await {
-        let score = score_lyrics(&lyrics.lines, meta.duration_seconds);
-        if score >= 25 {
-            candidates.push((score, lyrics));
-        }
-    }
-
-    if let Some(lyrics) = fetch_netease_lyrics(meta).await {
-        let score = score_lyrics(&lyrics.lines, meta.duration_seconds);
-        if score >= 25 {
-            candidates.push((score, lyrics));
-        }
-    }
-
-    candidates.sort_by_key(|(s, _)| -(i32::try_from(*s).unwrap_or(0)));
-    candidates.into_iter().next().map(|(_, lyrics)| lyrics)
+async fn fetch_ytm_timed_lyrics_browse(
+    state: &State<'_, AppState>,
+    browse_id: &str,
+) -> Result<SyncedLyricsResponse, String> {
+    let response = post_ytmusic_with_client(
+        state,
+        "browse",
+        json!({ "browseId": browse_id }),
+        "ANDROID_MUSIC",
+        lyrics::ANDROID_MUSIC_CLIENT_VERSION,
+        None,
+    )
+    .await?;
+    lyrics::parse_ytm_timed_lyrics_response(&response)
+        .ok_or_else(|| "YouTube Music returned no timed lyrics.".to_string())
 }
 
 async fn find_cached_lyric_track(
@@ -2992,6 +3286,23 @@ async fn resolve_stream(
         let mut cache = state.stream_cache.lock().await;
         cleanup_expired_stream_cache(&mut cache);
     }
+
+    if let Some(file_path) = find_disk_stream_cache(&cache_dir, &video_id).await {
+        let mut cache = state.stream_cache.lock().await;
+        cleanup_expired_stream_cache(&mut cache);
+        cache.insert(
+            video_id.clone(),
+            CachedStream {
+                source: file_path.clone(),
+                fetched_at: Instant::now(),
+            },
+        );
+        return Ok(StreamResponse {
+            url: None,
+            file_path: Some(file_path),
+        });
+    }
+
     remove_cached_streams(&cache_dir, &video_id).await?;
 
     let output_template = cache_dir.join(format!("{video_id}.%(ext)s"));
@@ -3078,7 +3389,7 @@ async fn remove_cached_streams(cache_dir: &Path, video_id: &str) -> Result<(), S
     Ok(())
 }
 
-fn stream_cache_dir(app: &AppHandle) -> Result<PathBuf, String> {
+pub(crate) fn stream_cache_dir(app: &AppHandle) -> Result<PathBuf, String> {
     let root = app
         .path()
         .app_local_data_dir()
@@ -3153,7 +3464,7 @@ async fn save_offline(app: AppHandle, video_id: String) -> Result<(), String> {
 
     let output_template = offline.join(format!("{video_id}.%(ext)s"));
     let output_template = output_template.to_string_lossy().to_string();
-    let output = run_command(
+    let output = run_command_with_timeout(
         &yt_dlp,
         [
             "-f",
@@ -3168,6 +3479,7 @@ async fn save_offline(app: AppHandle, video_id: String) -> Result<(), String> {
             &output_template,
             &watch_url,
         ],
+        YT_DLP_DOWNLOAD_TIMEOUT,
     )
     .await?;
 
@@ -3198,39 +3510,31 @@ async fn remove_offline(app: AppHandle, video_id: String) -> Result<(), String> 
 #[tauri::command]
 async fn load_all_user_data(
     app: AppHandle,
-    state: State<'_, AppState>,
 ) -> Result<HashMap<String, String>, String> {
-    let _guard = state.data_lock.0.lock().await;
     data_store::load_all(&app).await
 }
 
 #[tauri::command]
 async fn write_user_data(
     app: AppHandle,
-    state: State<'_, AppState>,
     key: String,
     data: String,
 ) -> Result<(), String> {
-    let _guard = state.data_lock.0.lock().await;
     data_store::write(&app, &key, &data).await
 }
 
 #[tauri::command]
 async fn delete_user_data(
     app: AppHandle,
-    state: State<'_, AppState>,
     key: String,
 ) -> Result<(), String> {
-    let _guard = state.data_lock.0.lock().await;
     data_store::delete(&app, &key).await
 }
 
 #[tauri::command]
 async fn clear_all_user_data_backend(
     app: AppHandle,
-    state: State<'_, AppState>,
 ) -> Result<(), String> {
-    let _guard = state.data_lock.0.lock().await;
     data_store::clear_all(&app).await
 }
 
@@ -3381,6 +3685,179 @@ async fn unique_mp3_path(dir: &Path, stem: &str) -> Result<PathBuf, String> {
     Err("Could not allocate a unique file name.".to_string())
 }
 
+fn collect_export_video_ids(primary: &str, fallbacks: &[String]) -> Vec<String> {
+    let mut ids = Vec::new();
+    let mut push = |id: &str| {
+        if !id.is_empty() && !ids.iter().any(|existing| existing == id) {
+            ids.push(id.to_string());
+        }
+    };
+    push(primary);
+    for id in fallbacks {
+        push(id);
+    }
+    ids
+}
+
+async fn cached_audio_file_valid(path: &Path) -> bool {
+    let Ok(metadata) = tokio::fs::metadata(path).await else {
+        return false;
+    };
+    metadata.is_file() && metadata.len() > 0
+}
+
+/// Reuse audio Velocity already downloaded for playback (stream cache or
+/// offline save) before shelling out to yt-dlp again.
+async fn find_cached_audio_source(
+    app: &AppHandle,
+    state: &State<'_, AppState>,
+    video_ids: &[String],
+) -> Option<PathBuf> {
+    {
+        let cache = state.stream_cache.lock().await;
+        for id in video_ids {
+            if let Some(entry) = cache.get(id) {
+                if entry.fetched_at.elapsed() < STREAM_CACHE_TTL {
+                    let path = PathBuf::from(&entry.source);
+                    if cached_audio_file_valid(&path).await {
+                        return Some(path);
+                    }
+                }
+            }
+        }
+    }
+
+    if let Ok(offline) = offline_dir(app) {
+        if offline.exists() {
+            for id in video_ids {
+                if let Some(path) = find_offline_file(&offline, id).await {
+                    if cached_audio_file_valid(&path).await {
+                        return Some(path);
+                    }
+                }
+            }
+        }
+    }
+
+    if let Ok(cache_dir) = stream_cache_dir(app) {
+        for id in video_ids {
+            if let Some(path) = find_disk_stream_cache(&cache_dir, id).await {
+                let path = PathBuf::from(path);
+                if cached_audio_file_valid(&path).await {
+                    return Some(path);
+                }
+            }
+        }
+    }
+
+    None
+}
+
+async fn convert_cached_audio_to_mp3(
+    app: &AppHandle,
+    source: &Path,
+    target_path: &Path,
+) -> Result<PathBuf, String> {
+    let parent = target_path
+        .parent()
+        .ok_or_else(|| "Target path has no parent directory.".to_string())?;
+    let stem = target_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| "Could not derive a file stem from the target path.".to_string())?;
+    let temp_mp3 = parent.join(format!(".velocity-export-{stem}.tmp.mp3"));
+
+    let is_mp3 = source
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| value.eq_ignore_ascii_case("mp3"))
+        .unwrap_or(false);
+    if is_mp3 {
+        tokio::fs::copy(source, &temp_mp3)
+            .await
+            .map_err(|error| format!("Failed to copy cached audio: {error}"))?;
+        return Ok(temp_mp3);
+    }
+
+    let ffmpeg = ensure_ffmpeg(app).await?;
+    let source_arg = source.to_string_lossy().to_string();
+    let output_arg = temp_mp3.to_string_lossy().to_string();
+    let mut command = Command::new(&ffmpeg);
+    command.args([
+        "-nostdin",
+        "-hide_banner",
+        "-nostats",
+        "-y",
+        "-i",
+        &source_arg,
+        "-vn",
+        "-codec:a",
+        "libmp3lame",
+        "-q:a",
+        "0",
+        &output_arg,
+    ]);
+    #[cfg(target_os = "windows")]
+    command.creation_flags(CREATE_NO_WINDOW);
+
+    let output = command
+        .output()
+        .await
+        .map_err(|error| format!("Failed to run ffmpeg: {error}"))?;
+    if !output.status.success() {
+        let _ = tokio::fs::remove_file(&temp_mp3).await;
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(if stderr.is_empty() {
+            "ffmpeg failed to convert cached audio to MP3.".to_string()
+        } else {
+            stderr
+        });
+    }
+    if !cached_audio_file_valid(&temp_mp3).await {
+        let _ = tokio::fs::remove_file(&temp_mp3).await;
+        return Err("ffmpeg produced an empty MP3 file.".to_string());
+    }
+    Ok(temp_mp3)
+}
+
+/// Produce a tagged-ready MP3 temp file for export. Consults cached
+/// playback/offline audio first, then walks the supplied video ids
+/// through yt-dlp until one succeeds.
+async fn acquire_export_mp3(
+    app: &AppHandle,
+    state: &State<'_, AppState>,
+    video_ids: &[String],
+    target: &Path,
+    cancel_rx: &mut Option<&mut oneshot::Receiver<()>>,
+) -> Result<PathBuf, String> {
+    if !video_ids.is_empty() {
+        if let Some(source) = find_cached_audio_source(app, state, video_ids).await {
+            if let Ok(produced) = convert_cached_audio_to_mp3(app, &source, target).await {
+                return Ok(produced);
+            }
+        }
+    }
+
+    let yt_dlp = ensure_yt_dlp(app).await?;
+    let mut last_error = "No streamable video id was provided.".to_string();
+    for video_id in video_ids {
+        let attempt = download_track_mp3(app, &yt_dlp, video_id, target);
+        let result = if let Some(rx) = cancel_rx.as_mut() {
+            tokio::select! {
+                result = attempt => result,
+                _ = &mut **rx => return Err("Save cancelled.".to_string()),
+            }
+        } else {
+            attempt.await
+        };
+        match result {
+            Ok(produced) => return Ok(produced),
+            Err(error) => last_error = error,
+        }
+    }
+    Err(last_error)
+}
+
 /// Pull a single track through yt-dlp into an MP3 at `target_path`. Used
 /// by both the song and album exports.
 ///
@@ -3388,10 +3865,17 @@ async fn unique_mp3_path(dir: &Path, stem: &str) -> Result<PathBuf, String> {
 /// after yt-dlp returns we don't care about the literal name it used —
 /// we re-tag the file with lofty and rename to `target_path` at the end.
 async fn download_track_mp3(
+    app: &AppHandle,
     yt_dlp: &Path,
     video_id: &str,
     target_path: &Path,
 ) -> Result<PathBuf, String> {
+    let ffmpeg = ensure_ffmpeg(app).await?;
+    let ffmpeg_dir = ffmpeg
+        .parent()
+        .ok_or_else(|| "Bundled ffmpeg has no parent directory.".to_string())?
+        .to_string_lossy()
+        .to_string();
     let watch_url = format!("https://music.youtube.com/watch?v={video_id}");
     let parent = target_path
         .parent()
@@ -3418,7 +3902,7 @@ async fn download_track_mp3(
     // `--embed-thumbnail` — we re-tag with lofty afterwards so the
     // user-supplied (and possibly enriched) metadata wins over whatever
     // yt-dlp scraped from the page.
-    let output = run_command(
+    let output = run_command_with_timeout(
         yt_dlp,
         [
             "-x",
@@ -3426,6 +3910,8 @@ async fn download_track_mp3(
             "mp3",
             "--audio-quality",
             "0",
+            "--ffmpeg-location",
+            &ffmpeg_dir,
             "--no-playlist",
             "--no-progress",
             "--no-part",
@@ -3436,6 +3922,7 @@ async fn download_track_mp3(
             &temp_template,
             &watch_url,
         ],
+        YT_DLP_DOWNLOAD_TIMEOUT,
     )
     .await?;
     let produced = output
@@ -3445,7 +3932,7 @@ async fn download_track_mp3(
         .find(|line| !line.is_empty())
         .filter(|line| Path::new(line).exists())
         .ok_or_else(|| {
-            "yt-dlp did not produce an MP3 file. Make sure ffmpeg is installed and on PATH."
+            "yt-dlp did not produce an MP3 file. Try again in a moment — Velocity may still be setting up ffmpeg."
                 .to_string()
         })?
         .to_string();
@@ -3714,13 +4201,8 @@ async fn save_track_to_mp3_inner(
         ));
     }
     let stem = sanitize_filename(&request.file_name);
-    let target = target_dir.join(format!("{stem}.mp3"));
-    if target.exists() {
-        return Err(format!(
-            "A file named \"{}\" already exists in the chosen folder.",
-            target.file_name().and_then(|n| n.to_str()).unwrap_or("track")
-        ));
-    }
+    let target = unique_mp3_path(&target_dir, &stem).await?;
+    let video_ids = collect_export_video_ids(&request.video_id, &request.fallback_video_ids);
 
     // Register a cancellation sender for this request. The frontend
     // can interrupt the in-flight work at the next checkpoint by
@@ -3728,8 +4210,9 @@ async fn save_track_to_mp3_inner(
     // entry back out on completion (success OR error OR cancel) so
     // the map only ever holds senders for live requests.
     let request_id = request.request_id.clone();
-    let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
-    if !request_id.is_empty() {
+    let (cancel_tx, mut cancel_rx) = oneshot::channel::<()>();
+    let cancellable = !request_id.is_empty();
+    if cancellable {
         state
             .active_save_exports
             .lock()
@@ -3737,17 +4220,20 @@ async fn save_track_to_mp3_inner(
             .insert(request_id.clone(), cancel_tx);
     }
 
-    // We use `tokio::select!` between the actual work and the cancel
-    // signal. To do that cleanly we wrap each sub-step in a future
-    // we own the lifetime of, and on cancellation we attempt to
-    // clean up the produced temp file before returning.
-    enum CancelResult {
-        Cancelled,
-        Failed(String),
-    }
+    let mut cancel_rx_slot = if cancellable {
+        Some(&mut cancel_rx)
+    } else {
+        None
+    };
     let work = async {
-        let yt_dlp = ensure_yt_dlp(app).await?;
-        let produced = download_track_mp3(&yt_dlp, &request.video_id, &target).await?;
+        let produced = acquire_export_mp3(
+            app,
+            state,
+            &video_ids,
+            &target,
+            &mut cancel_rx_slot,
+        )
+        .await?;
 
         // Pull the cover bytes in parallel with the tagging download
         // so the slowest leg wins. If the cover download fails (no
@@ -3784,36 +4270,20 @@ async fn save_track_to_mp3_inner(
         Ok(target.to_string_lossy().to_string())
     };
 
-    let result: Result<String, CancelResult> = if request_id.is_empty() {
-        // No request id means cancellation isn't supported (e.g.
-        // pre-frontend-id callers, future internal callers). Just
-        // run the work without a select.
-        work.await.map_err(CancelResult::Failed)
-    } else {
-        tokio::select! {
-            result = work => result.map_err(CancelResult::Failed),
-            _ = cancel_rx => Err(CancelResult::Cancelled),
-        }
-    };
+    let result = work.await;
 
     // Always unregister the sender, regardless of outcome.
-    if !request_id.is_empty() {
+    if cancellable {
         state.active_save_exports.lock().await.remove(&request_id);
     }
 
     match result {
         Ok(path) => Ok(path),
-        Err(CancelResult::Cancelled) => {
-            // The user pulled the ripcord. We may have left a
-            // partially-downloaded temp file in the target dir if
-            // yt-dlp finished before the cancel signal landed. Sweep
-            // it (and the target, if we'd already moved) so the user
-            // doesn't find a stray `.velocity-export-*.mp3` in their
-            // Music folder.
+        Err(error) if error == "Save cancelled." => {
             sweep_cancel_artifacts(&target).await;
-            Err("Save cancelled.".to_string())
+            Err(error)
         }
-        Err(CancelResult::Failed(error)) => Err(error),
+        Err(error) => Err(error),
     }
 }
 
@@ -3913,7 +4383,8 @@ async fn save_album_to_mp3_inner(
     // signaled.
     let request_id = request.request_id.clone();
     let (cancel_tx, mut cancel_rx) = oneshot::channel::<()>();
-    if !request_id.is_empty() {
+    let cancellable = !request_id.is_empty();
+    if cancellable {
         state
             .active_save_exports
             .lock()
@@ -3930,10 +4401,11 @@ async fn save_album_to_mp3_inner(
         None => None,
     };
 
-    enum CancelResult {
-        Cancelled,
-        Failed(String),
-    }
+    let mut cancel_rx_slot = if cancellable {
+        Some(&mut cancel_rx)
+    } else {
+        None
+    };
     let work = async {
         // Pre-compute each track's stem (front-end-supplied, but we
         // sanitize for the FS) and its unique on-disk path. The
@@ -3947,8 +4419,16 @@ async fn save_album_to_mp3_inner(
                 .unwrap_or_else(|| (idx + 1) as u32);
             let stem = sanitize_filename(&track.file_name);
             let target = unique_mp3_path(&album_dir, &stem).await?;
-            let yt_dlp = ensure_yt_dlp(app).await?;
-            let produced = download_track_mp3(&yt_dlp, &track.video_id, &target).await?;
+            let video_ids =
+                collect_export_video_ids(&track.video_id, &track.fallback_video_ids);
+            let produced = acquire_export_mp3(
+                app,
+                state,
+                &video_ids,
+                &target,
+                &mut cancel_rx_slot,
+            )
+            .await?;
             // Album name + album-artist are stamped on every track so
             // the resulting folder round-trips through any standard
             // player.
@@ -3974,32 +4454,15 @@ async fn save_album_to_mp3_inner(
         })
     };
 
-    let result: Result<SaveAlbumResult, CancelResult> = if request_id.is_empty() {
-        work.await.map_err(CancelResult::Failed)
-    } else {
-        // `oneshot::Receiver::try_recv` is a non-blocking peek; we
-        // also need to handle the case where the sender was dropped
-        // without firing (e.g. the album finished on its own and
-        // removed the entry). Wrap the receiver in an async loop
-        // that polls between tracks via a `tokio::select!` at the
-        // top of each iteration would require restructuring the
-        // for-loop, so instead we just race the whole work against
-        // the cancel signal once. The user has to wait for the
-        // current track to finish before cancellation takes effect,
-        // which matches the per-track granularity of `yt-dlp`.
-        tokio::select! {
-            result = work => result.map_err(CancelResult::Failed),
-            _ = &mut cancel_rx => Err(CancelResult::Cancelled),
-        }
-    };
+    let result = work.await;
 
-    if !request_id.is_empty() {
+    if cancellable {
         state.active_save_exports.lock().await.remove(&request_id);
     }
 
     match result {
         Ok(value) => Ok(value),
-        Err(CancelResult::Cancelled) => {
+        Err(error) if error == "Save cancelled." => {
             // The current track (if any) may have already landed on
             // disk before the cancel signal landed — yt-dlp is
             // synchronous from our side. Walk the album directory
@@ -4023,9 +4486,9 @@ async fn save_album_to_mp3_inner(
                     let _ = tokio::fs::remove_dir(&album_dir).await;
                 }
             }
-            Err("Save cancelled.".to_string())
+            Err(error)
         }
-        Err(CancelResult::Failed(error)) => Err(error),
+        Err(error) => Err(error),
     }
 }
 
@@ -4113,7 +4576,8 @@ async fn save_playlist_to_mp3_inner(
     // from our side.
     let request_id = request.request_id.clone();
     let (cancel_tx, mut cancel_rx) = oneshot::channel::<()>();
-    if !request_id.is_empty() {
+    let cancellable = !request_id.is_empty();
+    if cancellable {
         state
             .active_save_exports
             .lock()
@@ -4129,10 +4593,11 @@ async fn save_playlist_to_mp3_inner(
         None => None,
     };
 
-    enum CancelResult {
-        Cancelled,
-        Failed(String),
-    }
+    let mut cancel_rx_slot = if cancellable {
+        Some(&mut cancel_rx)
+    } else {
+        None
+    };
     let work = async {
         let track_total: u32 = request.tracks.len() as u32;
         let mut file_paths: Vec<String> = Vec::with_capacity(track_total as usize);
@@ -4160,9 +4625,19 @@ async fn save_playlist_to_mp3_inner(
             let track_number = track.track_number.unwrap_or_else(|| (idx + 1) as u32);
             let stem = sanitize_filename(&track.file_name);
             let target = unique_mp3_path(&playlist_dir, &stem).await?;
-            let yt_dlp = ensure_yt_dlp(app).await?;
-            let produced = match download_track_mp3(&yt_dlp, &track.video_id, &target).await {
+            let video_ids =
+                collect_export_video_ids(&track.video_id, &track.fallback_video_ids);
+            let produced = match acquire_export_mp3(
+                app,
+                state,
+                &video_ids,
+                &target,
+                &mut cancel_rx_slot,
+            )
+            .await
+            {
                 Ok(produced) => produced,
+                Err(error) if error == "Save cancelled." => return Err(error),
                 Err(error) => {
                     // One bad track shouldn't sink the whole export.
                     // We surface the error to the caller so the toast
@@ -4200,22 +4675,15 @@ async fn save_playlist_to_mp3_inner(
         })
     };
 
-    let result: Result<SavePlaylistResult, CancelResult> = if request_id.is_empty() {
-        work.await.map_err(CancelResult::Failed)
-    } else {
-        tokio::select! {
-            result = work => result.map_err(CancelResult::Failed),
-            _ = &mut cancel_rx => Err(CancelResult::Cancelled),
-        }
-    };
+    let result = work.await;
 
-    if !request_id.is_empty() {
+    if cancellable {
         state.active_save_exports.lock().await.remove(&request_id);
     }
 
     match result {
         Ok(value) => Ok(value),
-        Err(CancelResult::Cancelled) => {
+        Err(error) if error == "Save cancelled." => {
             // Same shape as the album cancel cleanup: drop every MP3
             // already in the playlist folder, then remove the folder
             // itself if it ended up empty.
@@ -4230,9 +4698,9 @@ async fn save_playlist_to_mp3_inner(
                     let _ = tokio::fs::remove_dir(&playlist_dir).await;
                 }
             }
-            Err("Save cancelled.".to_string())
+            Err(error)
         }
-        Err(CancelResult::Failed(error)) => Err(error),
+        Err(error) => Err(error),
     }
 }
 
@@ -4455,10 +4923,7 @@ async fn import_tracks(
             .artist
             .filter(|v| !v.trim().is_empty())
             .unwrap_or_else(|| "Imported audio".to_string());
-        let album = extracted
-            .album
-            .filter(|v| !v.trim().is_empty())
-            .or(Some("Collection".to_string()));
+        let album = extracted.album.filter(|v| !v.trim().is_empty());
 
         let record = ImportedTrackRecord {
             id: id.clone(),
@@ -4688,6 +5153,124 @@ async fn analyze_loudness_slice(
     Ok(empty_loudness_data())
 }
 
+#[tauri::command]
+async fn detect_leading_silence(file_path: String) -> Result<LeadingSilenceData, String> {
+    const LEADING_SILENCE_ANALYSIS_VERSION: u8 = 2;
+    const ANALYSIS_MAX_SECONDS: f64 = 45.0;
+    const SILENCE_NOISE_DB: f64 = -35.0;
+    const SILENCE_MIN_DURATION: f64 = 0.75;
+    const MIN_SKIP_SECONDS: f64 = 1.0;
+    const MAX_SKIP_SECONDS: f64 = 30.0;
+    const LEADING_SILENCE_START_TOLERANCE: f64 = 0.05;
+
+    fn empty_leading_silence_data() -> LeadingSilenceData {
+        LeadingSilenceData {
+            skip_seconds: None,
+            analysis_version: LEADING_SILENCE_ANALYSIS_VERSION,
+        }
+    }
+
+    fn parse_silence_value(line: &str, key: &str) -> Option<f64> {
+        let marker = format!("{key}:");
+        let start = line.find(&marker)? + marker.len();
+        let raw = line[start..].trim();
+        let token = raw.split_whitespace().next()?;
+        token.parse::<f64>().ok().filter(|value| value.is_finite())
+    }
+
+    async fn check_ffmpeg() -> Option<PathBuf> {
+        let name = if cfg!(target_os = "windows") {
+            "ffmpeg.exe"
+        } else {
+            "ffmpeg"
+        };
+        let mut cmd = Command::new(name);
+        cmd.arg("-version");
+        #[cfg(target_os = "windows")]
+        cmd.creation_flags(CREATE_NO_WINDOW);
+        cmd.output().await.ok().filter(|o| o.status.success())?;
+        Some(PathBuf::from(name))
+    }
+
+    let ffmpeg = match check_ffmpeg().await {
+        Some(path) => path,
+        None => return Ok(empty_leading_silence_data()),
+    };
+
+    let null_device = if cfg!(target_os = "windows") {
+        "NUL"
+    } else {
+        "/dev/null"
+    };
+
+    let filter = format!(
+        "silencedetect=noise={SILENCE_NOISE_DB}dB:d={SILENCE_MIN_DURATION}"
+    );
+
+    let mut command = Command::new(&ffmpeg);
+    command.args([
+        "-nostdin",
+        "-hide_banner",
+        "-nostats",
+        "-vn",
+        "-t",
+        &format!("{ANALYSIS_MAX_SECONDS:.3}"),
+        "-i",
+        &file_path,
+        "-af",
+        &filter,
+        "-f",
+        "null",
+        null_device,
+        "-y",
+    ]);
+    #[cfg(target_os = "windows")]
+    command.creation_flags(CREATE_NO_WINDOW);
+
+    let output = command
+        .output()
+        .await
+        .map_err(|error| format!("Failed to run ffmpeg: {error}"))?;
+
+    if !output.status.success() {
+        return Ok(empty_leading_silence_data());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let mut current_silence_start: Option<f64> = None;
+    let mut leading_skip: Option<f64> = None;
+
+    for line in stderr.lines() {
+        if line.contains("silence_start:") {
+            current_silence_start = parse_silence_value(line, "silence_start");
+            continue;
+        }
+        if line.contains("silence_end:") {
+            let silence_end = parse_silence_value(line, "silence_end");
+            if let (Some(start), Some(end)) = (current_silence_start, silence_end) {
+                if start <= LEADING_SILENCE_START_TOLERANCE {
+                    leading_skip = Some(end);
+                    break;
+                }
+            }
+            current_silence_start = None;
+        }
+    }
+
+    let skip_seconds = leading_skip.and_then(|seconds| {
+        if seconds < MIN_SKIP_SECONDS {
+            None
+        } else {
+            Some(seconds.min(MAX_SKIP_SECONDS))
+        }
+    });
+
+    Ok(LeadingSilenceData {
+        skip_seconds,
+        analysis_version: LEADING_SILENCE_ANALYSIS_VERSION,
+    })
+}
+
 async fn backend_status(app: &AppHandle) -> Result<BackendStatus, String> {
     let path = yt_dlp_path(app)?;
     if !path.exists() {
@@ -4744,12 +5327,137 @@ async fn ensure_yt_dlp(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(path)
 }
 
-fn yt_dlp_path(app: &AppHandle) -> Result<PathBuf, String> {
+fn app_bin_dir(app: &AppHandle) -> Result<PathBuf, String> {
     let root = app
         .path()
         .app_local_data_dir()
         .map_err(|error| format!("Could not resolve app data folder: {error}"))?;
-    Ok(root.join("bin").join("yt-dlp.exe"))
+    Ok(root.join("bin"))
+}
+
+fn yt_dlp_path(app: &AppHandle) -> Result<PathBuf, String> {
+    Ok(app_bin_dir(app)?.join("yt-dlp.exe"))
+}
+
+fn ffmpeg_executable_name() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "ffmpeg.exe"
+    } else {
+        "ffmpeg"
+    }
+}
+
+fn ffprobe_executable_name() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "ffprobe.exe"
+    } else {
+        "ffprobe"
+    }
+}
+
+async fn ffmpeg_bundle_ready(bin_dir: &Path) -> bool {
+    let ffmpeg = bin_dir.join(ffmpeg_executable_name());
+    let ffprobe = bin_dir.join(ffprobe_executable_name());
+    cached_audio_file_valid(&ffmpeg).await && cached_audio_file_valid(&ffprobe).await
+}
+
+async fn ffmpeg_on_path() -> Option<PathBuf> {
+    let name = ffmpeg_executable_name();
+    let mut cmd = Command::new(name);
+    cmd.arg("-version");
+    #[cfg(target_os = "windows")]
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    cmd.output()
+        .await
+        .ok()
+        .filter(|output| output.status.success())?;
+    Some(PathBuf::from(name))
+}
+
+#[cfg(target_os = "windows")]
+async fn extract_ffmpeg_zip(bytes: &[u8], bin_dir: &Path) -> Result<(), String> {
+    let cursor = Cursor::new(bytes);
+    let mut archive = zip::ZipArchive::new(cursor)
+        .map_err(|error| format!("Downloaded ffmpeg archive was invalid: {error}"))?;
+    for index in 0..archive.len() {
+        let mut entry = archive
+            .by_index(index)
+            .map_err(|error| format!("Failed to read ffmpeg archive entry: {error}"))?;
+        let Some(enclosed) = entry.enclosed_name() else {
+            continue;
+        };
+        let file_name = enclosed
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default();
+        if file_name != ffmpeg_executable_name() && file_name != ffprobe_executable_name() {
+            continue;
+        }
+        let out_path = bin_dir.join(file_name);
+        let mut out_file = std::fs::File::create(&out_path)
+            .map_err(|error| format!("Failed to create {}: {error}", out_path.display()))?;
+        std::io::copy(&mut entry, &mut out_file)
+            .map_err(|error| format!("Failed to extract {}: {error}", out_path.display()))?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+async fn download_bundled_ffmpeg(app: &AppHandle) -> Result<PathBuf, String> {
+    let bin_dir = app_bin_dir(app)?;
+    tokio::fs::create_dir_all(&bin_dir)
+        .await
+        .map_err(|error| format!("Failed to create bin folder: {error}"))?;
+
+    let response = HTTP
+        .get(FFMPEG_WIN_ZIP_URL)
+        .send()
+        .await
+        .map_err(|error| format!("Failed to download ffmpeg: {error}"))?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "Failed to download ffmpeg: HTTP {}",
+            response.status()
+        ));
+    }
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|error| format!("Failed to read ffmpeg download: {error}"))?;
+    extract_ffmpeg_zip(&bytes, &bin_dir).await?;
+
+    let ffmpeg = bin_dir.join(ffmpeg_executable_name());
+    if !ffmpeg_bundle_ready(&bin_dir).await {
+        return Err(
+            "ffmpeg download finished but ffmpeg/ffprobe were not found in the archive.".to_string(),
+        );
+    }
+    Ok(ffmpeg)
+}
+
+/// Resolve ffmpeg for MP3 export. Windows downloads a portable bundle
+/// beside yt-dlp on first use; other platforms fall back to PATH.
+async fn ensure_ffmpeg(app: &AppHandle) -> Result<PathBuf, String> {
+    let bin_dir = app_bin_dir(app)?;
+    if ffmpeg_bundle_ready(&bin_dir).await {
+        return Ok(bin_dir.join(ffmpeg_executable_name()));
+    }
+    if let Some(path) = ffmpeg_on_path().await {
+        return Ok(path);
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        return download_bundled_ffmpeg(app).await;
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        Err(
+            "ffmpeg is required to export MP3 files. Install ffmpeg and make sure it is on PATH."
+                .to_string(),
+        )
+    }
 }
 
 fn import_root_dir(app: &AppHandle) -> Result<PathBuf, String> {
@@ -4911,7 +5619,11 @@ fn record_to_media_track(
         kind: None,
         title: record.title.clone(),
         artist: record.artist.clone(),
-        album: record.album.clone(),
+        album: record
+            .album
+            .as_ref()
+            .filter(|value| !value.trim().eq_ignore_ascii_case("collection"))
+            .cloned(),
         album_browse_id: None,
         artist_browse_id: None,
         artist_credits: None,
@@ -5038,6 +5750,38 @@ async fn post_ytmusic(
         payload,
         "WEB_REMIX",
         &config.client_version,
+        None,
+    )
+    .await
+}
+
+async fn post_ytmusic_continuation(
+    state: &State<'_, AppState>,
+    token: &str,
+) -> Result<Value, String> {
+    let config = get_client_config(state).await?;
+    let encoded = urlencoding::encode(token);
+    let query_suffix = format!("&ctoken={encoded}&continuation={encoded}");
+    let with_query = post_ytmusic_with_client(
+        state,
+        "browse",
+        json!({ "continuation": token }),
+        "WEB_REMIX",
+        &config.client_version,
+        Some(query_suffix.as_str()),
+    )
+    .await?;
+    if parse_shelf_continuation_items(&with_query).is_some() {
+        return Ok(with_query);
+    }
+
+    post_ytmusic_with_client(
+        state,
+        "browse",
+        json!({ "continuation": token }),
+        "WEB_REMIX",
+        &config.client_version,
+        None,
     )
     .await
 }
@@ -5048,6 +5792,7 @@ async fn post_ytmusic_with_client(
     payload: Value,
     client_name: &str,
     client_version: &str,
+    query_suffix: Option<&str>,
 ) -> Result<Value, String> {
     let config = get_client_config(state).await?;
     let mut headers = HeaderMap::new();
@@ -5095,8 +5840,9 @@ async fn post_ytmusic_with_client(
     );
 
     let url = format!(
-        "https://music.youtube.com/youtubei/v1/{endpoint}?key={}",
-        config.api_key
+        "https://music.youtube.com/youtubei/v1/{endpoint}?key={}{}",
+        config.api_key,
+        query_suffix.unwrap_or_default()
     );
 
     let response = HTTP
@@ -5173,6 +5919,49 @@ async fn get_client_config(state: &State<'_, AppState>) -> Result<InnerTubeConfi
     });
 
     Ok(config)
+}
+
+fn parse_search_suggestions(value: &Value) -> Vec<SearchSuggestion> {
+    let raw_suggestions = value
+        .get("contents")
+        .and_then(Value::as_array)
+        .and_then(|items| items.first())
+        .and_then(|item| item.get("searchSuggestionsSectionRenderer"))
+        .and_then(|section| section.get("contents"))
+        .and_then(Value::as_array);
+
+    let Some(raw_suggestions) = raw_suggestions else {
+        return Vec::new();
+    };
+
+    let mut suggestions = Vec::new();
+    for raw in raw_suggestions {
+        let (suggestion_content, from_history) =
+            if let Some(history) = raw.get("historySuggestionRenderer") {
+                (history, true)
+            } else if let Some(search) = raw.get("searchSuggestionRenderer") {
+                (search, false)
+            } else {
+                continue;
+            };
+
+        let text = suggestion_content
+            .get("navigationEndpoint")
+            .and_then(|endpoint| endpoint.get("searchEndpoint"))
+            .and_then(|endpoint| endpoint.get("query"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+
+        if let Some(text) = text {
+            suggestions.push(SearchSuggestion {
+                text: text.to_string(),
+                from_history,
+            });
+        }
+    }
+
+    suggestions
 }
 
 fn parse_search_response(query: &str, value: &Value) -> SearchResponse {
@@ -5408,6 +6197,9 @@ fn parse_search_row(value: &Value) -> Option<SearchItem> {
         parsed_runs.type_label.as_deref(),
         meta_parts.first().map(String::as_str),
     );
+    if kind_label.is_some_and(|label| is_excluded_type_label(label)) {
+        return None;
+    }
     let kind = normalize_kind(kind_label, browse_id.is_some(), video_id.is_some());
     if kind == "unknown" {
         return None;
@@ -5597,8 +6389,8 @@ fn parse_entity_detail(browse_id: &str, value: &Value) -> Result<EntityDetail, S
     })
 }
 
-fn extract_top_songs_continuation(value: &Value) -> Option<String> {
-    let sections = value
+fn artist_overview_sections(value: &Value) -> Option<&[Value]> {
+    value
         .get("contents")
         .and_then(|v| v.get("singleColumnBrowseResultsRenderer"))
         .and_then(|v| v.get("tabs"))
@@ -5608,43 +6400,458 @@ fn extract_top_songs_continuation(value: &Value) -> Option<String> {
         .and_then(|v| v.get("content"))
         .and_then(|v| v.get("sectionListRenderer"))
         .and_then(|v| v.get("contents"))
-        .and_then(Value::as_array)?;
+        .and_then(Value::as_array)
+        .map(|sections| sections.as_slice())
+}
 
-    for section in sections {
-        if let Some(shelf) = section
+fn shelf_section_title(shelf: &Value) -> Option<String> {
+    // Artist overview shelves often expose `title` directly on the renderer
+    // (no nested `header.musicShelfHeaderRenderer`).
+    if let Some(title) = shelf.get("title").and_then(text_from_value) {
+        return Some(title);
+    }
+
+    shelf
+        .get("header")
+        .and_then(|h| {
+            h.get("musicShelfHeaderRenderer")
+                .or(h.get("musicPlaylistShelfHeaderRenderer"))
+        })
+        .and_then(|h| h.get("title"))
+        .and_then(text_from_value)
+}
+
+fn is_top_songs_section_title(title: &str) -> bool {
+    let lower = title.to_lowercase();
+    (lower.contains("top") && (lower.contains("song") || lower.contains("track")))
+        || lower == "songs"
+        || lower.contains("popular")
+}
+
+fn top_songs_shelf_index(sections: &[Value]) -> Option<usize> {
+    let mut best_index: Option<usize> = None;
+    let mut fallback_index: Option<usize> = None;
+
+    for (index, section) in sections.iter().enumerate() {
+        let Some(shelf) = section
             .get("musicShelfRenderer")
             .or_else(|| section.get("musicPlaylistShelfRenderer"))
-        {
-            let section_title = shelf
-                .get("header")
-                .and_then(|h| {
-                    h.get("musicShelfHeaderRenderer")
-                        .or(h.get("musicPlaylistShelfHeaderRenderer"))
-                })
-                .and_then(|h| h.get("title"))
-                .and_then(text_from_value);
+        else {
+            continue;
+        };
 
-            if let Some(section_title) = section_title {
-                let lower = section_title.to_lowercase();
-                if (lower.contains("top") && lower.contains("song"))
-                    || lower == "songs"
-                    || lower.contains("popular")
-                {
-                    return shelf
-                        .get("continuations")
-                        .and_then(Value::as_array)
-                        .and_then(|arr| arr.first())
-                        .and_then(|c| c.get("nextContinuationData"))
-                        .and_then(|c| c.get("continuation"))
-                        .and_then(Value::as_str)
-                        .map(str::to_string)
-                        .or_else(|| find_continuation_token(shelf));
+        if fallback_index.is_none() {
+            fallback_index = Some(index);
+        }
+
+        if let Some(section_title) = shelf_section_title(shelf) {
+            if is_top_songs_section_title(&section_title) {
+                best_index = Some(index);
+                break;
+            }
+        }
+    }
+
+    best_index.or(fallback_index)
+}
+
+fn top_songs_shelf<'a>(sections: &'a [Value]) -> Option<&'a Value> {
+    let index = top_songs_shelf_index(sections)?;
+    sections[index]
+        .get("musicShelfRenderer")
+        .or_else(|| sections[index].get("musicPlaylistShelfRenderer"))
+}
+
+fn continuation_token_from_item(item: &Value) -> Option<String> {
+    let renderer = item.get("continuationItemRenderer")?;
+    if let Some(token) = renderer
+        .get("continuationEndpoint")
+        .and_then(|endpoint| endpoint.get("continuationCommand"))
+        .and_then(|command| command.get("token"))
+        .and_then(Value::as_str)
+    {
+        return Some(token.to_string());
+    }
+
+    renderer
+        .get("continuationEndpoint")
+        .and_then(|endpoint| endpoint.get("commandExecutorCommand"))
+        .and_then(|executor| executor.get("commands"))
+        .and_then(Value::as_array)
+        .and_then(|commands| {
+            commands.iter().find_map(|command| {
+                let request = command
+                    .get("continuationCommand")
+                    .and_then(|value| value.get("request"))
+                    .and_then(Value::as_str);
+                if request != Some("CONTINUATION_REQUEST_TYPE_BROWSE") {
+                    return None;
+                }
+                command
+                    .get("continuationCommand")
+                    .and_then(|value| value.get("token"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+        })
+}
+
+fn continuation_token_from_shelf_contents(contents: &[Value]) -> Option<String> {
+    let last = contents.last()?;
+    continuation_token_from_item(last)
+}
+
+fn shelf_continuation_token(shelf: &Value) -> Option<String> {
+    shelf
+        .get("continuations")
+        .and_then(Value::as_array)
+        .and_then(|arr| arr.first())
+        .and_then(|c| c.get("nextContinuationData"))
+        .and_then(|c| c.get("continuation"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .or_else(|| {
+            shelf
+                .get("contents")
+                .and_then(Value::as_array)
+                .and_then(|contents| continuation_token_from_shelf_contents(contents.as_slice()))
+        })
+        .or_else(|| find_continuation_token(shelf))
+}
+
+fn parse_shelf_continuation_items(response: &Value) -> Option<Vec<Value>> {
+    if let Some(actions) = response.get("onResponseReceivedActions").and_then(Value::as_array) {
+        for action in actions {
+            if let Some(items) = action
+                .get("appendContinuationItemsAction")
+                .and_then(|value| value.get("continuationItems"))
+                .and_then(Value::as_array)
+            {
+                if !items.is_empty() {
+                    return Some(items.to_vec());
                 }
             }
         }
     }
 
-    None
+    response
+        .get("continuationContents")
+        .and_then(|contents| {
+            contents
+                .get("musicShelfContinuation")
+                .or(contents.get("musicPlaylistShelfContinuation"))
+        })
+        .and_then(|shelf| shelf.get("contents").or_else(|| shelf.get("items")))
+        .and_then(Value::as_array)
+        .map(|items| items.to_vec())
+}
+
+fn continuation_token_from_continuation_response(response: &Value) -> Option<String> {
+    if let Some(items) = response
+        .get("onResponseReceivedActions")
+        .and_then(Value::as_array)
+        .and_then(|actions| actions.first())
+        .and_then(|action| action.get("appendContinuationItemsAction"))
+        .and_then(|action| action.get("continuationItems"))
+        .and_then(Value::as_array)
+    {
+        if let Some(token) = continuation_token_from_shelf_contents(items) {
+            return Some(token);
+        }
+    }
+
+    response
+        .get("continuationContents")
+        .and_then(|contents| {
+            contents
+                .get("musicShelfContinuation")
+                .or(contents.get("musicPlaylistShelfContinuation"))
+        })
+        .and_then(shelf_continuation_token)
+}
+
+fn extract_top_songs_continuation(value: &Value) -> Option<String> {
+    let sections = artist_overview_sections(value)?;
+    let shelf = top_songs_shelf(sections)?;
+    shelf_continuation_token(shelf)
+}
+
+fn top_songs_playlist_browse_id(shelf: &Value) -> Option<String> {
+    if let Some(browse_id) = as_str_path(
+        shelf,
+        &["bottomEndpoint", "browseEndpoint", "browseId"],
+    ) {
+        return Some(browse_id.to_string());
+    }
+
+    if let Some(runs) = shelf
+        .get("title")
+        .and_then(|title| title.get("runs"))
+        .and_then(Value::as_array)
+    {
+        for run in runs {
+            if let Some(browse_id) =
+                as_str_path(run, &["navigationEndpoint", "browseEndpoint", "browseId"])
+            {
+                return Some(browse_id.to_string());
+            }
+        }
+    }
+
+    if let Some(header) = shelf.get("header") {
+        let header_renderer = header
+            .get("musicShelfHeaderRenderer")
+            .or_else(|| header.get("musicPlaylistShelfHeaderRenderer"))?;
+
+        if let Some(runs) = header_renderer
+            .get("title")
+            .and_then(|title| title.get("runs"))
+            .and_then(Value::as_array)
+        {
+            for run in runs {
+                if let Some(browse_id) =
+                    as_str_path(run, &["navigationEndpoint", "browseEndpoint", "browseId"])
+                {
+                    return Some(browse_id.to_string());
+                }
+            }
+        }
+
+        if let Some(buttons) = header_renderer.get("buttons").and_then(Value::as_array) {
+            for button in buttons {
+                for path in [
+                    &["buttonRenderer", "navigationEndpoint", "browseEndpoint", "browseId"][..],
+                    &[
+                        "musicPlayButtonRenderer",
+                        "playNavigationEndpoint",
+                        "watchPlaylistEndpoint",
+                        "playlistId",
+                    ][..],
+                ] {
+                    if let Some(id) = as_str_path(button, path) {
+                        let browse_id = if path.last() == Some(&"playlistId") {
+                            format!("VL{id}")
+                        } else {
+                            id.to_string()
+                        };
+                        return Some(browse_id);
+                    }
+                }
+            }
+        }
+    }
+
+    as_str_path(
+        shelf,
+        &["bottomText", "runs", "0", "navigationEndpoint", "browseEndpoint", "browseId"],
+    )
+    .map(str::to_string)
+}
+
+fn find_track_shelf_in_browse_response(value: &Value) -> Option<&Value> {
+    if let Some(sections) = value
+        .get("contents")
+        .and_then(|contents| contents.get("twoColumnBrowseResultsRenderer"))
+        .and_then(|renderer| renderer.get("secondaryContents"))
+        .and_then(|secondary| secondary.get("sectionListRenderer"))
+        .and_then(|section_list| section_list.get("contents"))
+        .and_then(Value::as_array)
+    {
+        for section in sections {
+            if let Some(shelf) = section
+                .get("musicPlaylistShelfRenderer")
+                .or_else(|| section.get("musicShelfRenderer"))
+            {
+                if shelf
+                    .get("contents")
+                    .and_then(Value::as_array)
+                    .is_some_and(|items| !items.is_empty())
+                {
+                    return Some(shelf);
+                }
+            }
+        }
+    }
+
+    if let Some(sections) = value
+        .get("contents")
+        .and_then(|contents| contents.get("twoColumnBrowseResultsRenderer"))
+        .and_then(|renderer| renderer.get("tabs"))
+        .and_then(Value::as_array)
+        .and_then(|tabs| tabs.first())
+        .and_then(|tab| tab.get("tabRenderer"))
+        .and_then(|tab_renderer| tab_renderer.get("content"))
+        .and_then(|content| content.get("sectionListRenderer"))
+        .and_then(|section_list| section_list.get("contents"))
+        .and_then(Value::as_array)
+    {
+        for section in sections {
+            if let Some(shelf) = section
+                .get("musicPlaylistShelfRenderer")
+                .or_else(|| section.get("musicShelfRenderer"))
+            {
+                if shelf
+                    .get("contents")
+                    .and_then(Value::as_array)
+                    .is_some_and(|items| !items.is_empty())
+                {
+                    return Some(shelf);
+                }
+            }
+        }
+    }
+
+    artist_overview_sections(value).and_then(top_songs_shelf)
+}
+
+fn parse_tracks_from_shelf_items(
+    items: &[Value],
+    artist: &str,
+    cover: Option<&str>,
+) -> Vec<MediaTrack> {
+    items
+        .iter()
+        .filter_map(|item| parse_track(item, None, Some(artist), cover))
+        .collect()
+}
+
+fn parse_playlist_tracks_from_shelf_items(
+    items: &[Value],
+    playlist_title: &str,
+    fallback_artist: Option<&str>,
+    cover: Option<&str>,
+) -> Vec<MediaTrack> {
+    items
+        .iter()
+        .filter_map(|item| parse_track(item, Some(playlist_title), fallback_artist, cover))
+        .collect()
+}
+
+fn merge_playlist_tracks(tracks: &mut Vec<MediaTrack>, extra: Vec<MediaTrack>, limit: usize) {
+    let mut seen = tracks
+        .iter()
+        .map(|track| track_identity_key(track))
+        .collect::<std::collections::HashSet<_>>();
+    for track in extra {
+        if tracks.len() >= limit {
+            break;
+        }
+        let key = track_identity_key(&track);
+        if seen.insert(key) {
+            tracks.push(track);
+        }
+    }
+}
+
+async fn fetch_playlist_shelf_tracks_with_continuations(
+    state: &State<'_, AppState>,
+    shelf: &Value,
+    playlist_title: &str,
+    fallback_artist: Option<&str>,
+    cover: Option<&str>,
+    limit: usize,
+) -> Result<Vec<MediaTrack>, String> {
+    let mut tracks = shelf
+        .get("contents")
+        .and_then(Value::as_array)
+        .map(|items| {
+            parse_playlist_tracks_from_shelf_items(items, playlist_title, fallback_artist, cover)
+        })
+        .unwrap_or_default();
+    tracks.truncate(limit);
+    if tracks.len() >= limit {
+        return Ok(tracks);
+    }
+
+    let mut continuation_token = shelf_continuation_token(shelf);
+    while let Some(token) = continuation_token {
+        if tracks.len() >= limit {
+            break;
+        }
+
+        let cont_response = post_ytmusic_continuation(state, &token).await?;
+        let Some(items) = parse_shelf_continuation_items(&cont_response) else {
+            break;
+        };
+
+        let batch =
+            parse_playlist_tracks_from_shelf_items(&items, playlist_title, fallback_artist, cover);
+        if batch.is_empty() {
+            break;
+        }
+
+        merge_playlist_tracks(&mut tracks, batch, limit);
+        continuation_token = continuation_token_from_shelf_contents(&items)
+            .or_else(|| continuation_token_from_continuation_response(&cont_response));
+    }
+
+    Ok(tracks)
+}
+
+fn merge_top_songs(tracks: &mut Vec<MediaTrack>, extra: Vec<MediaTrack>, limit: usize) {
+    let mut seen = tracks
+        .iter()
+        .map(|track| track_identity_key(track))
+        .collect::<std::collections::HashSet<_>>();
+    for track in extra {
+        if tracks.len() >= limit {
+            break;
+        }
+        let key = track_identity_key(&track);
+        if seen.insert(key) {
+            tracks.push(track);
+        }
+    }
+}
+
+fn track_identity_key(track: &MediaTrack) -> String {
+    track
+        .video_id
+        .as_deref()
+        .or(Some(track.id.as_str()))
+        .unwrap_or("")
+        .to_string()
+}
+
+async fn fetch_shelf_tracks_with_continuations(
+    state: &State<'_, AppState>,
+    shelf: &Value,
+    artist: &str,
+    cover: Option<&str>,
+    limit: usize,
+) -> Result<Vec<MediaTrack>, String> {
+    let mut tracks = shelf
+        .get("contents")
+        .and_then(Value::as_array)
+        .map(|items| parse_tracks_from_shelf_items(items, artist, cover))
+        .unwrap_or_default();
+    tracks.truncate(limit);
+    if tracks.len() >= limit {
+        return Ok(tracks);
+    }
+
+    let mut continuation_token = shelf_continuation_token(shelf);
+    while let Some(token) = continuation_token {
+        if tracks.len() >= limit {
+            break;
+        }
+
+        let cont_response = post_ytmusic_continuation(state, &token).await?;
+        let Some(items) = parse_shelf_continuation_items(&cont_response) else {
+            break;
+        };
+
+        let batch = parse_tracks_from_shelf_items(&items, artist, cover);
+        if batch.is_empty() {
+            break;
+        }
+
+        merge_top_songs(&mut tracks, batch, limit);
+        continuation_token = continuation_token_from_shelf_contents(&items)
+            .or_else(|| continuation_token_from_continuation_response(&cont_response));
+    }
+
+    Ok(tracks)
 }
 
 fn find_continuation_token(value: &Value) -> Option<String> {
@@ -5677,17 +6884,7 @@ fn parse_artist_detail(browse_id: &str, value: &Value) -> Result<ArtistDetail, S
         .and_then(|value| value.get("musicImmersiveHeaderRenderer"))
         .ok_or_else(|| "This artist page did not contain a header.".to_string())?;
 
-    let sections = value
-        .get("contents")
-        .and_then(|value| value.get("singleColumnBrowseResultsRenderer"))
-        .and_then(|value| value.get("tabs"))
-        .and_then(Value::as_array)
-        .and_then(|tabs| tabs.first())
-        .and_then(|value| value.get("tabRenderer"))
-        .and_then(|value| value.get("content"))
-        .and_then(|value| value.get("sectionListRenderer"))
-        .and_then(|value| value.get("contents"))
-        .and_then(Value::as_array)
+    let sections = artist_overview_sections(value)
         .ok_or_else(|| "This artist page did not contain sections.".to_string())?;
 
     let title = text_from_value(
@@ -5703,50 +6900,7 @@ fn parse_artist_detail(browse_id: &str, value: &Value) -> Result<ArtistDetail, S
     let description = header.get("description").and_then(text_from_value);
     let monthly_listeners = header.get("monthlyListenerCount").and_then(text_from_value);
 
-    let mut best_index: Option<usize> = None;
-    let mut fallback_index: Option<usize> = None;
-
-    for (index, section) in sections.iter().enumerate() {
-        let shelf = if let Some(s) = section.get("musicShelfRenderer") {
-            s
-        } else if let Some(s) = section.get("musicPlaylistShelfRenderer") {
-            s
-        } else {
-            continue;
-        };
-
-        if fallback_index.is_none() {
-            fallback_index = Some(index);
-        }
-
-        let section_title = shelf
-            .get("header")
-            .and_then(|h| {
-                h.get("musicShelfHeaderRenderer")
-                    .or(h.get("musicPlaylistShelfHeaderRenderer"))
-            })
-            .and_then(|h| h.get("title"))
-            .and_then(text_from_value);
-
-        if let Some(t) = section_title {
-            let lower = t.to_lowercase();
-            if (lower.contains("top") && lower.contains("song"))
-                || lower == "songs"
-                || lower.contains("popular")
-            {
-                best_index = Some(index);
-                break;
-            }
-        }
-    }
-
-    let top_songs = best_index
-        .or(fallback_index)
-        .and_then(|idx| {
-            sections[idx]
-                .get("musicShelfRenderer")
-                .or(sections[idx].get("musicPlaylistShelfRenderer"))
-        })
+    let top_songs = top_songs_shelf(sections)
         .and_then(|shelf| shelf.get("contents"))
         .and_then(Value::as_array)
         .map(|items| {
@@ -5771,6 +6925,7 @@ fn parse_artist_detail(browse_id: &str, value: &Value) -> Result<ArtistDetail, S
         banner,
         monthly_listeners,
         top_songs,
+        top_songs_has_more: false,
         shelves,
     })
 }
@@ -6195,6 +7350,13 @@ fn parse_track(
     let parsed_runs = col1_text
         .map(extract_run_meta_from_runs)
         .unwrap_or_default();
+    if parsed_runs
+        .type_label
+        .as_deref()
+        .is_some_and(is_excluded_type_label)
+    {
+        return None;
+    }
     let artist = parsed_runs.artist_text.unwrap_or_else(|| {
         let meta = flex.get(1).cloned().unwrap_or_default();
         let parts = split_bullets_fixed(&meta);
@@ -6248,7 +7410,7 @@ fn parse_track(
             .type_label
             .map(|value| value.trim().to_ascii_lowercase())
             .filter(|value| !value.is_empty())
-            .filter(|value| value != "episode" && value != "podcast"),
+            .filter(|value| !is_excluded_type_label(value)),
         title,
         artist,
         album: album.map(str::to_string),
@@ -6300,17 +7462,6 @@ fn normalize_menu_text(value: &str) -> String {
         .to_ascii_lowercase()
 }
 
-fn normalize_lookup_text(value: &str) -> String {
-    value
-        .chars()
-        .flat_map(|ch| ch.to_lowercase())
-        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { ' ' })
-        .collect::<String>()
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
 fn text_from_value(value: &Value) -> Option<String> {
     if let Some(text) = value.as_str() {
         return Some(text.to_string());
@@ -6346,8 +7497,16 @@ fn split_bullets(value: &str) -> Vec<String> {
         .collect()
 }
 
+fn is_excluded_type_label(label: &str) -> bool {
+    matches!(
+        label.trim().to_ascii_lowercase().as_str(),
+        "episode" | "podcast" | "mix"
+    )
+}
+
 fn normalize_kind(label: Option<&str>, has_browse: bool, has_video: bool) -> String {
     match label.map(|value| value.to_lowercase()) {
+        Some(label) if is_excluded_type_label(&label) => "unknown".to_string(),
         Some(label) if label == "artist" => "artist".to_string(),
         Some(label) if label == "album" || label == "single" || label == "ep" => {
             "album".to_string()
@@ -6392,6 +7551,7 @@ fn is_type_label(value: &str) -> bool {
             | "playlist"
             | "podcast"
             | "episode"
+            | "mix"
             | "video"
     )
 }
@@ -6806,848 +7966,6 @@ fn watch_next_payload(video_id: &str, playlist_id: Option<&str>) -> Value {
     payload
 }
 
-fn normalize_query_text(text: &str) -> String {
-    let mut s = String::with_capacity(text.len());
-    let mut depth: u32 = 0;
-    for ch in text.chars() {
-        match ch {
-            '(' | '[' => depth += 1,
-            ')' | ']' => {
-                if depth > 0 {
-                    depth -= 1;
-                }
-            }
-            _ if depth == 0 => {
-                s.push(ch.to_ascii_lowercase());
-            }
-            _ => {}
-        }
-    }
-    let trimmed = s.trim();
-    let mut result = String::with_capacity(trimmed.len());
-    let mut prev_space = false;
-    for ch in trimmed.chars() {
-        if ch.is_ascii_whitespace() || ch == '_' || ch == '-' {
-            if !prev_space {
-                result.push(' ');
-                prev_space = true;
-            }
-        } else if ch.is_alphanumeric() {
-            result.push(ch);
-            prev_space = false;
-        }
-    }
-    result.trim().to_string()
-}
-
-fn titles_match(a: &str, b: &str) -> bool {
-    let na = normalize_query_text(a);
-    let nb = normalize_query_text(b);
-    if na.is_empty() || nb.is_empty() {
-        return false;
-    }
-    na == nb || na.contains(&nb) || nb.contains(&na)
-}
-
-fn score_lyrics(lines: &[TimedLyricLine], track_duration_secs: Option<u32>) -> u32 {
-    let n = lines.len();
-    if n < 2 {
-        return 0;
-    }
-
-    let mut score: u32 = 40;
-
-    if n >= 8 {
-        score += 5;
-    }
-    if n >= 16 {
-        score += 5;
-    }
-    if n >= 30 {
-        score += 5;
-    }
-
-    let first_ms = lines[0].start_time_ms;
-    if first_ms <= 2000 {
-        score += 10;
-    } else if first_ms <= 5000 {
-        score += 5;
-    } else if first_ms > 30_000 {
-        score = score.saturating_sub(20);
-    } else {
-        score = score.saturating_sub(8);
-    }
-
-    let last_ms = lines[n - 1].start_time_ms;
-    if let Some(dur_s) = track_duration_secs {
-        let dur_ms = dur_s * 1000;
-        if dur_ms > 0 {
-            let ratio = last_ms as f64 / dur_ms as f64;
-            if ratio >= 0.80 && ratio <= 1.20 {
-                score += 15;
-            } else if ratio >= 0.55 && ratio <= 1.40 {
-                score += 5;
-            } else {
-                score = score.saturating_sub(20);
-            }
-        }
-    }
-
-    let mut monotonic = true;
-    let mut gap_penalty: u32 = 0;
-    for w in lines.windows(2) {
-        let a = w[0].start_time_ms;
-        let b = w[1].start_time_ms;
-        if b < a {
-            monotonic = false;
-        } else {
-            let gap = b - a;
-            if gap > 30_000 {
-                gap_penalty += 3;
-            } else if gap > 15_000 {
-                gap_penalty += 1;
-            }
-        }
-    }
-    if monotonic {
-        score += 10;
-    } else {
-        score = score.saturating_sub(25);
-    }
-    score = score.saturating_sub(gap_penalty.min(20));
-
-    if lines.iter().any(|l| l.words.is_some()) {
-        score += 15;
-    }
-
-    score.min(100)
-}
-
-fn validate_lyrics(lines: &[TimedLyricLine], track_duration_secs: Option<u32>) -> bool {
-    score_lyrics(lines, track_duration_secs) >= 25
-}
-
-fn parse_lrc(lrc: &str) -> Vec<TimedLyricLine> {
-    let mut offset_ms: i64 = 0;
-    let mut entries: Vec<(u32, String)> = Vec::new();
-
-    for raw in lrc.lines() {
-        let line = raw.trim();
-        if line.is_empty() {
-            continue;
-        }
-
-        // Global offset tag: `[offset:±N]` (milliseconds).
-        if let Some(rest) = line.strip_prefix("[offset:") {
-            if let Some(inner) = rest.strip_suffix(']') {
-                if let Ok(value) = inner.trim().parse::<i64>() {
-                    offset_ms = value;
-                }
-            }
-            continue;
-        }
-
-        // Consume every leading [mm:ss.xx] timestamp so multi-timestamp lines
-        // (`[00:12.34][00:45.00]text`) emit one entry per cue.
-        let mut rest = line;
-        let mut timestamps: Vec<u32> = Vec::new();
-        while let Some(captures) = LRC_TIMESTAMP_RE.captures(rest) {
-            let minutes: u32 = captures[1].parse().unwrap_or(0);
-            let seconds: u32 = captures[2].parse().unwrap_or(0);
-            let frac_ms: u32 = captures
-                .get(3)
-                .map(|match_| {
-                    let digits = match_.as_str();
-                    let padded = format!("{:0<3}", digits);
-                    padded[..3].parse().unwrap_or(0)
-                })
-                .unwrap_or(0);
-            timestamps.push(minutes * 60_000 + seconds * 1000 + frac_ms);
-            rest = &rest[captures[0].len()..];
-        }
-
-        if timestamps.is_empty() {
-            continue;
-        }
-        let text = rest.trim().to_string();
-        if text.is_empty() || is_lrc_metadata_line(&text) {
-            continue;
-        }
-        for timestamp in timestamps {
-            entries.push((timestamp, text.clone()));
-        }
-    }
-
-    if entries.is_empty() {
-        return Vec::new();
-    }
-    entries.sort_by_key(|(ms, _)| *ms);
-
-    let mut lines = Vec::with_capacity(entries.len());
-    for (index, (start, text)) in entries.iter().enumerate() {
-        let start_ms = apply_lrc_offset(*start, offset_ms);
-        let end_ms = entries
-            .get(index + 1)
-            .map(|(next_start, _)| apply_lrc_offset(*next_start, offset_ms))
-            .filter(|end| *end > start_ms);
-        lines.push(TimedLyricLine {
-            id: start_ms,
-            text: text.clone(),
-            start_time_ms: start_ms,
-            end_time_ms: end_ms,
-            words: None,
-        });
-    }
-    lines
-}
-
-fn apply_lrc_offset(ms: u32, offset_ms: i64) -> u32 {
-    (ms as i64 + offset_ms).max(0) as u32
-}
-
-fn is_lrc_metadata_line(text: &str) -> bool {
-    static METADATA_RE: once_cell::sync::Lazy<regex::Regex> =
-        once_cell::sync::Lazy::new(|| regex::Regex::new("^[一-龥][一-龥\\s]*:").unwrap());
-    METADATA_RE.is_match(text)
-}
-
-fn build_lyrics_from_lrc(lrc: &str, source: &str) -> Option<SyncedLyricsResponse> {
-    let lines = parse_lrc(lrc);
-    if lines.is_empty() {
-        return None;
-    }
-    Some(SyncedLyricsResponse {
-        lines,
-        source: Some(source.to_string()),
-        has_per_word_sync: Some(false),
-    })
-}
-
-const MUSIXMATCH_SOURCE: &str = "Lyrics from Musixmatch";
-
-async fn fetch_musixmatch_token(state: &State<'_, AppState>) -> Option<(String, String)> {
-    // Check cached token first.
-    {
-        let cache = state.musixmatch_token.lock().await;
-        if let Some(ref cached) = *cache {
-            if Instant::now() < cached.expires_at {
-                return Some((cached.token.clone(), cached.cookies.clone()));
-            }
-        }
-    }
-
-    // The Musixmatch desktop API returns a 301 with Set-Cookie headers on
-    // the first call. We must follow the redirect manually (like a browser),
-    // passing accumulated cookies on each retry, until we get a non-301
-    // JSON response containing the user_token.
-    let mut cookies: Vec<String> = Vec::new();
-
-    for _attempt in 0..3 {
-        let mut req = HTTP_NO_REDIRECT
-            .get("https://apic-desktop.musixmatch.com/ws/1.1/token.get")
-            .query(&[
-                ("user_language", "en"),
-                ("app_id", MUSIXMATCH_APP_ID),
-            ])
-            .timeout(LYRIC_PROVIDER_TIMEOUT);
-        if !cookies.is_empty() {
-            let cookie_str = cookies.join("; ");
-            req = req.header("cookie", &cookie_str);
-        }
-        let resp = req.send().await.ok()?;
-
-        if resp.status().as_u16() == 301 {
-            for set_cookie in resp.headers().get_all("set-cookie").iter() {
-                if let Ok(val) = set_cookie.to_str() {
-                    if let Some(name_value) = val.split(';').next() {
-                        let nv = name_value.trim().to_string();
-                        if nv.ends_with("=unknown") {
-                            continue;
-                        }
-                        cookies.push(nv);
-                    }
-                }
-            }
-            continue;
-        }
-
-        // Non-301: parse the JSON response.
-        let json: Value = resp.json().await.ok()?;
-        let status = json
-            .pointer("/message/header/status_code")
-            .and_then(Value::as_i64)?;
-
-        if status == 401 {
-            return None;
-        }
-        if status != 200 {
-            return None;
-        }
-
-        let token = json
-            .pointer("/message/body/user_token")
-            .and_then(Value::as_str)?
-            .to_string();
-        let cookie_header = cookies.join("; ");
-
-        // Cache for 9 minutes (token expires in 10).
-        {
-            let mut cache = state.musixmatch_token.lock().await;
-            *cache = Some(MusixmatchTokenCache {
-                token: token.clone(),
-                cookies: cookie_header.clone(),
-                expires_at: Instant::now() + Duration::from_secs(540),
-            });
-        }
-
-        return Some((token, cookie_header));
-    }
-
-    None
-}
-
-async fn fetch_musixmatch_lyrics(
-    state: &State<'_, AppState>,
-    track: &LyricTrack,
-) -> Option<SyncedLyricsResponse> {
-    let (token, cookies) = fetch_musixmatch_token(state).await?;
-
-    let client = &HTTP;
-
-    // Search for the track.
-    let mut search_params: Vec<(&str, &str)> = vec![
-        ("app_id", MUSIXMATCH_APP_ID),
-        ("usertoken", &token),
-        ("q_track", &track.title),
-        ("q_artist", &track.artist),
-        ("page_size", "5"),
-        ("page", "1"),
-    ];
-    let duration_str;
-    if let Some(dur) = track.duration_seconds {
-        duration_str = dur.to_string();
-        search_params.push(("q_duration", &duration_str));
-    }
-
-    let search_resp = client
-        .get("https://apic-desktop.musixmatch.com/ws/1.1/track.search")
-        .query(&search_params)
-        .header("cookie", &cookies)
-        .timeout(LYRIC_PROVIDER_TIMEOUT)
-        .send()
-        .await
-        .ok()?;
-
-    let search_json: Value = search_resp.json().await.ok()?;
-    let track_list = search_json
-        .pointer("/message/body/track_list")
-        .and_then(Value::as_array)?;
-
-    let track_duration = track.duration_seconds.map(|s| s as i64);
-
-    let mut scored: Vec<(i64, &Value)> = track_list
-        .iter()
-        .filter_map(|entry| {
-            let track_name = entry
-                .pointer("/track/track_name")
-                .and_then(Value::as_str)
-                .unwrap_or("");
-            let artist_name = entry
-                .pointer("/track/artist_name")
-                .and_then(Value::as_str)
-                .unwrap_or("");
-            let has_richsync = entry
-                .pointer("/track/has_richsync")
-                .and_then(Value::as_i64)
-                .unwrap_or(0);
-            let entry_duration = entry
-                .pointer("/track/track_length")
-                .and_then(Value::as_i64)
-                .unwrap_or(0);
-
-            let mut score: i64 = 0;
-
-            let nt = normalize_query_text(track_name);
-            let nt_target = normalize_query_text(&track.title);
-            if nt == nt_target {
-                score += 50;
-            } else if !nt.is_empty()
-                && !nt_target.is_empty()
-                && (nt.contains(&nt_target) || nt_target.contains(&nt))
-            {
-                score += 20;
-            }
-
-            let na = normalize_query_text(artist_name);
-            let na_target = normalize_query_text(&track.artist);
-            if na == na_target {
-                score += 30;
-            } else if !na.is_empty()
-                && !na_target.is_empty()
-                && (na.contains(&na_target) || na_target.contains(&na))
-            {
-                score += 10;
-            }
-
-            if let Some(td) = track_duration {
-                let delta = (entry_duration - td).abs();
-                if delta <= 5 {
-                    score += 20;
-                } else if delta <= 15 {
-                    score += 10;
-                } else if delta <= 30 {
-                    score += 5;
-                }
-            }
-
-            if has_richsync == 1 {
-                score += 40;
-            }
-
-            if score >= 30 {
-                Some((score, entry))
-            } else {
-                None
-            }
-        })
-        .collect();
-
-    scored.sort_by_key(|(s, _)| -*s);
-
-    let matched = scored
-        .first()
-        .filter(|(_, entry)| {
-            entry
-                .pointer("/track/has_richsync")
-                .and_then(Value::as_i64)
-                == Some(1)
-        })
-        .map(|(_, entry)| *entry)?;
-
-    let track_id = matched
-        .pointer("/track/track_id")
-        .and_then(Value::as_i64)?;
-
-    // Fetch richsync (word-level lyrics).
-    let richsync_resp = client
-        .get("https://apic-desktop.musixmatch.com/ws/1.1/track.richsync.get")
-        .query(&[
-            ("app_id", MUSIXMATCH_APP_ID),
-            ("usertoken", &token),
-            ("track_id", &track_id.to_string()),
-        ])
-        .header("cookie", &cookies)
-        .timeout(LYRIC_PROVIDER_TIMEOUT)
-        .send()
-        .await
-        .ok()?;
-
-    let richsync_json: Value = richsync_resp.json().await.ok()?;
-    let status = richsync_json
-        .pointer("/message/header/status_code")
-        .and_then(Value::as_i64)?;
-    if status != 200 {
-        return None;
-    }
-
-    let richsync_body_str = richsync_json
-        .pointer("/message/body/richsync/richsync_body")
-        .and_then(Value::as_str)?;
-
-    // The richsync_body is a JSON string that needs to be parsed.
-    let richsync_body: Value = serde_json::from_str(richsync_body_str).ok()?;
-    let lines_array = richsync_body.as_array()?;
-
-    let mut lines = Vec::new();
-    for (_line_idx, line_entry) in lines_array.iter().enumerate() {
-        let ts = line_entry.get("ts").and_then(Value::as_f64).unwrap_or(0.0);
-        let te = line_entry.get("te").and_then(Value::as_f64).unwrap_or(0.0);
-        let text = line_entry
-            .get("x")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
-        let words_data = line_entry.get("l").and_then(Value::as_array);
-
-        let line_start_ms = (ts * 1000.0) as u32;
-        let line_end_ms = (te * 1000.0) as u32;
-
-        // If there's word-level data, build TimedLyricWords.
-        let words = words_data.and_then(|word_entries| {
-            let mut words = Vec::new();
-            for (word_idx, word_entry) in word_entries.iter().enumerate() {
-                let c = word_entry
-                    .get("c")
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
-                let o = word_entry.get("o").and_then(Value::as_f64).unwrap_or(0.0);
-                let offset_ms = (o * 1000.0) as u32;
-
-                // Word end time is the next word's offset, or the line end time.
-                let next_offset_ms = word_entries
-                    .get(word_idx + 1)
-                    .and_then(|w| w.get("o"))
-                    .and_then(Value::as_f64)
-                    .map(|o| (o * 1000.0) as u32)
-                    .unwrap_or(line_end_ms - line_start_ms);
-
-                if !c.is_empty() {
-                    words.push(TimedLyricWord {
-                        text: c.to_string(),
-                        start_time_ms: line_start_ms + offset_ms,
-                        end_time_ms: line_start_ms + next_offset_ms,
-                    });
-                }
-            }
-            if words.is_empty() {
-                None
-            } else {
-                Some(words)
-            }
-        });
-
-        if text.trim().is_empty() {
-            continue;
-        }
-
-        lines.push(TimedLyricLine {
-            id: line_start_ms,
-            text,
-            start_time_ms: line_start_ms,
-            end_time_ms: Some(line_end_ms),
-            words,
-        });
-    }
-
-    if lines.is_empty() {
-        return None;
-    }
-
-    Some(SyncedLyricsResponse {
-        lines,
-        source: Some(MUSIXMATCH_SOURCE.to_string()),
-        has_per_word_sync: Some(true),
-    })
-}
-
-const LRCLIB_SOURCE: &str = "Lyrics from LRCLIB";
-const KUGOU_SOURCE: &str = "Lyrics from Kugou";
-const QQ_MUSIC_SOURCE: &str = "Lyrics from QQ Music";
-const NETEASE_SOURCE: &str = "Lyrics from NetEase Cloud Music";
-
-async fn fetch_lrclib_lyrics(track: &LyricTrack) -> Option<SyncedLyricsResponse> {
-    let mut params: Vec<(&str, String)> = vec![
-        ("artist_name", track.artist.clone()),
-        ("track_name", track.title.clone()),
-    ];
-    if let Some(album) = track.album.as_ref().filter(|album| !album.trim().is_empty()) {
-        params.push(("album_name", album.clone()));
-    }
-    if let Some(duration) = track.duration_seconds {
-        params.push(("duration", duration.to_string()));
-    }
-
-    // /api/get returns a single exact-ish match; /api/search is the fuzzy
-    // fallback when the precise query misses.
-    if let Some(lyrics) = fetch_lrclib_get(&params).await {
-        return Some(lyrics);
-    }
-    fetch_lrclib_search(track).await
-}
-
-async fn fetch_lrclib_get(params: &[(&str, String)]) -> Option<SyncedLyricsResponse> {
-    let response = HTTP
-        .get("https://lrclib.net/api/get")
-        .query(params)
-        .timeout(LYRIC_PROVIDER_TIMEOUT)
-        .send()
-        .await
-        .ok()?;
-    if !response.status().is_success() {
-        return None;
-    }
-    let json: Value = response.json().await.ok()?;
-    parse_lrclib_entry(&json)
-}
-
-async fn fetch_lrclib_search(track: &LyricTrack) -> Option<SyncedLyricsResponse> {
-    let params: Vec<(&str, String)> = vec![
-        ("artist_name", track.artist.clone()),
-        ("track_name", track.title.clone()),
-    ];
-    let response = HTTP
-        .get("https://lrclib.net/api/search")
-        .query(&params)
-        .timeout(LYRIC_PROVIDER_TIMEOUT)
-        .send()
-        .await
-        .ok()?;
-    if !response.status().is_success() {
-        return None;
-    }
-    let results: Vec<Value> = response.json().await.ok()?;
-    pick_best_lrclib_match(&results, track)
-}
-
-fn pick_best_lrclib_match(results: &[Value], track: &LyricTrack) -> Option<SyncedLyricsResponse> {
-    let mut candidates: Vec<(u32, SyncedLyricsResponse)> = results
-        .iter()
-        .filter_map(|entry| {
-            let synced = entry.get("syncedLyrics").and_then(Value::as_str)?;
-            if synced.trim().is_empty() {
-                return None;
-            }
-            let lines = parse_lrc(synced);
-            if lines.is_empty() {
-                return None;
-            }
-            let mut score = score_lyrics(&lines, track.duration_seconds);
-
-            let entry_duration = entry.get("duration").and_then(Value::as_f64).unwrap_or(0.0);
-            if let Some(td) = track.duration_seconds {
-                let delta = ((entry_duration as i64) - (td as i64)).abs();
-                if delta <= 3 {
-                    score += 10;
-                } else if delta <= 10 {
-                    score += 5;
-                } else if delta > 60 {
-                    score = score.saturating_sub(15);
-                }
-            }
-
-            let entry_title = entry.get("trackName").and_then(Value::as_str).unwrap_or("");
-            if !entry_title.is_empty() && !titles_match(entry_title, &track.title) {
-                score = score.saturating_sub(15);
-            }
-
-            if score >= 25 {
-                Some((
-                    score,
-                    SyncedLyricsResponse {
-                        lines,
-                        source: Some(LRCLIB_SOURCE.to_string()),
-                        has_per_word_sync: Some(false),
-                    },
-                ))
-            } else {
-                None
-            }
-        })
-        .collect();
-
-    candidates.sort_by_key(|(s, _)| -(i32::try_from(*s).unwrap_or(0)));
-    candidates.into_iter().next().map(|(_, lyrics)| lyrics)
-}
-
-fn parse_lrclib_entry(value: &Value) -> Option<SyncedLyricsResponse> {
-    let synced = value.get("syncedLyrics").and_then(Value::as_str)?;
-    if synced.trim().is_empty() {
-        return None;
-    }
-    build_lyrics_from_lrc(synced, LRCLIB_SOURCE)
-}
-
-async fn fetch_netease_lyrics(track: &LyricTrack) -> Option<SyncedLyricsResponse> {
-    let query = format!("{} {}", track.artist, track.title);
-    let response = HTTP
-        .post("https://music.163.com/api/search/get")
-        .header("Referer", "https://music.163.com")
-        .form(&[
-            ("s", query.as_str()),
-            ("type", "1"),
-            ("offset", "0"),
-            ("limit", "10"),
-        ])
-        .timeout(LYRIC_PROVIDER_TIMEOUT)
-        .send()
-        .await
-        .ok()?;
-    if !response.status().is_success() {
-        return None;
-    }
-    let json: Value = response.json().await.ok()?;
-    let songs = json
-        .get("result")
-        .and_then(|result| result.get("songs"))
-        .and_then(Value::as_array)?;
-    let song_id = pick_netease_song(songs, track)?;
-    fetch_netease_lyrics_by_id(song_id).await
-}
-
-fn pick_netease_song(songs: &[Value], track: &LyricTrack) -> Option<u64> {
-    let mut candidates: Vec<(i64, u64)> = Vec::new();
-    for song in songs {
-        let id = match song.get("id").and_then(Value::as_u64) {
-            Some(value) => value,
-            None => continue,
-        };
-        let name = song.get("name").and_then(Value::as_str).unwrap_or("");
-        if !lyric_name_matches(name, &track.title) {
-            continue;
-        }
-        let duration_ms = song.get("duration").and_then(Value::as_u64).unwrap_or(0);
-        let delta = track
-            .duration_seconds
-            .map(|seconds| ((duration_ms as i64) - (seconds as i64 * 1000)).abs())
-            .unwrap_or(0);
-        candidates.push((delta, id));
-    }
-    candidates.sort_by_key(|(delta, _)| *delta);
-    candidates.first().map(|(_, id)| *id)
-}
-
-async fn fetch_netease_lyrics_by_id(song_id: u64) -> Option<SyncedLyricsResponse> {
-    let url = format!("https://music.163.com/api/song/lyric?id={song_id}&lv=1&tv=-1");
-    let response = HTTP
-        .get(&url)
-        .header("Referer", "https://music.163.com")
-        .timeout(LYRIC_PROVIDER_TIMEOUT)
-        .send()
-        .await
-        .ok()?;
-    if !response.status().is_success() {
-        return None;
-    }
-    let json: Value = response.json().await.ok()?;
-    let lrc = json
-        .get("lrc")
-        .and_then(|value| value.get("lyric"))
-        .and_then(Value::as_str)?;
-    if lrc.trim().is_empty() {
-        return None;
-    }
-    build_lyrics_from_lrc(lrc, NETEASE_SOURCE)
-}
-
-async fn fetch_kugou_lyrics(track: &LyricTrack) -> Option<SyncedLyricsResponse> {
-    let query = format!("{} {}", track.artist, track.title);
-    let search_url = format!(
-        "https://mobilecdn.kugou.com/api/v3/search/song?keyword={}&page=1&pagesize=5",
-        urlencoding::encode(&query),
-    );
-    let response = HTTP
-        .get(&search_url)
-        .header("User-Agent", USER_AGENT)
-        .timeout(LYRIC_PROVIDER_TIMEOUT)
-        .send()
-        .await
-        .ok()?;
-    if !response.status().is_success() {
-        return None;
-    }
-    let json: Value = response.json().await.ok()?;
-    let data = json.get("data")?.get("info")?.as_array()?;
-    let candidate = data.iter().find(|entry| {
-        let song_name = entry.get("songname").and_then(Value::as_str).unwrap_or("");
-        lyric_name_matches(song_name, &track.title)
-    })?;
-    let hash = candidate.get("hash").and_then(Value::as_str)?;
-
-    // Kugou lyrics API requires MD5 of the hash as the accesskey.
-    let hash_bytes = hex::decode(hash).ok()?;
-    let accesskey = {
-        let mut hasher = Md5::new();
-        hasher.update(&hash_bytes);
-        hex::encode(hasher.finalize())
-    };
-
-    let lyrics_url = format!(
-        "https://lyrics.kugou.com/download?ver=1&client=pc&id={}&accesskey={}&fmt=lrc&charset=utf8",
-        hash, accesskey,
-    );
-    let resp = HTTP
-        .get(&lyrics_url)
-        .header("User-Agent", USER_AGENT)
-        .timeout(LYRIC_PROVIDER_TIMEOUT)
-        .send()
-        .await
-        .ok()?;
-    if !resp.status().is_success() {
-        return None;
-    }
-    let json: Value = resp.json().await.ok()?;
-    let status = json.get("status").and_then(Value::as_i64).unwrap_or(0);
-    if status != 200 {
-        return None;
-    }
-    let lrc = json.get("content").and_then(Value::as_str)?;
-    let lrc_decoded = base64_decode(lrc)?;
-    build_lyrics_from_lrc(&lrc_decoded, KUGOU_SOURCE)
-}
-
-fn base64_decode(input: &str) -> Option<String> {
-    use std::io::Read;
-    let decoded = base64::engine::general_purpose::STANDARD
-        .decode(input)
-        .ok()?;
-    let mut decoder = flate2::read::GzDecoder::new(&decoded[..]);
-    let mut output = String::new();
-    decoder.read_to_string(&mut output).ok()?;
-    Some(output)
-}
-
-async fn fetch_qq_music_lyrics(track: &LyricTrack) -> Option<SyncedLyricsResponse> {
-    let query = format!("{} {}", track.artist, track.title);
-    let search_url = format!(
-        "https://c.y.qq.com/splcloud/fcgi-bin/smartbox_new.fcg?key={}&format=json",
-        urlencoding::encode(&query),
-    );
-    let response = HTTP
-        .get(&search_url)
-        .header("Referer", "https://y.qq.com/")
-        .header("User-Agent", USER_AGENT)
-        .timeout(LYRIC_PROVIDER_TIMEOUT)
-        .send()
-        .await
-        .ok()?;
-    if !response.status().is_success() {
-        return None;
-    }
-    let json: Value = response.json().await.ok()?;
-    let songs = json
-        .get("data")
-        .and_then(|d| d.get("song"))
-        .and_then(|s| s.get("list"))
-        .and_then(Value::as_array)?;
-    let song = songs.iter().find(|entry| {
-        let name = entry.get("name").and_then(Value::as_str).unwrap_or("");
-        lyric_name_matches(name, &track.title)
-    })?;
-    let mid = song.get("mid").and_then(Value::as_str)?;
-
-    let lyrics_url = format!(
-        "https://c.y.qq.com/lyric/fcgi-bin/fcg_query_lyric_new.fcg?songmid={}&format=json&nobase64=1",
-        mid,
-    );
-    let resp = HTTP
-        .get(&lyrics_url)
-        .header("Referer", "https://y.qq.com/")
-        .header("User-Agent", USER_AGENT)
-        .timeout(LYRIC_PROVIDER_TIMEOUT)
-        .send()
-        .await
-        .ok()?;
-    if !resp.status().is_success() {
-        return None;
-    }
-    let text = resp.text().await.ok()?;
-    // QQ Music wraps JSON in a callback — strip it if present.
-    let json_str = text
-        .strip_prefix("MusicJsonCallback(")
-        .and_then(|s| s.strip_suffix(')'))
-        .unwrap_or(&text);
-    let json: Value = serde_json::from_str(json_str).ok()?;
-    let lrc = json.get("lyric").and_then(Value::as_str)?;
-    if lrc.trim().is_empty() {
-        return None;
-    }
-    build_lyrics_from_lrc(lrc, QQ_MUSIC_SOURCE)
-}
-
-fn lyric_name_matches(candidate: &str, target: &str) -> bool {
-    titles_match(candidate, target)
-}
-
 fn get_path<'a>(value: &'a Value, path: &[&str]) -> Option<&'a Value> {
     let mut current = value;
     for key in path {
@@ -7655,6 +7973,74 @@ fn get_path<'a>(value: &'a Value, path: &[&str]) -> Option<&'a Value> {
     }
     Some(current)
 }
+
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+fn append_updater_log(app: &AppHandle, message: &str) {
+    use std::io::Write;
+
+    eprintln!("[updater] {message}");
+    if let Ok(dir) = app.path().app_local_data_dir() {
+        let path = dir.join("updater.log");
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            let _ = writeln!(file, "{message}");
+        }
+    }
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+fn spawn_startup_updater(app: &AppHandle) {
+    use tauri_plugin_updater::UpdaterExt;
+
+    let handle = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let current = handle.package_info().version.to_string();
+        let updater = match handle.updater() {
+            Ok(updater) => updater,
+            Err(error) => {
+                append_updater_log(&handle, &format!("failed to initialize updater: {error}"));
+                return;
+            }
+        };
+
+        match updater.check().await {
+            Ok(Some(update)) => {
+                append_updater_log(
+                    &handle,
+                    &format!(
+                        "update available: {current} -> {}",
+                        update.version
+                    ),
+                );
+                match update
+                    .download_and_install(|_chunk, _total| {}, || {})
+                    .await
+                {
+                    Ok(()) => {
+                        append_updater_log(&handle, "update installed; restarting");
+                        // Windows NSIS install exits the process before this returns.
+                        #[cfg(not(target_os = "windows"))]
+                        let _ = handle.restart();
+                    }
+                    Err(error) => {
+                        append_updater_log(
+                            &handle,
+                            &format!("update install failed: {error}"),
+                        );
+                    }
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                append_updater_log(&handle, &format!("update check failed: {error}"));
+            }
+        }
+    });
+}
+
 
 fn main() {
     tauri::Builder::default()
@@ -7671,9 +8057,11 @@ fn main() {
             get_backend_status,
             ensure_streaming_backend,
             search_music,
+            search_suggestions,
             cache_artwork,
             get_entity_detail,
             get_artist_detail,
+            get_artist_top_songs_extended,
             get_watch_playlist,
             resolve_track_album,
             get_synced_lyrics,
@@ -7686,6 +8074,7 @@ fn main() {
             remove_imported_track,
             analyze_loudness,
             analyze_loudness_chunk,
+            detect_leading_silence,
             get_track_duration,
             get_artist_monthly_listeners,
             save_offline,
@@ -7701,10 +8090,44 @@ fn main() {
             write_user_data,
             delete_user_data,
             clear_all_user_data_backend,
-            import_external_playlist
+            import_external_playlist,
+            window_drag::remember_window_bounds,
+            window_drag::is_app_fullscreen,
+            window_drag::toggle_app_fullscreen,
+            discord_presence::sync_discord_presence
         ])
         .setup(|app| {
+            let default_panic_hook = std::panic::take_hook();
+            std::panic::set_hook(Box::new(move |info| {
+                discord_presence::shutdown_discord_presence();
+                default_panic_hook(info);
+            }));
+            window_drag::init(app.handle().clone());
+
+            // Eagerly install the in-memory data store before the
+            // React tree mounts and storage.ts fires its first
+            // IPC call. block_on stalls the main thread for <1ms
+            // (single local JSON read).
+            let store = tauri::async_runtime::block_on(async {
+                data_store::DataStore::init(app.handle()).await
+            })
+            .expect("datastore init failed");
+            data_store::install(store).expect("datastore install failed");
+
+            #[cfg(any(target_os = "windows", target_os = "macos"))]
+            spawn_startup_updater(app.handle());
+
             if let Some(main_window) = app.get_webview_window("main") {
+                if let Err(error) = window_drag::install_drag_hook(&main_window) {
+                    eprintln!("[window_drag] failed to install drag hook: {error}");
+                }
+
+                main_window.on_window_event(|event| {
+                    if matches!(event, tauri::WindowEvent::CloseRequested { .. }) {
+                        discord_presence::shutdown_discord_presence();
+                    }
+                });
+
                 let _ = main_window.with_webview(|webview| {
                     #[cfg(windows)]
                     unsafe {
@@ -7719,8 +8142,19 @@ fn main() {
 
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("failed to run app");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|_app_handle, event| match event {
+            tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit => {
+                discord_presence::shutdown_discord_presence();
+                if let Ok(store) = data_store::current_store() {
+                    tauri::async_runtime::block_on(async {
+                        if let Err(e) = store.flush_blocking().await { eprintln!("[data_store] shutdown flush failed: {e}"); }
+                    });
+                }
+            }
+            _ => {}
+        });
 }
 
 #[cfg(test)]
@@ -7862,6 +8296,41 @@ mod tests {
             ),
             "https://lh3.googleusercontent.com/example=w2880-h1200-p-l90-rj"
         );
+    }
+
+    #[test]
+    fn parse_search_suggestions_reads_history_and_query_suggestions() {
+        let value = json!({
+            "contents": [{
+                "searchSuggestionsSectionRenderer": {
+                    "contents": [
+                        {
+                            "historySuggestionRenderer": {
+                                "navigationEndpoint": {
+                                    "searchEndpoint": { "query": "faded" }
+                                },
+                                "suggestion": { "runs": [{ "text": "fade", "bold": true }, { "text": "d" }] }
+                            }
+                        },
+                        {
+                            "searchSuggestionRenderer": {
+                                "navigationEndpoint": {
+                                    "searchEndpoint": { "query": "faded alan walker" }
+                                },
+                                "suggestion": { "runs": [{ "text": "fade", "bold": true }, { "text": "d alan walker" }] }
+                            }
+                        }
+                    ]
+                }
+            }]
+        });
+
+        let suggestions = parse_search_suggestions(&value);
+        assert_eq!(suggestions.len(), 2);
+        assert_eq!(suggestions[0].text, "faded");
+        assert!(suggestions[0].from_history);
+        assert_eq!(suggestions[1].text, "faded alan walker");
+        assert!(!suggestions[1].from_history);
     }
 
     #[test]
@@ -8323,7 +8792,7 @@ mod tests {
     #[test]
     fn parse_lrc_handles_basic_synced_lines() {
         let lrc = "[00:12.34]First line\n[00:15.67]Second line\n[00:20.00]Third line";
-        let lines = parse_lrc(lrc);
+        let lines = lyrics::parse_lrc(lrc);
         assert_eq!(lines.len(), 3);
         assert_eq!(lines[0].text, "First line");
         assert_eq!(lines[0].start_time_ms, 12_340);
@@ -8336,7 +8805,7 @@ mod tests {
     #[test]
     fn parse_lrc_expands_multi_timestamp_lines() {
         let lrc = "[00:10.00][00:40.00]Repeat me";
-        let lines = parse_lrc(lrc);
+        let lines = lyrics::parse_lrc(lrc);
         assert_eq!(lines.len(), 2);
         assert_eq!(lines[0].text, "Repeat me");
         assert_eq!(lines[0].start_time_ms, 10_000);
@@ -8348,7 +8817,7 @@ mod tests {
     #[test]
     fn parse_lrc_applies_offset_tag_and_skips_metadata() {
         let lrc = "[ti:Song]\n[ar:Artist]\n[offset:+250]\n[00:10.00]Hello\n[00:14.00]World";
-        let lines = parse_lrc(lrc);
+        let lines = lyrics::parse_lrc(lrc);
         assert_eq!(lines.len(), 2);
         assert_eq!(lines[0].start_time_ms, 10_250);
         assert_eq!(lines[1].start_time_ms, 14_250);
@@ -8358,7 +8827,7 @@ mod tests {
     #[test]
     fn parse_lrc_ignores_plain_text_without_timestamps() {
         let lrc = "Plain lyrics line\n[00:05.00]Synced line";
-        let lines = parse_lrc(lrc);
+        let lines = lyrics::parse_lrc(lrc);
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0].text, "Synced line");
         assert_eq!(lines[0].start_time_ms, 5_000);
@@ -8366,15 +8835,15 @@ mod tests {
 
     #[test]
     fn parse_lrc_returns_empty_for_garbage_input() {
-        assert!(parse_lrc("").is_empty());
-        assert!(parse_lrc("no timestamps here").is_empty());
-        assert!(parse_lrc("[ti:Title]\n[ar:Artist]").is_empty());
+        assert!(lyrics::parse_lrc("").is_empty());
+        assert!(lyrics::parse_lrc("no timestamps here").is_empty());
+        assert!(lyrics::parse_lrc("[ti:Title]\n[ar:Artist]").is_empty());
     }
 
     #[test]
     fn parse_lrc_filters_chinese_metadata_lines() {
         let lrc = "[00:00.00]作词: Thomas Bangalter\n[00:00.00]作曲: Thomas Bangalter\n[00:12.34]First line\n[00:15.67]Second line";
-        let lines = parse_lrc(lrc);
+        let lines = lyrics::parse_lrc(lrc);
         assert_eq!(lines.len(), 2);
         assert_eq!(lines[0].text, "First line");
         assert_eq!(lines[1].text, "Second line");
@@ -8441,6 +8910,448 @@ mod tests {
         assert_eq!(
             first_video_id_from_tracks_dump(raw).as_deref(),
             Some("nbCOAPR33ME")
+        );
+    }
+
+    fn artist_top_songs_browse_response(section_title: &str, continuation: Option<&str>) -> Value {
+        let mut shelf = json!({
+            "header": {
+                "musicShelfHeaderRenderer": {
+                    "title": { "runs": [{ "text": section_title }] }
+                }
+            },
+            "contents": [
+                {
+                    "musicResponsiveListItemRenderer": {
+                        "flexColumns": [
+                            {
+                                "musicResponsiveListItemFlexColumnRenderer": {
+                                    "text": { "runs": [{ "text": "Song One" }] }
+                                }
+                            }
+                        ],
+                        "playlistItemData": { "videoId": "song1" }
+                    }
+                }
+            ]
+        });
+        if let Some(token) = continuation {
+            shelf["continuations"] = json!([{
+                "nextContinuationData": { "continuation": token }
+            }]);
+        }
+        json!({
+            "header": {
+                "musicImmersiveHeaderRenderer": {
+                    "title": { "runs": [{ "text": "Radiohead" }] }
+                }
+            },
+            "contents": {
+                "singleColumnBrowseResultsRenderer": {
+                    "tabs": [{
+                        "tabRenderer": {
+                            "content": {
+                                "sectionListRenderer": {
+                                    "contents": [{
+                                        "musicShelfRenderer": shelf
+                                    }]
+                                }
+                            }
+                        }
+                    }]
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn top_tracks_section_title_matches_for_continuation() {
+        assert!(is_top_songs_section_title("Top tracks"));
+        assert!(is_top_songs_section_title("Top songs"));
+        assert!(!is_top_songs_section_title("Albums"));
+    }
+
+    #[test]
+    fn extract_top_songs_continuation_uses_top_tracks_shelf() {
+        let response = artist_top_songs_browse_response("Top tracks", Some("cont-token"));
+        assert_eq!(
+            extract_top_songs_continuation(&response).as_deref(),
+            Some("cont-token")
+        );
+    }
+
+    #[test]
+    fn extract_top_songs_continuation_falls_back_to_first_shelf() {
+        let response = artist_top_songs_browse_response("Fans also like", Some("fallback-token"));
+        assert_eq!(
+            extract_top_songs_continuation(&response).as_deref(),
+            Some("fallback-token")
+        );
+    }
+
+    #[test]
+    fn parse_artist_detail_reads_same_shelf_as_continuation() {
+        let response = artist_top_songs_browse_response("Top tracks", Some("cont-token"));
+        let detail = parse_artist_detail("artist123", &response).expect("artist detail");
+        assert_eq!(detail.top_songs.len(), 1);
+        assert_eq!(detail.top_songs[0].title, "Song One");
+    }
+
+    #[test]
+    fn top_songs_playlist_browse_id_reads_header_navigation() {
+        let shelf = json!({
+            "header": {
+                "musicShelfHeaderRenderer": {
+                    "title": {
+                        "runs": [{
+                            "text": "Top songs",
+                            "navigationEndpoint": {
+                                "browseEndpoint": {
+                                    "browseId": "VLPLExamplePlaylistId"
+                                }
+                            }
+                        }]
+                    }
+                }
+            },
+            "contents": []
+        });
+
+        assert_eq!(
+            top_songs_playlist_browse_id(&shelf).as_deref(),
+            Some("VLPLExamplePlaylistId")
+        );
+    }
+
+    #[test]
+    fn top_songs_playlist_browse_id_reads_headerless_bottom_endpoint() {
+        let shelf = json!({
+            "title": { "runs": [{ "text": "Top songs" }] },
+            "bottomEndpoint": {
+                "browseEndpoint": {
+                    "browseId": "VLOLAK5uy_exampleAudioPlaylist"
+                }
+            },
+            "contents": []
+        });
+
+        assert_eq!(
+            top_songs_playlist_browse_id(&shelf).as_deref(),
+            Some("VLOLAK5uy_exampleAudioPlaylist")
+        );
+    }
+
+    #[test]
+    fn shelf_section_title_reads_headerless_top_level_title() {
+        let shelf = json!({
+            "title": { "runs": [{ "text": "Top songs" }] }
+        });
+        assert_eq!(shelf_section_title(&shelf).as_deref(), Some("Top songs"));
+    }
+
+    async fn live_ytmusic_browse(browse_id: &str) -> Value {
+        let html = HTTP
+            .get("https://music.youtube.com/")
+            .send()
+            .await
+            .expect("music shell");
+        let html = html.text().await.expect("music shell body");
+        let api_key = API_KEY_RE
+            .captures(&html)
+            .and_then(|caps| caps.get(1))
+            .expect("api key")
+            .as_str();
+        let client_version = CLIENT_VERSION_RE
+            .captures(&html)
+            .and_then(|caps| caps.get(1))
+            .expect("client version")
+            .as_str();
+        let visitor_data = VISITOR_DATA_RE
+            .captures(&html)
+            .and_then(|caps| caps.get(1))
+            .expect("visitor data")
+            .as_str();
+
+        let url = format!("https://music.youtube.com/youtubei/v1/browse?key={api_key}");
+        let body = json!({
+            "browseId": browse_id,
+            "context": {
+                "client": {
+                    "clientName": "WEB_REMIX",
+                    "clientVersion": client_version,
+                    "hl": "en",
+                    "gl": "US",
+                    "platform": "DESKTOP",
+                    "clientFormFactor": "UNKNOWN_FORM_FACTOR",
+                    "visitorData": visitor_data,
+                },
+                "capabilities": {},
+                "request": { "useSsl": true },
+                "user": { "lockedSafetyMode": false },
+            }
+        });
+
+        HTTP.post(url)
+            .header("Accept-Language", "en-US,en;q=0.9")
+            .header("Origin", "https://music.youtube.com")
+            .header("Referer", "https://music.youtube.com/")
+            .header("x-goog-visitor-id", visitor_data)
+            .json(&body)
+            .send()
+            .await
+            .expect("browse request")
+            .json::<Value>()
+            .await
+            .expect("browse json")
+    }
+
+    #[tokio::test]
+    #[ignore = "live YouTube Music network integration"]
+    async fn live_radiohead_top_songs_load_at_least_six() {
+        let response = live_ytmusic_browse("UCUDVBtnOQi4c7E8jebpjc9Q").await;
+
+        let sections = artist_overview_sections(&response).expect("sections");
+        let shelf = top_songs_shelf(sections).expect("top songs shelf");
+        assert_eq!(shelf_section_title(shelf).as_deref(), Some("Top songs"));
+        let playlist_browse_id = top_songs_playlist_browse_id(shelf)
+            .expect("playlist browse id on headerless artist shelf");
+
+        let playlist_response = live_ytmusic_browse(&playlist_browse_id).await;
+        let playlist_shelf =
+            find_track_shelf_in_browse_response(&playlist_response).expect("playlist shelf");
+        let tracks = parse_tracks_from_shelf_items(
+            playlist_shelf
+                .get("contents")
+                .and_then(Value::as_array)
+                .expect("playlist contents"),
+            "Radiohead",
+            None,
+        );
+
+        assert!(
+            tracks.len() >= 6,
+            "expected at least 6 top songs from linked playlist, got {}",
+            tracks.len()
+        );
+    }
+
+    #[test]
+    fn shelf_continuation_token_reads_continuation_item_renderer() {
+        let shelf = json!({
+            "contents": [
+                {
+                    "musicResponsiveListItemRenderer": {
+                        "flexColumns": [{
+                            "musicResponsiveListItemFlexColumnRenderer": {
+                                "text": { "runs": [{ "text": "Song One" }] }
+                            }
+                        }],
+                        "playlistItemData": { "videoId": "song1" }
+                    }
+                },
+                {
+                    "continuationItemRenderer": {
+                        "continuationEndpoint": {
+                            "continuationCommand": {
+                                "token": "inline-cont-token"
+                            }
+                        }
+                    }
+                }
+            ]
+        });
+
+        assert_eq!(
+            shelf_continuation_token(&shelf).as_deref(),
+            Some("inline-cont-token")
+        );
+    }
+
+    #[test]
+    fn parse_shelf_continuation_items_reads_append_action() {
+        let response = json!({
+            "onResponseReceivedActions": [{
+                "appendContinuationItemsAction": {
+                    "continuationItems": [{
+                        "musicResponsiveListItemRenderer": {
+                            "flexColumns": [{
+                                "musicResponsiveListItemFlexColumnRenderer": {
+                                    "text": { "runs": [{ "text": "Song Six" }] }
+                                }
+                            }],
+                            "playlistItemData": { "videoId": "song6" }
+                        }
+                    }]
+                }
+            }]
+        });
+
+        let items = parse_shelf_continuation_items(&response).expect("items");
+        assert_eq!(items.len(), 1);
+        let track = parse_track(&items[0], None, Some("Radiohead"), None).expect("track");
+        assert_eq!(track.title, "Song Six");
+    }
+
+    #[test]
+    fn top_songs_shelf_index_skips_non_shelf_sections() {
+        let response = json!({
+            "header": {
+                "musicImmersiveHeaderRenderer": {
+                    "title": { "runs": [{ "text": "Radiohead" }] }
+                }
+            },
+            "contents": {
+                "singleColumnBrowseResultsRenderer": {
+                    "tabs": [{
+                        "tabRenderer": {
+                            "content": {
+                                "sectionListRenderer": {
+                                    "contents": [
+                                        {
+                                            "musicCarouselShelfRenderer": {
+                                                "header": {
+                                                    "musicCarouselShelfBasicHeaderRenderer": {
+                                                        "title": { "runs": [{ "text": "Albums" }] }
+                                                    }
+                                                },
+                                                "contents": []
+                                            }
+                                        },
+                                        {
+                                            "musicShelfRenderer": {
+                                                "header": {
+                                                    "musicShelfHeaderRenderer": {
+                                                        "title": { "runs": [{ "text": "Top songs" }] }
+                                                    }
+                                                },
+                                                "contents": [{
+                                                    "musicResponsiveListItemRenderer": {
+                                                        "flexColumns": [{
+                                                            "musicResponsiveListItemFlexColumnRenderer": {
+                                                                "text": { "runs": [{ "text": "Creep" }] }
+                                                            }
+                                                        }],
+                                                        "playlistItemData": { "videoId": "creep" }
+                                                    }
+                                                }]
+                                            }
+                                        }
+                                    ]
+                                }
+                            }
+                        }
+                    }]
+                }
+            }
+        });
+
+        let sections = artist_overview_sections(&response).expect("sections");
+        assert_eq!(top_songs_shelf_index(sections), Some(1));
+        let detail = parse_artist_detail("artist123", &response).expect("artist detail");
+        assert_eq!(detail.top_songs.len(), 1);
+        assert_eq!(detail.top_songs[0].title, "Creep");
+    }
+
+    #[test]
+    fn parse_spotify_og_track_count_reads_item_total() {
+        let html = r#"<meta property="og:description" content="Playlist · Liam · 299 items · 3 saves">"#;
+        assert_eq!(parse_spotify_og_track_count(html), Some(299));
+    }
+
+    #[test]
+    fn spotify_import_track_count_sufficient_detects_embed_cap() {
+        assert!(!spotify_import_track_count_sufficient(100, Some(305)));
+        assert!(spotify_import_track_count_sufficient(305, Some(305)));
+        assert!(!spotify_import_track_count_sufficient(100, None));
+        assert!(spotify_import_track_count_sufficient(42, None));
+    }
+
+    #[test]
+    fn parse_spotify_embed_track_entity_reads_name_and_artist() {
+        let entity = json!({
+            "name": "The Less I Know The Better",
+            "artists": [{"name": "Tame Impala"}],
+            "duration": 263000
+        });
+        let track = parse_spotify_embed_track_entity(&entity).expect("embed track");
+        assert_eq!(track.title, "The Less I Know The Better");
+        assert_eq!(track.artist, "Tame Impala");
+        assert_eq!(track.duration_seconds, Some(263));
+    }
+
+    #[test]
+    fn spotify_access_token_from_html_reads_embed_session_token() {
+        let html = concat!(
+            r#"<script id="__NEXT_DATA__">{"props":{"pageProps":{"state":{"settings":{"session":{"#,
+            r#""accessToken":"abcdefghijklmnopqrstuvwxyz0123456789_ABCDEF-ghij"}}}}}}}</script>"#
+        );
+        let token = spotify_access_token_from_html(html).expect("token");
+        assert!(token.starts_with("abcdefghijklmnopqrstuvwxyz"));
+    }
+
+    #[tokio::test]
+    #[ignore = "live network: Spotify pathfinder playlist pagination"]
+    async fn spotify_pathfinder_returns_more_than_embed_cap_live() {
+        let embed_html =
+            fetch_spotify_embed_html("0WmzNjrJtN1rBjAUPXCnZm")
+                .await
+                .expect("embed html");
+        let token = spotify_access_token_from_html(&embed_html).expect("embed token");
+        let items = fetch_spotify_pathfinder_playlist_items(
+            "0WmzNjrJtN1rBjAUPXCnZm",
+            &token,
+            Some(299),
+        )
+        .await
+        .expect("pathfinder items");
+        assert!(items.len() > SPOTIFY_EMBED_TRACK_PAGE_CAP);
+    }
+
+    #[tokio::test]
+    #[ignore = "live network: Spotify embed track metadata scrape"]
+    async fn spotify_embed_track_metadata_live() {
+        let track = fetch_spotify_track_metadata_from_embed_page("6K4t31amVTZDgR3sKmwUJJ")
+            .await
+            .expect("track metadata");
+        assert_eq!(track.title, "The Less I Know The Better");
+        assert_eq!(track.artist, "Tame Impala");
+    }
+
+    #[tokio::test]
+    #[ignore = "live network: Spotify extend beyond embed cap"]
+    async fn spotify_extend_beyond_embed_cap_live() {
+        let url = "https://open.spotify.com/playlist/0WmzNjrJtN1rBjAUPXCnZm";
+        let embed_html = fetch_spotify_embed_html("0WmzNjrJtN1rBjAUPXCnZm")
+            .await
+            .expect("embed html");
+        let import = scrape_playlist_via_embed_page(url, Some(&embed_html))
+            .await
+            .expect("embed import");
+        assert_eq!(import.tracks.len(), SPOTIFY_EMBED_TRACK_PAGE_CAP);
+        let token = spotify_access_token_from_html(&embed_html).expect("embed token");
+        let extended = extend_spotify_tracks_beyond_embed_cap(
+            &import.tracks,
+            "0WmzNjrJtN1rBjAUPXCnZm",
+            &token,
+            Some(299),
+            None,
+        )
+        .await
+        .expect("extended tracks");
+        assert!(extended.len() > SPOTIFY_EMBED_TRACK_PAGE_CAP);
+    }
+
+    #[tokio::test]
+    #[ignore = "live network: Spotify playlist import pagination"]
+    async fn spotify_playlist_import_fetches_more_than_embed_cap_live() {
+        let url = "https://open.spotify.com/playlist/0WmzNjrJtN1rBjAUPXCnZm";
+        let import = scrape_spotify_playlist(url)
+            .await
+            .expect("spotify playlist import");
+        assert!(
+            import.tracks.len() > SPOTIFY_EMBED_TRACK_PAGE_CAP,
+            "expected more than {SPOTIFY_EMBED_TRACK_PAGE_CAP} tracks, got {}",
+            import.tracks.len()
         );
     }
 

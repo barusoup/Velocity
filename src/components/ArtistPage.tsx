@@ -15,6 +15,7 @@ import {
 import {
   getArtistDetail,
   getArtistMonthlyListeners,
+  getArtistTopSongsExtended,
   getEntityDetail,
   cacheArtwork,
   peekArtistDetail,
@@ -27,8 +28,19 @@ import { useCollection, type SavedAlbum } from "../collection";
 import { usePlayer } from "../player";
 import type { ArtistDetail, EntityDetail, MediaTrack, SearchItem } from "../types";
 import { extractInterestingArtworkColor, mixRgb, peekArtworkAccent, rgbToCss } from "../utils/artwork-color";
-import { formatOptionalDuration, formatPlayCount } from "../utils/media";
-import { ArtworkImage, getArtworkRoundedClass, useResolvedArtworkSource } from "./Shared";
+import {
+  filterQueueableTracks,
+  formatOptionalDuration,
+  formatPlayCount,
+  isSameSongTrack,
+} from "../utils/media";
+import {
+  ArtworkImage,
+  cardHoverPlayRevealClass,
+  cardHoverPlayTransitionClass,
+  getArtworkRoundedClass,
+  useResolvedArtworkSource,
+} from "./Shared";
 import { SaveButton } from "./SaveButton";
 import { Marquee } from "./Marquee";
 import { POPULAR_TRACK_GRID, RELEASE_TRACK_GRID, TrackListHeader } from "./TrackList";
@@ -42,6 +54,8 @@ import {
 } from "./PagesShared";
 import { useSetting, setSetting } from "../settings";
 import { getDirectArtistBrowseId, resolveArtistBrowseId } from "../utils/navigation";
+import { useHorizontalDragScroll } from "../hooks/useHorizontalDragScroll";
+import { useTrackMetadataBackfill } from "../hooks/useTrackMetadataBackfill";
 
 export type ReleaseType = "album" | "single" | "compilation";
 type ReleaseFilter = "all" | ReleaseType;
@@ -89,6 +103,11 @@ const MAIN_FILTERS: Array<{ value: ReleaseFilter; label: string }> = [
   { value: "single", label: "Singles and EPs" },
 ];
 
+const MAIN_FILTER_ORDER: ReleaseFilter[] = MAIN_FILTERS.map((filter) => filter.value);
+const RELEASE_STRIP_MOTION_MS = 400;
+const RELEASE_STRIP_STAGGER_MS = 34;
+const RELEASE_STRIP_MAX_STAGGER_ITEMS = 10;
+
 const FULL_FILTERS: Array<{ value: ReleaseFilter; label: string }> = [
   { value: "all", label: "All" },
   { value: "album", label: "Albums" },
@@ -133,7 +152,6 @@ export function ArtistPage({
   onAddAlbumToQueue,
   onAddAlbumToPlaylist,
   resolvePlaylists,
-  createPlaylistAndAddTracks,
 }: {
   browseId: string;
   cover?: string | null;
@@ -150,9 +168,6 @@ export function ArtistPage({
   onAddAlbumToQueue?: (tracks: MediaTrack[], browseId: string, name: string) => void;
   onAddAlbumToPlaylist?: (browseId: string, tracks: MediaTrack[]) => Promise<void> | void;
   resolvePlaylists?: (query: string) => Promise<Array<{ browseId: string; title: string; subtitle?: string | null; cover?: string | null }>>;
-  createPlaylistAndAddTracks?: (
-    tracks: MediaTrack[],
-  ) => Promise<{ browseId: string; title: string } | void>;
 }) {
   const player = usePlayer();
   // Seed from the synchronous peek so a Back/Forward navigation to an
@@ -207,22 +222,23 @@ export function ArtistPage({
       collapseTimerRef.current = null;
     }
 
-    getArtistDetail(browseId)
+    const applyArtistDetail = (data: ArtistDetail) => {
+      if (cancelled) return;
+      setState({ status: "ready", data });
+      if (!data.monthlyListeners && !peekArtistMonthlyListeners(browseId)) {
+        getArtistMonthlyListeners(browseId)
+          .then((value) => {
+            if (cancelled) return;
+            setExtraMonthlyListeners(value);
+          })
+          .catch(() => undefined);
+      }
+    };
+
+    void getArtistDetail(browseId)
       .then((data) => {
         if (cancelled) return;
-        setState({ status: "ready", data });
-        // If the main detail came back without a listener count, fall back
-        // to the dedicated fetch (which retries with backoff on the Rust
-        // side). Skip the call when the cache already has a value so cache
-        // hits render without redundant requests.
-        if (!data.monthlyListeners && !peekArtistMonthlyListeners(browseId)) {
-          getArtistMonthlyListeners(browseId)
-            .then((value) => {
-              if (cancelled) return;
-              setExtraMonthlyListeners(value);
-            })
-            .catch(() => undefined);
-        }
+        applyArtistDetail(data);
       })
       .catch((error) => {
         if (cancelled) return;
@@ -244,9 +260,19 @@ export function ArtistPage({
 
   const detail = state.data ?? null;
   const topSongs = useMemo<MediaTrack[]>(
-    () => (detail?.topSongs ?? []).map((track) => ({ ...track, artistBrowseId: browseId })),
+    () =>
+      filterQueueableTracks(
+        (detail?.topSongs ?? []).map((track) => ({ ...track, artistBrowseId: browseId })),
+      ),
     [browseId, detail?.topSongs],
   );
+  const [displayTopSongs, setDisplayTopSongs] = useState<MediaTrack[]>(topSongs);
+
+  useEffect(() => {
+    setDisplayTopSongs(topSongs);
+  }, [topSongs]);
+
+  useTrackMetadataBackfill(displayTopSongs, setDisplayTopSongs);
   const releases = useMemo<ReleaseItem[]>(
     () => (detail ? buildReleaseItems(detail) : []),
     [detail],
@@ -274,7 +300,10 @@ export function ArtistPage({
     [releaseFilter, releases, sortMode],
   );
 
-  const handleTogglePopular = useCallback(() => {
+  const showTopTracksExpand =
+    (detail?.topSongs.length ?? 0) > 5 || Boolean(detail?.topSongsHasMore);
+
+  const handleTogglePopular = useCallback(async () => {
     if (collapseTimerRef.current) {
       clearTimeout(collapseTimerRef.current);
       collapseTimerRef.current = null;
@@ -307,13 +336,32 @@ export function ArtistPage({
         collapseTimerRef.current = null;
       }, POPULAR_COLLAPSE_TOTAL_MS);
     } else {
+      if ((detail?.topSongs.length ?? 0) <= 5 && detail?.topSongsHasMore) {
+        try {
+          const extended = await getArtistTopSongsExtended(browseId);
+          setState((prev) => {
+            if (prev.status !== "ready" || !prev.data) return prev;
+            return {
+              ...prev,
+              data: {
+                ...prev.data,
+                topSongs: extended,
+                topSongsHasMore: extended.length > 5 ? false : prev.data.topSongsHasMore,
+              },
+            };
+          });
+        } catch {
+          // Expand with whatever tracks we already have.
+        }
+      }
+
       setShowExtras(true);
       setPopularCollapsing(false);
       requestAnimationFrame(() => {
         setPopularExpanded(true);
       });
     }
-  }, [popularExpanded]);
+  }, [browseId, detail?.topSongs.length, detail?.topSongsHasMore, popularExpanded]);
 
   if (state.status === "loading") return <LoadingPanel label="Loading artist" />;
   if (state.status === "error") return <ErrorPanel message={state.error ?? "Failed to load artist."} />;
@@ -351,7 +399,8 @@ export function ArtistPage({
           browseId={browseId}
           displayCover={displayCover}
           displayBanner={displayBanner}
-          topSongs={topSongs}
+          topSongs={displayTopSongs}
+          showTopTracksExpand={showTopTracksExpand}
           popularExpanded={popularExpanded}
           popularCollapsing={popularCollapsing}
           showExtras={showExtras}
@@ -393,7 +442,7 @@ export function ArtistPage({
             setSortMenuOpen((open) => !open);
             setFilterMenuOpen(false);
           }}
-          activeTrackId={player.currentTrack?.id ?? null}
+          currentTrack={player.currentTrack}
           playing={player.isPlaying}
           buffering={player.isBuffering}
           togglePlay={player.togglePlay}
@@ -405,7 +454,7 @@ export function ArtistPage({
           onAddAlbumToQueue={onAddAlbumToQueue}
           onAddAlbumToPlaylist={onAddAlbumToPlaylist}
           resolvePlaylists={resolvePlaylists}
-          createPlaylistAndAddTracks={createPlaylistAndAddTracks}
+
           onNavigate={onNavigate}
         />
       </div>
@@ -420,6 +469,7 @@ function ArtistOverview({
   displayCover,
   displayBanner,
   topSongs,
+  showTopTracksExpand,
   popularExpanded,
   popularCollapsing,
   showExtras,
@@ -441,6 +491,7 @@ function ArtistOverview({
   displayCover?: string | null;
   displayBanner?: string | null;
   topSongs: MediaTrack[];
+  showTopTracksExpand: boolean;
   popularExpanded: boolean;
   popularCollapsing: boolean;
   showExtras: boolean;
@@ -449,7 +500,7 @@ function ArtistOverview({
   filterBarRef: RefObject<HTMLDivElement | null>;
   popularListRef: RefObject<HTMLDivElement | null>;
   pillStyle: CSSProperties;
-  onTogglePopular: () => void;
+  onTogglePopular: () => void | Promise<void>;
   onChangeMainFilter: (filter: ReleaseFilter) => void;
   onOpenFullDiscography: () => void;
   onOpenItem: (item: SearchItem) => void;
@@ -457,8 +508,10 @@ function ArtistOverview({
   onNavigate: (view: View) => void;
 }) {
   const player = usePlayer();
+  const collection = useCollection();
+  const isArtistSaved = collection.isArtistSaved(browseId);
   const [topTrackHovered, setTopTrackHovered] = useState(false);
-  const firstTopTrackActive = topSongs[0] ? isTrackActive(player.currentTrack, topSongs[0], { kind: "artist", browseId }, player.queueOrigin) : false;
+  const firstTopTrackActive = topSongs[0] ? isSameSongTrack(player.currentTrack, topSongs[0]) : false;
   const handlePlayRelease = useCallback((item: ReleaseItem) => {
     const browseId = item.browseId;
     if (!browseId) return;
@@ -467,30 +520,51 @@ function ArtistOverview({
       void player.playMany(tracks, 0, { kind: "album", browseId });
     });
   }, [player]);
-  const releaseStripRef = useRef<HTMLDivElement | null>(null);
+  const {
+    stripRef: releaseStripRef,
+    isDragging: isDraggingReleases,
+    onPointerDown: handleReleaseStripPointerDown,
+    onClickCapture: handleReleaseStripClickCapture,
+  } = useHorizontalDragScroll();
+  const prevMainFilterRef = useRef(mainFilter);
+  const stripMotionTimerRef = useRef<number | null>(null);
+  const [stripMotion, setStripMotion] = useState<"forward" | "backward" | null>(null);
   const scrollFadesRef = useRef({ left: false, right: false });
   const updateScrollFadesRef = useRef<(() => void) | null>(null);
-  const dragStateRef = useRef({
-    pointerId: -1,
-    startX: 0,
-    startScrollLeft: 0,
-    isDown: false,
-    isDragging: false,
-    suppressClick: false,
-    samples: [] as Array<{ x: number; t: number }>,
-    velocity: 0,
-    animationFrameId: 0,
-  });
-  const [isDraggingReleases, setIsDraggingReleases] = useState(false);
 
   useEffect(() => {
     return () => {
-      const s = dragStateRef.current;
-      if (s.animationFrameId) {
-        window.cancelAnimationFrame(s.animationFrameId);
+      if (stripMotionTimerRef.current) {
+        window.clearTimeout(stripMotionTimerRef.current);
       }
     };
   }, []);
+
+  useLayoutEffect(() => {
+    const prev = prevMainFilterRef.current;
+    if (prev === mainFilter) return;
+
+    const prevIndex = MAIN_FILTER_ORDER.indexOf(prev);
+    const nextIndex = MAIN_FILTER_ORDER.indexOf(mainFilter);
+    prevMainFilterRef.current = mainFilter;
+
+    if (prevIndex >= 0 && nextIndex >= 0 && prevIndex !== nextIndex) {
+      setStripMotion(nextIndex > prevIndex ? "forward" : "backward");
+      if (stripMotionTimerRef.current) {
+        window.clearTimeout(stripMotionTimerRef.current);
+      }
+      const staggerCount = Math.min(mainReleases.length, RELEASE_STRIP_MAX_STAGGER_ITEMS);
+      stripMotionTimerRef.current = window.setTimeout(
+        () => setStripMotion(null),
+        RELEASE_STRIP_MOTION_MS + staggerCount * RELEASE_STRIP_STAGGER_MS,
+      );
+    }
+
+    const strip = releaseStripRef.current;
+    if (strip) {
+      strip.scrollLeft = 0;
+    }
+  }, [mainFilter, mainReleases.length]);
 
   const applyScrollFades = (strip: HTMLElement, left: boolean, right: boolean) => {
     const hasFade = left || right;
@@ -538,162 +612,6 @@ function ArtistOverview({
   useEffect(() => {
     updateScrollFadesRef.current?.();
   }, [mainReleases]);
-
-  const handleReleaseStripPointerDown = (event: React.PointerEvent<HTMLDivElement>) => {
-    if (event.button !== 0) return;
-    const strip = releaseStripRef.current;
-    if (!strip) return;
-    const s = dragStateRef.current;
-
-    if (s.animationFrameId) {
-      window.cancelAnimationFrame(s.animationFrameId);
-      s.animationFrameId = 0;
-    }
-
-    s.startX = event.clientX;
-    s.startScrollLeft = strip.scrollLeft;
-    s.isDown = true;
-    s.isDragging = false;
-    s.suppressClick = false;
-    s.samples = [{ x: event.clientX, t: performance.now() }];
-    s.velocity = 0;
-  };
-
-  useEffect(() => {
-    const s = dragStateRef.current;
-
-    const handlePointerMove = (event: PointerEvent) => {
-      const strip = releaseStripRef.current;
-      if (!strip || !s.isDown) return;
-
-      const now = performance.now();
-      s.samples.push({ x: event.clientX, t: now });
-
-      const cutoff = now - 100;
-      s.samples = s.samples.filter((sm) => sm.t >= cutoff);
-
-      if (s.samples.length >= 2) {
-        const first = s.samples[0];
-        const last = s.samples[s.samples.length - 1];
-        const dt = last.t - first.t;
-        if (dt > 0) {
-          const fingerVelocity = (last.x - first.x) / dt;
-          s.velocity = -fingerVelocity * 16;
-        }
-      }
-
-      const deltaX = event.clientX - s.startX;
-      if (!s.isDragging && Math.abs(deltaX) < 6) return;
-
-      if (!s.isDragging) {
-        s.isDragging = true;
-        setIsDraggingReleases(true);
-        s.samples = [{ x: event.clientX, t: now }];
-      }
-
-      event.preventDefault();
-      strip.scrollLeft = s.startScrollLeft - deltaX;
-    };
-
-    const handlePointerUp = () => {
-      if (!s.isDown) return;
-
-      const wasDragging = s.isDragging;
-      s.isDown = false;
-
-      if (wasDragging) {
-        s.suppressClick = true;
-        window.setTimeout(() => {
-          s.suppressClick = false;
-        }, 0);
-      }
-
-      s.isDragging = false;
-      setIsDraggingReleases(false);
-
-      const strip = releaseStripRef.current;
-      if (!strip || !wasDragging) return;
-
-      const v = s.velocity;
-      const hasMomentum = Math.abs(v) >= 0.5;
-
-      if (hasMomentum) {
-        const friction = 0.93;
-        const animate = () => {
-          s.velocity *= friction;
-          strip.scrollLeft += s.velocity;
-          if (Math.abs(s.velocity) < 0.15) {
-            s.animationFrameId = 0;
-            snapToNearestRelease(strip);
-            return;
-          }
-          s.animationFrameId = window.requestAnimationFrame(animate);
-        };
-        s.animationFrameId = window.requestAnimationFrame(animate);
-      } else {
-        snapToNearestRelease(strip);
-      }
-    };
-
-    const snapToNearestRelease = (strip: HTMLElement) => {
-      const firstChild = strip.children[0] as HTMLElement | undefined;
-      if (!firstChild) return;
-
-      const style = getComputedStyle(strip);
-      const gap = parseFloat(style.gap) || 0;
-      const stride = firstChild.offsetWidth + gap;
-      if (stride <= 0) return;
-
-      const maxScroll = strip.scrollWidth - strip.clientWidth;
-      const current = strip.scrollLeft;
-
-      if (current <= 1 || current >= maxScroll - 1) return;
-
-      const nearest = Math.round(current / stride) * stride;
-      const target = Math.max(0, Math.min(nearest, maxScroll));
-
-      if (Math.abs(target - current) < 1) return;
-
-      s.velocity = 0;
-      if (s.animationFrameId) {
-        window.cancelAnimationFrame(s.animationFrameId);
-        s.animationFrameId = 0;
-      }
-
-      const startX = strip.scrollLeft;
-      const distance = target - startX;
-      const duration = 280;
-      const startTime = performance.now();
-
-      const easeOutCubic = (t: number) => 1 - Math.pow(1 - t, 3);
-
-      const step = (now: number) => {
-        const elapsed = now - startTime;
-        const progress = Math.min(elapsed / duration, 1);
-        strip.scrollLeft = startX + distance * easeOutCubic(progress);
-        if (progress < 1) {
-          s.animationFrameId = window.requestAnimationFrame(step);
-        } else {
-          s.animationFrameId = 0;
-        }
-      };
-      s.animationFrameId = window.requestAnimationFrame(step);
-    };
-
-    window.addEventListener("pointermove", handlePointerMove, { passive: false });
-    window.addEventListener("pointerup", handlePointerUp);
-    return () => {
-      window.removeEventListener("pointermove", handlePointerMove);
-      window.removeEventListener("pointerup", handlePointerUp);
-    };
-  }, []);
-
-  const handleReleaseStripClickCapture = (event: React.MouseEvent<HTMLDivElement>) => {
-    if (!dragStateRef.current.suppressClick) return;
-    event.preventDefault();
-    event.stopPropagation();
-    dragStateRef.current.suppressClick = false;
-  };
 
   const artistOrigin = player.queueOrigin;
   const isArtistActive =
@@ -776,14 +694,19 @@ function ArtistOverview({
             <AnimatedShuffle active={player.shuffle} size={28} />
           </button>
 
-          <button
-            type="button"
-            className="flex h-10 w-10 cursor-default items-center justify-center text-white/22 select-none animate-none"
-            aria-label="Artist options"
-            disabled
-          >
-            <Ellipsis size={28} />
-          </button>
+          <SaveButton
+            isSaved={isArtistSaved}
+            onToggle={() =>
+              collection.toggleArtist({
+                browseId,
+                title: detail.title,
+                cover: displayCover ?? null,
+                banner: displayBanner ?? null,
+                monthlyListeners: monthlyListeners ?? null,
+              })
+            }
+            ariaLabel={isArtistSaved ? "Remove from collection" : "Save artist to collection"}
+          />
         </div>
 
         {topSongs.length > 0 && (
@@ -830,13 +753,13 @@ function ArtistOverview({
                 />
               ))}
             </div>
-            {topSongs.length > 5 && (
+            {showTopTracksExpand && (
               <div className="mt-0 px-3">
                 <button
                   type="button"
                   aria-expanded={popularExpanded}
                   disabled={popularCollapsing}
-                  onClick={onTogglePopular}
+                  onClick={() => void onTogglePopular()}
                   className="py-1.5 whitespace-nowrap text-left text-sm font-semibold text-white/60 transition hover:text-white animate-none"
                   style={{ marginLeft: "calc((2.75rem - 1ch) / 2 - 0.55rem)" }}
                 >
@@ -887,19 +810,30 @@ function ArtistOverview({
 
               <div
                   ref={releaseStripRef}
-                  className={`flex gap-3 overflow-x-auto pb-3 pr-6 overscroll-x-contain select-none [scrollbar-width:none] [&::-webkit-scrollbar]:hidden ${
+                  className={`artist-release-strip flex gap-3 overflow-x-auto pb-3 pr-6 overscroll-x-contain select-none [scrollbar-width:none] [&::-webkit-scrollbar]:hidden ${
                     isDraggingReleases ? "cursor-grabbing" : "cursor-grab"
+                  } ${stripMotion === "forward" ? "is-transitioning-forward" : ""} ${
+                    stripMotion === "backward" ? "is-transitioning-backward" : ""
                   }`}
                   onPointerDown={handleReleaseStripPointerDown}
                   onClickCapture={handleReleaseStripClickCapture}
                 >
-                  {mainReleases.map((item) => (
-                    <div key={item.id} className="w-[clamp(10.25rem,15.3125vw,12.25rem)] shrink-0">
+                  {mainReleases.map((item, index) => (
+                    <div
+                      key={`${mainFilter}-${item.id}`}
+                      className="artist-release-strip-card w-[clamp(10.25rem,15.3125vw,12.25rem)] shrink-0"
+                      style={
+                        {
+                          "--domino-index": Math.min(index, RELEASE_STRIP_MAX_STAGGER_ITEMS),
+                        } as CSSProperties
+                      }
+                    >
                       <ReleaseCard
                         item={item}
                         onOpen={() => onOpenItem(item)}
                         onPlay={() => handlePlayRelease(item)}
                         playBgColor={releaseCardPlayBg}
+                        playButtonSize="lg"
                         artistBrowseId={browseId}
                       />
                     </div>
@@ -910,31 +844,6 @@ function ArtistOverview({
       </section>
     </div>
   );
-}
-
-function isTrackActive(
-  currentTrack: MediaTrack | null,
-  track: MediaTrack,
-  contextOrigin?: import("../player").QueueOrigin | null,
-  activeOrigin?: import("../player").QueueOrigin | null,
-): boolean {
-  if (!currentTrack) return false;
-  if (
-    currentTrack.videoId && track.videoId
-      ? currentTrack.videoId !== track.videoId
-      : currentTrack.id !== track.id
-  ) return false;
-  if (contextOrigin) {
-    if (!activeOrigin) return false;
-    if (contextOrigin.kind !== activeOrigin.kind) return false;
-    if ("browseId" in contextOrigin && "browseId" in activeOrigin) {
-      return contextOrigin.browseId === activeOrigin.browseId;
-    }
-    if ("id" in contextOrigin && "id" in activeOrigin) {
-      return contextOrigin.id === activeOrigin.id;
-    }
-  }
-  return true;
 }
 
 function PopularTrackRow({
@@ -958,10 +867,10 @@ function PopularTrackRow({
 }) {
   const player = usePlayer();
   const collection = useCollection();
-  const active = isTrackActive(player.currentTrack, track, queueOrigin, player.queueOrigin);
+  const active = isSameSongTrack(player.currentTrack, track);
   const playingActive = active && player.isPlaying;
   const bufferingActive = active && player.isBuffering;
-  const isSaved = collection.isSongSaved(track.id);
+  const isSaved = collection.isTrackSaved(track);
   const directArtistBrowseId = onNavigate ? getDirectArtistBrowseId(track) : null;
   const handleResolveNavigate = useCallback(() => {
     if (!onNavigate) return;
@@ -1036,12 +945,12 @@ function PopularTrackRow({
                 event.stopPropagation();
                 onNavigateToAlbum();
               }}
-              className="block w-full truncate text-left text-lg font-semibold text-white transition hover:text-white/95 focus-visible:outline-none animate-none"
+              className="block w-full text-left text-lg font-semibold text-white transition hover:text-white/95 focus-visible:outline-none animate-none"
             >
-              {track.title}
+              <Marquee className="text-lg font-semibold text-inherit">{track.title}</Marquee>
             </button>
           ) : (
-            <div className="truncate text-lg font-semibold text-white">{track.title}</div>
+            <Marquee className="text-lg font-semibold text-white">{track.title}</Marquee>
           )}
           <div className="truncate text-sm font-semibold text-neutral-400">
             {onNavigate ? (
@@ -1124,6 +1033,7 @@ export function ReleaseCard({
   metaExtra,
   suppressContextMenu,
   artistBrowseId: _artistBrowseId,
+  playButtonSize = "md",
 }: {
   item: ReleaseItem;
   onOpen: () => void;
@@ -1134,6 +1044,7 @@ export function ReleaseCard({
   metaExtra?: React.ReactNode;
   suppressContextMenu?: boolean;
   artistBrowseId?: string | null;
+  playButtonSize?: "md" | "lg";
 }) {
   const player = usePlayer();
   // A release card is "current" when the player's queueOrigin is an
@@ -1144,6 +1055,8 @@ export function ReleaseCard({
     player.queueOrigin?.kind === "album" && player.queueOrigin.browseId === item.browseId;
   const playing = isCurrentAlbum && player.isPlaying;
   const buffering = isCurrentAlbum && player.isBuffering;
+  const playButtonClass = playButtonSize === "lg" ? "h-14 w-14" : "h-12 w-12";
+  const playIconSize = playButtonSize === "lg" ? 24 : 20;
 
   return (
     <div
@@ -1183,16 +1096,16 @@ export function ReleaseCard({
               onPlay();
             }
           }}
-          className="absolute bottom-2 right-2 flex h-12 w-12 translate-y-2 items-center justify-center rounded-full text-black opacity-0 shadow-lg group-hover:translate-y-0 group-hover:opacity-100 animate-none"
+          className={`absolute bottom-2 right-2 flex ${playButtonClass} items-center justify-center rounded-full text-black shadow-lg ${cardHoverPlayTransitionClass} ${cardHoverPlayRevealClass()}`}
           style={{ backgroundColor: playBgColor }}
           aria-label={buffering ? "Loading" : playing ? "Pause release" : "Play release"}
         >
           {buffering ? (
-            <LoaderCircle size={20} className="animate-spin" />
+            <LoaderCircle size={playIconSize} className="animate-spin" />
           ) : playing ? (
-            <Pause size={20} fill="currentColor" strokeWidth={0} />
+            <Pause size={playIconSize} fill="currentColor" strokeWidth={0} />
           ) : (
-            <Play size={20} fill="currentColor" strokeWidth={0} className="translate-x-[1.5px]" />
+            <Play size={playIconSize} fill="currentColor" strokeWidth={0} className="translate-x-[1.5px]" />
           )}
         </button>
       </div>
@@ -1226,7 +1139,7 @@ function FullDiscographyView({
   onChangeViewMode,
   onToggleFilterMenu,
   onToggleSortMenu,
-  activeTrackId,
+  currentTrack,
   playing,
   buffering,
   togglePlay,
@@ -1238,7 +1151,6 @@ function FullDiscographyView({
   onAddAlbumToQueue,
   onAddAlbumToPlaylist,
   resolvePlaylists,
-  createPlaylistAndAddTracks,
   onNavigate,
 }: {
   active: boolean;
@@ -1259,7 +1171,7 @@ function FullDiscographyView({
   onChangeViewMode: (mode: ViewMode) => void;
   onToggleFilterMenu: () => void;
   onToggleSortMenu: () => void;
-  activeTrackId: string | null;
+  currentTrack: MediaTrack | null;
   playing: boolean;
   buffering: boolean;
   togglePlay: () => void;
@@ -1271,9 +1183,6 @@ function FullDiscographyView({
   onAddAlbumToQueue?: (tracks: MediaTrack[], browseId: string, name: string) => void;
   onAddAlbumToPlaylist?: (browseId: string, tracks: MediaTrack[]) => Promise<void> | void;
   resolvePlaylists?: (query: string) => Promise<Array<{ browseId: string; title: string; subtitle?: string | null; cover?: string | null }>>;
-  createPlaylistAndAddTracks?: (
-    tracks: MediaTrack[],
-  ) => Promise<{ browseId: string; title: string } | void>;
   onNavigate?: (view: View) => void;
 }) {
   const [details, setDetails] = useState<Record<string, ReleaseDetailState>>(() => {
@@ -1913,7 +1822,7 @@ function FullDiscographyView({
                 state={release.browseId ? details[release.browseId] : undefined}
                 onOpen={() => onOpenItem(release)}
                 onPlayTrack={onPlayTrack}
-                activeTrackId={activeTrackId}
+                currentTrack={currentTrack}
                 playing={playing}
                 buffering={buffering}
               togglePlay={togglePlay}
@@ -1921,7 +1830,7 @@ function FullDiscographyView({
                 onAddAlbumToQueue={onAddAlbumToQueue}
                 onAddAlbumToPlaylist={onAddAlbumToPlaylist}
                 resolvePlaylists={resolvePlaylists}
-                createPlaylistAndAddTracks={createPlaylistAndAddTracks}
+      
                 onNavigate={onNavigate}
                 artistBrowseId={artistBrowseId}
               />
@@ -2102,7 +2011,7 @@ function DiscographyRelease({
   state,
   onOpen,
   onPlayTrack,
-  activeTrackId,
+  currentTrack,
   playing,
   buffering,
   togglePlay,
@@ -2110,7 +2019,6 @@ function DiscographyRelease({
   onAddAlbumToQueue,
   onAddAlbumToPlaylist,
   resolvePlaylists,
-  createPlaylistAndAddTracks,
   onNavigate,
   artistBrowseId,
 }: {
@@ -2120,7 +2028,7 @@ function DiscographyRelease({
   state?: ReleaseDetailState;
   onOpen: () => void;
   onPlayTrack: (track: MediaTrack) => void;
-  activeTrackId: string | null;
+  currentTrack: MediaTrack | null;
   playing: boolean;
   buffering: boolean;
   togglePlay: () => void;
@@ -2128,9 +2036,6 @@ function DiscographyRelease({
   onAddAlbumToQueue?: (tracks: MediaTrack[], browseId: string, name: string) => void;
   onAddAlbumToPlaylist?: (browseId: string, tracks: MediaTrack[]) => Promise<void> | void;
   resolvePlaylists?: (query: string) => Promise<Array<{ browseId: string; title: string; subtitle?: string | null; cover?: string | null }>>;
-  createPlaylistAndAddTracks?: (
-    tracks: MediaTrack[],
-  ) => Promise<{ browseId: string; title: string } | void>;
   onNavigate?: (view: View) => void;
   artistBrowseId?: string | null;
 }) {
@@ -2138,12 +2043,21 @@ function DiscographyRelease({
   const collection = useCollection();
   const detail = state?.status === "ready" ? state.data : null;
   const tracks = useMemo(() => {
-    return detail?.tracks.map((track) => ({
-      ...track,
-      album: track.album ?? release.title,
-      albumBrowseId: release.browseId ?? track.albumBrowseId,
-    })) ?? [];
+    const mapped =
+      detail?.tracks.map((track) => ({
+        ...track,
+        album: track.album ?? release.title,
+        albumBrowseId: release.browseId ?? track.albumBrowseId,
+      })) ?? [];
+    return filterQueueableTracks(mapped);
   }, [detail, release.browseId, release.title]);
+  const [displayTracks, setDisplayTracks] = useState<MediaTrack[]>(tracks);
+
+  useEffect(() => {
+    setDisplayTracks(tracks);
+  }, [tracks]);
+
+  useTrackMetadataBackfill(displayTracks, setDisplayTracks);
   const isReleaseActive =
     player.currentTrack?.albumBrowseId === release.browseId &&
     (!artistBrowseId || (player.queueOrigin?.kind === "artist" && player.queueOrigin.browseId === artistBrowseId));
@@ -2151,7 +2065,7 @@ function DiscographyRelease({
   const isReleaseBuffering = isReleaseActive && player.isBuffering;
   const meta = detail ? formatFullReleaseMeta(release, detail.tracks.length) : formatReleaseMeta(release);
   const [firstTrackHovered, setFirstTrackHovered] = useState(false);
-  const firstTrackActive = activeTrackId === tracks[0]?.id;
+  const firstTrackActive = displayTracks[0] ? isSameSongTrack(currentTrack, displayTracks[0]) : false;
   const [ellipsisOpen, setEllipsisOpen] = useState(false);
   const [ellipsisPosition, setEllipsisPosition] = useState<{ x: number; y: number } | undefined>(undefined);
   const ellipsisButtonRef = useRef<HTMLButtonElement | null>(null);
@@ -2203,8 +2117,8 @@ function DiscographyRelease({
               onClick={() => {
                 if (isReleaseActive) {
                   player.togglePlay();
-                } else if (tracks.length > 0) {
-                  void player.playMany(tracks, 0, release.browseId ? { kind: "album", browseId: release.browseId } : undefined);
+                } else if (displayTracks.length > 0) {
+                  void player.playMany(displayTracks, 0, release.browseId ? { kind: "album", browseId: release.browseId } : undefined);
                 } else {
                   onOpen();
                 }
@@ -2220,32 +2134,32 @@ function DiscographyRelease({
                 <Play size={22} fill="currentColor" strokeWidth={0} />
               )}
             </button>
-            <button
-              type="button"
-              className="flex h-8 w-8 items-center justify-center text-white/58 transition hover:text-white animate-none"
-              aria-label="Add release"
-            >
-              {release.browseId ? (
-                <SaveButton
-                  isSaved={collection.isAlbumSaved(release.browseId)}
-                  onToggle={() =>
-                    collection.toggleAlbum({
-                      browseId: release.browseId!,
-                      title: release.title,
-                      subtitle: release.subtitle ?? "",
-                      cover: release.cover ?? null,
-                      byline: release.artist ?? null,
-                      year: release.yearLabel ?? null,
-                      artistBrowseId: release.artistBrowseId ?? null,
-                    })
-                  }
-                  size="sm"
-                  ariaLabel="Add release to collection"
-                />
-              ) : (
+            {release.browseId ? (
+              <SaveButton
+                isSaved={collection.isAlbumSaved(release.browseId)}
+                onToggle={() =>
+                  collection.toggleAlbum({
+                    browseId: release.browseId!,
+                    title: release.title,
+                    subtitle: release.subtitle ?? "",
+                    cover: release.cover ?? null,
+                    byline: release.artist ?? null,
+                    year: release.yearLabel ?? null,
+                    artistBrowseId: release.artistBrowseId ?? null,
+                  })
+                }
+                size="md"
+                ariaLabel="Add release to collection"
+              />
+            ) : (
+              <button
+                type="button"
+                className="flex h-8 w-8 items-center justify-center text-white/58 transition hover:text-white animate-none"
+                aria-label="Add release"
+              >
                 <CirclePlus size={22} />
-              )}
-            </button>
+              </button>
+            )}
             <button
               ref={ellipsisButtonRef}
               type="button"
@@ -2270,11 +2184,11 @@ function DiscographyRelease({
         position={ellipsisPosition}
         onClose={() => setEllipsisOpen(false)}
         album={savedAlbum}
-        tracks={tracks.length > 0 ? tracks : undefined}
+        tracks={displayTracks.length > 0 ? displayTracks : undefined}
         onAddAlbumToQueue={onAddAlbumToQueue}
         onAddAlbumToPlaylist={onAddAlbumToPlaylist}
         resolvePlaylists={resolvePlaylists}
-        createPlaylistAndAddTracks={createPlaylistAndAddTracks}
+
         onNavigate={onNavigate}
         currentAlbumBrowseId={player.currentTrack?.albumBrowseId ?? undefined}
       />
@@ -2290,21 +2204,21 @@ function DiscographyRelease({
         <div className="px-4 py-5 text-sm font-semibold text-white/42">{state.message}</div>
       ) : (
         <div>
-          {tracks.map((track, index) => (
+          {displayTracks.map((track, index) => (
             <DiscographyTrackRow
               key={track.id}
               track={track}
               index={index}
               dominoIndex={Math.min(index, 14)}
-              active={activeTrackId === track.id}
-              playing={playing && activeTrackId === track.id}
-              buffering={buffering && activeTrackId === track.id}
+              active={isSameSongTrack(currentTrack, track)}
+              playing={playing && isSameSongTrack(currentTrack, track)}
+              buffering={buffering && isSameSongTrack(currentTrack, track)}
               onPlay={() => {
-                if (tracks.length > 0) {
+                if (displayTracks.length > 0) {
                   if (release.browseId) {
-                    void player.playMany(tracks, index, { kind: "album", browseId: release.browseId });
+                    void player.playMany(displayTracks, index, { kind: "album", browseId: release.browseId });
                   } else {
-                    playMany(tracks, index);
+                    playMany(displayTracks, index);
                   }
                 } else {
                   onPlayTrack(track);
@@ -2342,7 +2256,7 @@ function DiscographyTrackRow({
   onHoverChange?: (hovered: boolean) => void;
 }) {
   const collection = useCollection();
-  const isSaved = collection.isSongSaved(track.id);
+  const isSaved = collection.isTrackSaved(track);
   return (
     <div
       data-song-context-target="true"

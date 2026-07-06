@@ -18,7 +18,13 @@ import { SaveButton } from "./SaveButton";
 import { AnimatedShuffle } from "./PlayerButtonIcons";
 import type { EntityDetail, MediaTrack } from "../types";
 import { mixRgb, rgbToCss } from "../utils/artwork-color";
-import { formatDuration, formatOptionalDuration, formatPlayCount } from "../utils/media";
+import {
+  filterQueueableTracks,
+  formatDuration,
+  formatOptionalDuration,
+  formatPlayCount,
+  isSameSongTrack,
+} from "../utils/media";
 import { ArtworkImage, MoreButton, TrackRow, encodeTrackForContextMenu } from "./Shared";
 import { Marquee } from "./Marquee";
 import {
@@ -36,6 +42,7 @@ import {
 } from "./PagesShared";
 import { getDirectArtistBrowseId, resolveArtistBrowseId } from "../utils/navigation";
 import { useSetting, setSetting, type ViewMode } from "../settings";
+import { useTrackMetadataBackfill } from "../hooks/useTrackMetadataBackfill";
 
 export function EntityPage({
   browseId,
@@ -44,7 +51,6 @@ export function EntityPage({
   onAddAlbumToQueue,
   onAddAlbumToPlaylist,
   resolvePlaylists,
-  createPlaylistAndAddTracks,
 }: {
   browseId: string;
   onPlayMany: (tracks: MediaTrack[], startIndex?: number, origin?: QueueOrigin) => void;
@@ -54,9 +60,6 @@ export function EntityPage({
   resolvePlaylists?: (
     query: string,
   ) => Promise<Array<{ browseId: string; title: string; subtitle?: string | null; cover?: string | null }>>;
-  createPlaylistAndAddTracks?: (
-    tracks: MediaTrack[],
-  ) => Promise<{ browseId: string; title: string } | void>;
 }) {
   // Seed from the synchronous peek so a Back/Forward navigation to an
   // already-visited album/playlist renders its full content on the very
@@ -111,7 +114,6 @@ export function EntityPage({
         onAddAlbumToQueue={onAddAlbumToQueue}
         onAddAlbumToPlaylist={onAddAlbumToPlaylist}
         resolvePlaylists={resolvePlaylists}
-        createPlaylistAndAddTracks={createPlaylistAndAddTracks}
       />
     );
   }
@@ -147,15 +149,26 @@ function PlaylistPage({
   const isPlaylistPlaying = isPlaylistActive && player.isPlaying;
   const isPlaylistBuffering = isPlaylistActive && player.isBuffering;
   const playlistTracks = useMemo(
-    () => detail.tracks.map((track) => ({ ...track, albumBrowseId: playlistBrowseId })),
+    () =>
+      filterQueueableTracks(
+        detail.tracks.map((track) => ({ ...track, albumBrowseId: playlistBrowseId })),
+      ),
     [playlistBrowseId, detail.tracks],
   );
+  const [displayPlaylistTracks, setDisplayPlaylistTracks] = useState<MediaTrack[]>(playlistTracks);
+
+  useEffect(() => {
+    setDisplayPlaylistTracks(playlistTracks);
+  }, [playlistTracks]);
+
+  useTrackMetadataBackfill(displayPlaylistTracks, setDisplayPlaylistTracks);
+
   const accent = useArtworkAccent(detail.cover, playlistBrowseId);
-  const totalSeconds = detail.tracks.reduce((sum, track) => sum + (track.durationSeconds ?? 0), 0);
+  const totalSeconds = displayPlaylistTracks.reduce((sum, track) => sum + (track.durationSeconds ?? 0), 0);
   const heroTop = mixRgb(accent, { r: 0, g: 0, b: 0 }, 0.34);
   const controlTop = mixRgb(accent, { r: 0, g: 0, b: 0 }, 0.86);
   const playColor = mixRgb(accent, { r: 255, g: 255, b: 255 }, 0.22);
-  const trackCount = detail.tracks.length;
+  const trackCount = displayPlaylistTracks.length;
   const songLabel = `${trackCount} ${trackCount === 1 ? "song" : "songs"}`;
 
   const heroStyle: CSSProperties = {
@@ -223,7 +236,7 @@ function PlaylistPage({
             onClick={
               isPlaylistActive
                 ? player.togglePlay
-                : () => void player.playMany(playlistTracks, 0, { kind: "playlist", browseId })
+                : () => void player.playMany(displayPlaylistTracks, 0, { kind: "playlist", browseId })
             }
             className="flex h-14 w-14 items-center justify-center rounded-full text-black transition hover:scale-[1.04] animate-none"
             style={{ backgroundColor: rgbToCss(playColor) }}
@@ -251,12 +264,12 @@ function PlaylistPage({
       </section>
 
       <section className="bg-black px-[var(--ui-page-pad)] pb-[clamp(2.5rem,3.125vw,4rem)] pt-[clamp(1.4rem,3vw,2.2rem)]">
-        {playlistTracks.map((track, index) => (
+        {displayPlaylistTracks.map((track, index) => (
           <TrackRow
             key={track.id}
             track={track}
             index={index}
-            onPlay={() => onPlayMany(playlistTracks, index, { kind: "playlist", browseId })}
+            onPlay={() => onPlayMany(displayPlaylistTracks, index, { kind: "playlist", browseId })}
             showArtist
             showAlbum
             onNavigate={onNavigate}
@@ -281,7 +294,6 @@ function AlbumPage({
   onAddAlbumToQueue,
   onAddAlbumToPlaylist,
   resolvePlaylists,
-  createPlaylistAndAddTracks,
 }: {
   detail: EntityDetail;
   browseId: string;
@@ -292,9 +304,6 @@ function AlbumPage({
   resolvePlaylists?: (
     query: string,
   ) => Promise<Array<{ browseId: string; title: string; subtitle?: string | null; cover?: string | null }>>;
-  createPlaylistAndAddTracks?: (
-    tracks: MediaTrack[],
-  ) => Promise<{ browseId: string; title: string } | void>;
 }) {
   const player = usePlayer();
   const collection = useCollection();
@@ -307,13 +316,24 @@ function AlbumPage({
   const isAlbumPlaying = isAlbumActive && player.isPlaying;
   const isAlbumBuffering = isAlbumActive && player.isBuffering;
   const albumTracks = useMemo(
-    () => detail.tracks.map((track) => ({ ...track, albumBrowseId })),
+    () =>
+      filterQueueableTracks(
+        detail.tracks.map((track) => ({ ...track, albumBrowseId })),
+      ),
     [albumBrowseId, detail.tracks],
   );
+  const [displayAlbumTracks, setDisplayAlbumTracks] = useState<MediaTrack[]>(albumTracks);
+
+  useEffect(() => {
+    setDisplayAlbumTracks(albumTracks);
+  }, [albumTracks]);
+
+  useTrackMetadataBackfill(displayAlbumTracks, setDisplayAlbumTracks);
+
   const accent = useArtworkAccent(detail.cover, albumBrowseId);
   const primaryArtistBrowseId =
-    albumTracks.find((track) => track.artistBrowseId)?.artistBrowseId ?? null;
-  const primaryArtistCredits = albumTracks[0]?.artistCredits ?? null;
+    displayAlbumTracks.find((track) => track.artistBrowseId)?.artistBrowseId ?? null;
+  const primaryArtistCredits = displayAlbumTracks[0]?.artistCredits ?? null;
   const artistThumb = useArtistCover(primaryArtistBrowseId);
   const handleResolveArtistName = useCallback((artistName: string) => {
     void resolveArtistBrowseId({ artist: artistName })
@@ -323,13 +343,25 @@ function AlbumPage({
       })
       .catch(() => undefined);
   }, [onNavigate]);
-  const totalSeconds = albumTracks.reduce((sum, track) => sum + (track.durationSeconds ?? 0), 0);
+  const handleResolveBylineNavigate = useCallback(() => {
+    void resolveArtistBrowseId({
+      artist: detail.byline ?? undefined,
+      artistBrowseId: primaryArtistBrowseId,
+      artistCredits: primaryArtistCredits,
+    })
+      .then((browseId) => {
+        if (!browseId) return;
+        onNavigate({ name: "artist", browseId, context: "default" });
+      })
+      .catch(() => undefined);
+  }, [detail.byline, onNavigate, primaryArtistBrowseId, primaryArtistCredits]);
+  const totalSeconds = displayAlbumTracks.reduce((sum, track) => sum + (track.durationSeconds ?? 0), 0);
   const heroTop = mixRgb(accent, { r: 0, g: 0, b: 0 }, 0.34);
   const controlTop = mixRgb(accent, { r: 0, g: 0, b: 0 }, 0.86);
   const playColor = mixRgb(accent, { r: 255, g: 255, b: 255 }, 0.22);
   const baseMetaParts = detail.meta
     ? splitAlbumMeta(detail.meta)
-    : [formatAlbumSummary(albumTracks.length, totalSeconds)];
+    : [formatAlbumSummary(displayAlbumTracks.length, totalSeconds)];
 
   let releaseDate: string | undefined;
   let metaParts = baseMetaParts;
@@ -348,7 +380,7 @@ function AlbumPage({
     }
   }
   const [firstTrackHovered, setFirstTrackHovered] = useState(false);
-  const firstTrackActive = albumTracks[0] ? isTrackActive(player.currentTrack, albumTracks[0], { kind: "album", browseId }, player.queueOrigin) : false;
+  const firstTrackActive = displayAlbumTracks[0] ? isSameSongTrack(player.currentTrack, displayAlbumTracks[0]) : false;
   const viewMode = useSetting("viewModeAlbum");
   const [viewMenuOpen, setViewMenuOpen] = useState(false);
   const [ellipsisOpen, setEllipsisOpen] = useState(false);
@@ -356,10 +388,10 @@ function AlbumPage({
   const ellipsisButtonRef = useRef<HTMLButtonElement | null>(null);
   const viewMenuScopeRef = useRef<HTMLDivElement | null>(null);
   const savedAlbum = useMemo<SavedAlbum>(() => entityToSavedAlbum(detail), [detail]);
-  const isSingle = albumTracks.length === 1;
+  const isSingle = displayAlbumTracks.length === 1;
   const isReleaseSaved = isSingle
-    ? (albumTracks[0]?.videoId
-        ? collection.isSongSavedByVideo(albumTracks[0].videoId)
+    ? (displayAlbumTracks[0]?.videoId
+        ? collection.isSongSavedByVideo(displayAlbumTracks[0].videoId)
         : false)
     : collection.isAlbumSaved(browseId);
 
@@ -411,7 +443,7 @@ function AlbumPage({
 
           <div className="min-w-0 flex-1 pb-1">
             <div className="mb-3 text-xs font-bold text-white">
-              {albumTracks.length === 1 ? "Single" : "Album"}
+              {displayAlbumTracks.length === 1 ? "Single" : "Album"}
             </div>
             <Marquee speed={60} className="max-w-5xl text-[clamp(2rem,4.5vw,3.6rem)] font-bold leading-[1] text-white">
               {detail.title}
@@ -432,6 +464,7 @@ function AlbumPage({
                       artistCredits={primaryArtistCredits}
                       context="default"
                       onNavigate={onNavigate}
+                      onResolveNavigate={primaryArtistBrowseId ? null : handleResolveBylineNavigate}
                       onResolveArtistName={handleResolveArtistName}
                     />
                   </span>
@@ -464,7 +497,7 @@ function AlbumPage({
             onClick={
               isAlbumActive
                 ? player.togglePlay
-                : () => void player.playMany(albumTracks, 0, { kind: "album", browseId })
+                : () => void player.playMany(displayAlbumTracks, 0, { kind: "album", browseId })
             }
             className="flex h-14 w-14 items-center justify-center rounded-full text-black transition hover:scale-[1.04] animate-none"
             style={{ backgroundColor: rgbToCss(playColor) }}
@@ -501,8 +534,8 @@ function AlbumPage({
           <SaveButton
             isSaved={isReleaseSaved}
             onToggle={() => {
-              if (isSingle && albumTracks[0]) {
-                collection.toggleSong(albumTracks[0]);
+              if (isSingle && displayAlbumTracks[0]) {
+                collection.toggleSong(displayAlbumTracks[0]);
               } else {
                 collection.toggleAlbum(savedAlbum);
               }
@@ -566,11 +599,10 @@ function AlbumPage({
         position={ellipsisPosition}
         onClose={() => setEllipsisOpen(false)}
         album={savedAlbum}
-        tracks={albumTracks}
+        tracks={displayAlbumTracks}
         onAddAlbumToQueue={onAddAlbumToQueue}
         onAddAlbumToPlaylist={onAddAlbumToPlaylist}
         resolvePlaylists={resolvePlaylists}
-        createPlaylistAndAddTracks={createPlaylistAndAddTracks}
       />
 
       <section className="bg-black px-[var(--ui-page-pad)] pb-[clamp(2.5rem,3.125vw,4rem)] pt-[clamp(1.4rem,3vw,2.2rem)]">
@@ -581,14 +613,14 @@ function AlbumPage({
         )}
 
         <div>
-          {albumTracks.map((track, index) =>
+          {displayAlbumTracks.map((track, index) =>
             viewMode === "compact" ? (
               <CompactTrackRow
                 key={track.id}
                 track={track}
                 index={index}
                 playColor={playColor}
-                onPlay={() => onPlayMany(albumTracks, index, { kind: "album", browseId })}
+                onPlay={() => onPlayMany(displayAlbumTracks, index, { kind: "album", browseId })}
                 onHoverChange={index === 0 ? setFirstTrackHovered : undefined}
                 queueOrigin={{ kind: "album", browseId }}
               />
@@ -598,7 +630,7 @@ function AlbumPage({
                 track={track}
                 index={index}
                 playColor={playColor}
-                onPlay={() => onPlayMany(albumTracks, index, { kind: "album", browseId })}
+                onPlay={() => onPlayMany(displayAlbumTracks, index, { kind: "album", browseId })}
                 onNavigate={onNavigate}
                 onHoverChange={index === 0 ? setFirstTrackHovered : undefined}
                 queueOrigin={{ kind: "album", browseId }}
@@ -610,31 +642,6 @@ function AlbumPage({
       </section>
     </div>
   );
-}
-
-function isTrackActive(
-  currentTrack: MediaTrack | null,
-  track: MediaTrack,
-  contextOrigin?: QueueOrigin | null,
-  activeOrigin?: QueueOrigin | null,
-): boolean {
-  if (!currentTrack) return false;
-  if (
-    currentTrack.videoId && track.videoId
-      ? currentTrack.videoId !== track.videoId
-      : currentTrack.id !== track.id
-  ) return false;
-  if (contextOrigin) {
-    if (!activeOrigin) return false;
-    if (contextOrigin.kind !== activeOrigin.kind) return false;
-    if ("browseId" in contextOrigin && "browseId" in activeOrigin) {
-      return contextOrigin.browseId === activeOrigin.browseId;
-    }
-    if ("id" in contextOrigin && "id" in activeOrigin) {
-      return contextOrigin.id === activeOrigin.id;
-    }
-  }
-  return true;
 }
 
 function AlbumTrackRow({
@@ -658,11 +665,11 @@ function AlbumTrackRow({
 }) {
   const player = usePlayer();
   const collection = useCollection();
-  const active = isTrackActive(player.currentTrack, track, queueOrigin, player.queueOrigin);
+  const active = isSameSongTrack(player.currentTrack, track);
   const playingActive = active && player.isPlaying;
   const bufferingActive = active && player.isBuffering;
   const contextPayload = useMemo(() => encodeTrackForContextMenu(track), [track]);
-  const isSaved = parentIsSaved ?? collection.isSongSaved(track.id);
+  const isSaved = parentIsSaved ?? collection.isTrackSaved(track);
   const directArtistBrowseId = getDirectArtistBrowseId(track);
   const handleResolveNavigate = useCallback(() => {
     void resolveArtistBrowseId(track)
@@ -732,12 +739,12 @@ function AlbumTrackRow({
 
       <div className="flex min-w-0 items-center gap-2 py-0.5">
         <div className="min-w-0 overflow-hidden">
-          <div
-            className={`truncate text-[15px] font-semibold ${active ? "" : "text-white/92"}`}
+          <Marquee
+            className={`text-[15px] font-semibold ${active ? "" : "text-white/92"}`}
             style={active ? { color: rgbToCss(playColor) } : undefined}
           >
             {track.title}
-          </div>
+          </Marquee>
           <div className="mt-1 min-w-0 truncate text-sm text-white/46">
             <ArtistCreditText
               artist={track.artist}
@@ -801,7 +808,7 @@ function CompactTrackRow({
   queueOrigin?: QueueOrigin | null;
 }) {
   const player = usePlayer();
-  const active = isTrackActive(player.currentTrack, track, queueOrigin, player.queueOrigin);
+  const active = isSameSongTrack(player.currentTrack, track);
   const playingActive = active && player.isPlaying;
   const bufferingActive = active && player.isBuffering;
   const contextPayload = useMemo(() => encodeTrackForContextMenu(track), [track]);
@@ -856,12 +863,12 @@ function CompactTrackRow({
       </div>
 
       <div className="min-w-0 self-center">
-        <div
-          className={`truncate text-[15px] font-semibold ${active ? "" : "text-white/92"}`}
+        <Marquee
+          className={`text-[15px] font-semibold ${active ? "" : "text-white/92"}`}
           style={active ? { color: rgbToCss(playColor) } : undefined}
         >
           {track.title}
-        </div>
+        </Marquee>
       </div>
 
       <div className="flex items-center justify-center text-sm tabular-nums text-white/50">

@@ -6,19 +6,24 @@ import {
   useMemo,
   useRef,
   useState,
+  type Context,
   type ReactNode,
 } from "react";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import {
   analyzeLoudness,
   analyzeLoudnessChunk,
-  getSyncedLyrics,
+  detectLeadingSilence,
+  evictPersistedLyricsExcept,
+  hydratePersistedLyricsForTrack,
+  persistCachedLyricsForTrack,
+  prefetchSyncedLyricsForTrack,
   getWatchPlaylist,
-  getOfflinePath,
+  getOfflinePathForTrack,
+  hydrateUploadTrackForPlayback,
   invalidateStream,
   invalidateWatchPlaylist,
   resolveStream,
-  searchMusic,
 } from "./api";
 import type { LoudnessData, MediaTrack, QueueOrigin } from "./types";
 import {
@@ -30,9 +35,43 @@ import {
   getInitialGain,
   hasAttemptedAnalysis,
 } from "./normalization";
-import { getSetting, useSetting } from "./settings";
-import type { SearchItem } from "./types";
+import {
+  hasAttemptedLeadingSilenceAnalysis,
+  LEADING_SILENCE_DETECT_TIMEOUT_MS,
+  resolveLeadingSilenceSkipSeconds,
+  setCachedLeadingSilence,
+} from "./leading-silence";
+import { getSetting, setSetting, SETTINGS_KEY, useSetting } from "./settings";
 import { getItem, setItem, removeItem } from "./storage";
+import { enrichUploadMetadataFromYtm } from "./utils/upload-enrichment";
+import {
+  exportStreamVideoId,
+  filterQueueableTracks,
+  isAutoplayWatchPlaylistCandidate,
+  isQueueableTrack,
+  readLiveMediaDuration,
+  readDuration,
+  remapQueueStartIndex,
+  streamIdentityVideoIds,
+} from "./utils/media";
+import {
+  mergeTrackMetadata,
+  resolveTrackMetadata,
+} from "./utils/track-metadata-backfill";
+import {
+  isUnplayableStreamError,
+  resolveAutoplayEntries,
+  resolveStreamTrackAudio,
+  resolveStreamTrackAudioFallback,
+} from "./utils/song-resolution";
+import {
+  addVisitedQueueTrack,
+  findPreviousVisitedQueueIndex,
+  removeVisitedQueueTrack,
+  resetVisitedQueueTracks,
+  resolveHistoryVisitedTrackIds,
+  restoreVisitedQueueTracks,
+} from "./utils/queue-visited";
 
 export const currentAudio: { current: HTMLAudioElement | null } = { current: null };
 
@@ -42,14 +81,12 @@ type AutoplaySeed = { videoId: string; playlistId: string | null };
 
 export type { QueueOrigin } from "./types";
 
-type QueueHistoryTrack = {
-  track: MediaTrack;
-  queueIndex: number;
-};
-
 type RecentPlaybackTrack = {
   track: MediaTrack;
+  /** Index into `playbackHistory`, or `-1` when the row comes from the current queue. */
   historyIndex: number;
+  /** Set when `historyIndex === -1` — click restores via `playQueueIndex`. */
+  queueIndex?: number;
 };
 
 type PlayerState = {
@@ -58,12 +95,15 @@ type PlayerState = {
   queueIndex: number;
   queueOrigin: QueueOrigin | null;
   autoplayTrackIds: ReadonlySet<string>;
-  previousQueue: QueueHistoryTrack[];
   recentlyPlayed: RecentPlaybackTrack[];
   isPlaying: boolean;
   isBuffering: boolean;
   isReloadingAutoplay: boolean;
   progress: number;
+  /** Live scrubber position while dragging; `null` when not scrubbing. */
+  seekScrubProgress: number | null;
+  /** Bumps on every `seek()` so consumers (e.g. Discord RPC) can force-sync. */
+  seekRevision: number;
   duration: number;
   volume: number;
   muted: boolean;
@@ -79,16 +119,20 @@ type PlayerActions = {
   play: (track: MediaTrack) => Promise<void>;
   playMany: (tracks: MediaTrack[], startIndex?: number, origin?: QueueOrigin) => Promise<void>;
   playShuffled: (tracks: MediaTrack[], origin?: QueueOrigin) => Promise<void>;
-  playQueueIndex: (index: number) => void;
+  playQueueIndex: (index: number, trackId?: string) => void;
   restoreHistoryEntry: (index: number) => void;
   moveQueueItem: (fromIndex: number, toIndex: number) => void;
   clearQueue: () => void;
+  clearPlaybackHistory: () => void;
   removeTrackFromQueue: (trackId: string) => void;
   appendToQueue: (tracks: MediaTrack[], origin?: QueueOrigin) => void;
   togglePlay: () => void;
   next: (recordRecentlyPlayed?: boolean) => void;
   prev: () => void;
   seek: (seconds: number) => void;
+  beginSeekScrub: () => boolean;
+  finishSeekScrub: (seconds: number | null, resume: boolean) => void;
+  updateSeekScrubPreview: (seconds: number | null) => void;
   setVolume: (value: number) => void;
   setLiveVolume: (value: number) => void;
   toggleMute: () => void;
@@ -104,7 +148,21 @@ type PlayerActions = {
 
 type PlayerContextValue = PlayerState & PlayerActions;
 
-const PlayerContext = createContext<PlayerContextValue | null>(null);
+// HMR-stable PlayerContext. Vite re-evaluates this file whenever a
+// downstream consumer (anything importing `usePlayer`) is edited in dev
+// mode, which would otherwise mint a fresh Context identity on every
+// reload. If a sibling lazy chunk in the same HMR batch fails to fetch
+// mid-batch, React Fast Refresh aborts its commit phase without rolling
+// back the module evaluation — the fiber tree keeps the old
+// <PlayerContext.Provider> while `useContext` reads the new Context's
+// default `null`, throwing "usePlayer must be used within PlayerProvider".
+// Stashing on `globalThis` keeps the identity stable across re-evaluations
+// so the chunk failure surfaces only as a bare "Unhandled Rejection"
+// overlay, never a context-tree crash.
+const playerContextSlot = globalThis as {
+  __VelocityPlayerContext?: Context<PlayerContextValue | null>;
+};
+const PlayerContext = (playerContextSlot.__VelocityPlayerContext ??= createContext<PlayerContextValue | null>(null));
 const VOLUME_KEY = "velocity-volume";
 const MUTED_KEY = "velocity-muted";
 const AUTOPLAY_KEY = "velocity-autoplay";
@@ -119,7 +177,6 @@ const RECENTLY_PLAYED_LIMIT = 50;
 // Total attempts = 1 initial + (MAX_LOAD_ATTEMPTS - 1) retries, spaced by RETRY_DELAY_MS.
 const MAX_LOAD_ATTEMPTS = 3;
 const RETRY_DELAY_MS = [700, 1500, 3500];
-const SEARCH_MATCH_TIMEOUT_MS = 4_000;
 const STREAM_RESOLVE_TIMEOUT_MS = 12_000;
 // How long to wait for a YT Music watch-playlist response before treating
 // the attempt as a failed autoplay fetch and trigging a retry. Keeps the
@@ -128,6 +185,59 @@ const AUTOPLAY_FETCH_TIMEOUT_MS = 3_000;
 // Base delay between auto-retries of a failed autoplay fetch. After the
 // 3rd retry the delay begins doubling per subsequent retry.
 const AUTOPLAY_RETRY_BASE_DELAY_MS = 3_000;
+// Re-resolve stream audio before resuming if the element has been idle longer
+// than this. Slightly under the Rust STREAM_CACHE_TTL (45 min) so a cached
+// file deleted server-side while the app sat paused cannot leave the media
+// element reading a ghost path and skipping mid-track.
+const STALE_PLAYBACK_MS = 40 * 60 * 1000;
+const SESSION_KEY = "velocity-session";
+const SESSION_MAX_AGE_MS = 86_400_000;
+
+type SavedSession = {
+  track: MediaTrack;
+  progress: number;
+  savedAt: number;
+};
+
+function parseSavedSessionRaw(raw: string | null): SavedSession | null {
+  if (!raw) return null;
+  try {
+    const data = JSON.parse(raw) as SavedSession;
+    if (!data?.track?.id || typeof data.progress !== "number") return null;
+    if (Date.now() - data.savedAt > SESSION_MAX_AGE_MS) return null;
+    return data;
+  } catch {
+    return null;
+  }
+}
+
+let cachedBootSession: SavedSession | null | undefined;
+
+/** One-shot read used to seed player state before the first paint on cold boot. */
+function getBootSession(): SavedSession | null {
+  if (cachedBootSession === undefined) {
+    if (getSetting("saveTimestamp")) {
+      const raw = getItem(SESSION_KEY);
+      cachedBootSession = parseSavedSessionRaw(raw);
+      if (raw && !cachedBootSession) removeItem(SESSION_KEY);
+    } else {
+      cachedBootSession = null;
+    }
+    if (cachedBootSession) {
+      hydratePersistedLyricsForTrack(cachedBootSession.track);
+    }
+  }
+  return cachedBootSession;
+}
+
+function bootAutoplaySeed(session: SavedSession): AutoplaySeed | null {
+  const restored = session.track;
+  const seedVideoId =
+    restored.source === "stream"
+      ? restored.resolvedVideoId ?? restored.videoId ?? null
+      : null;
+  return seedVideoId ? { videoId: seedVideoId, playlistId: null } : null;
+}
 
 type WebAudioWindow = Window & {
   webkitAudioContext?: typeof AudioContext;
@@ -137,6 +247,72 @@ function clampVolume(value: number): number {
   return Number.isFinite(value) ? Math.max(0, Math.min(1, value)) : DEFAULT_VOLUME;
 }
 
+function readAudioElementDuration(audio: HTMLAudioElement): number | null {
+  const value = readLiveMediaDuration(audio);
+  return value > 0 ? value : null;
+}
+
+function waitForMediaReady(audio: HTMLAudioElement): Promise<void> {
+  if (audio.readyState >= HTMLMediaElement.HAVE_FUTURE_DATA) {
+    return Promise.resolve();
+  }
+  return new Promise((resolve, reject) => {
+    const onReady = () => {
+      cleanup();
+      resolve();
+    };
+    const onError = () => {
+      cleanup();
+      reject(new Error(describeMediaError(audio.error) ?? "The audio could not be reloaded."));
+    };
+    const cleanup = () => {
+      audio.removeEventListener("canplay", onReady);
+      audio.removeEventListener("error", onError);
+    };
+    audio.addEventListener("canplay", onReady);
+    audio.addEventListener("error", onError);
+  });
+}
+
+function isPlaybackIdleLongEnough(idleSinceMs: number): boolean {
+  return idleSinceMs > 0 && Date.now() - idleSinceMs >= STALE_PLAYBACK_MS;
+}
+
+function playbackNeedsSourceRefresh(
+  track: MediaTrack | null | undefined,
+  idleSinceMs: number,
+  refreshFlag: boolean,
+): boolean {
+  return (
+    track?.source === "stream" &&
+    (refreshFlag || isPlaybackIdleLongEnough(idleSinceMs))
+  );
+}
+
+// Single source of truth for the audio gain applied to the gain node /
+// audio element. Encapsulates the full factor chain:
+//
+//   effective = normGain(when enabled) * clamp(volume) * 10^(masterVolume / 20)
+//
+// `normGain` is the linearized loudness-normalization factor (`1` if the
+// user has disabled audio normalization or the cached gain hasn't been
+// derived yet). `10^(masterVolume / 20)` is the master scaling expressed
+// in dB so users twiddle a UI slider in familiar dB units.
+//
+// Reads of `audioNormalization` and `masterVolume` are awaited synchronously
+// from localStorage-backed settings — they cannot fail and are safe inside
+// any of the 4 callsites that used to copy this formula by hand (see the
+// audio load effect, `applyOutputLevels`, `setLiveVolume`, and `togglePlay`).
+function computeAppliedGain(volume: number, normGain: number): number {
+  const cleanVolume = clampVolume(volume);
+  const cleanGain = Number.isFinite(normGain) && normGain > 0 ? normGain : 1;
+  const masterVolumeDb = getSetting("masterVolume");
+  const masterVolumeGain = Math.pow(10, masterVolumeDb / 20);
+  const normalizationEnabled = getSetting("audioNormalization");
+  const effectiveGain = normalizationEnabled ? cleanGain : 1;
+  return effectiveGain * cleanVolume * masterVolumeGain;
+}
+
 function shuffledCopy<T>(items: readonly T[]): T[] {
   const shuffled = [...items];
   for (let index = shuffled.length - 1; index > 0; index -= 1) {
@@ -144,71 +320,6 @@ function shuffledCopy<T>(items: readonly T[]): T[] {
     [shuffled[index], shuffled[swapIndex]] = [shuffled[swapIndex], shuffled[index]];
   }
   return shuffled;
-}
-
-// Common YouTube video-title decorations that hurt song search matching.
-// Strip them so a search like "Artist Song (Official Music Video)" still
-// resolves to a clean title match in the search results.
-const VIDEO_TITLE_SUFFIX_REGEX = new RegExp(
-  "[\\(\\[]?(official\\s+(music\\s+)?video|official\\s+audio|music\\s+video|official\\s+visualizer|visualizer|audio|video|lyrics?|lyric\\s+video|clip|m\\/v|hd|4k|hq|remastered(?:\\s+\\d{4})?)[\\)\\]]?\\s*$",
-  "i",
-);
-const VIDEO_TITLE_PREFIX_REGEX = new RegExp(
-  "^[\\(\\[]?(official\\s+(music\\s+)?video|official\\s+audio|music\\s+video)[\\)\\]]?\\s*[-–—:]?\\s*",
-  "i",
-);
-
-function cleanAutoplaySearchTitle(title: string): string {
-  return title
-    .replace(VIDEO_TITLE_PREFIX_REGEX, "")
-    .replace(VIDEO_TITLE_SUFFIX_REGEX, "")
-    .replace(/\s*[-–—]\s*topic\s*$/i, "")
-    .trim();
-}
-
-const AUTOPLAY_MIN_ARTIST_OVERLAP = 0.25;
-const AUTOPLAY_MIN_TITLE_OVERLAP = 0.25;
-
-function normalizeAutoplayMatchText(value: string): string {
-  return value
-    .toLowerCase()
-    .normalize("NFKD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .replace(/[^\p{L}\p{N}]+/gu, " ")
-    .trim();
-}
-
-function tokenOverlap(left: string, right: string): number {
-  const leftTokens = new Set(normalizeAutoplayMatchText(left).split(/\s+/).filter(Boolean));
-  const rightTokens = new Set(normalizeAutoplayMatchText(right).split(/\s+/).filter(Boolean));
-  if (leftTokens.size === 0 || rightTokens.size === 0) return 0;
-  let overlap = 0;
-  for (const token of leftTokens) {
-    if (rightTokens.has(token)) overlap += 1;
-  }
-  return overlap / Math.max(leftTokens.size, rightTokens.size);
-}
-
-// When swapping a track's underlying videoId (e.g. a music video → Topic upload,
-// or an album-track mislabel), require the candidate's runtime to match the
-// original within a tolerance. This blocks mislabeled uploads that claim the
-// right title/artist but actually contain a different song (observed: a
-// "Paranoid Android" result that played "2 + 2 = 5"). We require a candidate
-// duration whenever the source has one; if the source has no duration we can't
-// validate, so we fall back to the title/artist checks alone.
-function isDurationMatchForAutoplaySwap(
-  sourceSeconds: number | null | undefined,
-  candidateSeconds: number | null | undefined,
-): boolean {
-  const hasSource =
-    sourceSeconds != null && Number.isFinite(sourceSeconds) && sourceSeconds > 0;
-  const hasCandidate =
-    candidateSeconds != null && Number.isFinite(candidateSeconds) && candidateSeconds > 0;
-  if (!hasSource) return true;
-  if (!hasCandidate) return false;
-  const diff = Math.abs(sourceSeconds - candidateSeconds);
-  const tolerance = Math.max(15, sourceSeconds * 0.15);
-  return diff <= tolerance;
 }
 
 function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
@@ -225,259 +336,6 @@ function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string)
       },
     );
   });
-}
-
-// Build the display-metadata patch that should be applied to a track when
-// the audio has been resolved to a different (canonical Topic upload) song.
-// The matched song's title/cover/etc. win over the source track's — the
-// caller wants the user to see the audio-only song's metadata, not the
-// music video's. We deliberately do NOT mutate `id` or `videoId`; those
-// are preserved so the track's identity (and the active-state checks that
-// depend on it) keeps matching the original entry shown in track lists.
-//
-// Note: we intentionally do NOT fall back to `track.X` when `matched.X`
-// is missing. The source track is often the music video, and silently
-// inheriting its cover/title would re-introduce the music video's
-// metadata after the audio has been corrected to the canonical song.
-//
-// `matched` may be either a `SearchItem` (returned by
-// `findCanonicalSongVideoId`) or a fully-built `MediaTrack` (returned by
-// `findClosestSongForVideoTrack`). The fields we read are common to both.
-function songMetadataFromMatch(
-  _track: MediaTrack,
-  matched: MediaTrack | SearchItem,
-): Partial<MediaTrack> {
-  return {
-    title: matched.title,
-    artist: matched.artist ?? undefined,
-    album: matched.album ?? undefined,
-    albumBrowseId: matched.albumBrowseId ?? undefined,
-    artistBrowseId: matched.artistBrowseId ?? undefined,
-    artistCredits: matched.artistCredits ?? undefined,
-    durationSeconds: matched.durationSeconds ?? undefined,
-    playCount: matched.playCount ?? undefined,
-    cover: matched.cover ?? undefined,
-    kind: "song",
-  };
-}
-
-// Resolve an autoplay-tail entry to its audio-only song counterpart.
-//   * `kind === "video"` (the YT Music autoplay-suggested music video) gets
-//     passed through `findClosestSongForVideoTrack`, which returns a
-//     brand-new track with the canonical Topic-upload's videoId and
-//     metadata. If no match is found the entry is dropped — we never add a
-//     raw music video to the autoplay tail because its videoId would play
-//     the video's audio (visual clip, not the song) in the queue.
-//   * `kind === "song"` (YT Music sometimes mislabels music videos as
-//     songs via its normalize_kind fallback) is run through
-//     `findCanonicalSongVideoId` to look up a *different* song-kind
-//     videoId for the same (artist, title). When found, the entry is
-//     rebuilt with the canonical's videoId and display metadata so the
-//     audio and the thumbnail/title stay in sync.
-//   * Episodes, podcasts, and anything else pass through untouched.
-//
-// Returns `null` for video entries with no match (so the autoplay tail
-// filter drops them); returns the transformed entry otherwise.
-async function resolveAutoplayEntryToSong(entry: MediaTrack): Promise<MediaTrack | null> {
-  if (entry.kind === "video") {
-    const matched = await findClosestSongForVideoTrack(entry);
-    return matched ?? null;
-  }
-  if (entry.kind === "song" && entry.videoId) {
-    try {
-      const canonical = await findCanonicalSongVideoId(entry);
-      if (canonical && canonical.videoId && canonical.videoId !== entry.videoId) {
-        return {
-          ...entry,
-          id: `yt:${canonical.videoId}`,
-          videoId: canonical.videoId,
-          ...songMetadataFromMatch(entry, canonical),
-        };
-      }
-    } catch {
-      // Search failed — keep the original entry rather than dropping it.
-    }
-  }
-  return entry;
-}
-
-async function findClosestSongForVideoTrack(
-  video: MediaTrack,
-): Promise<MediaTrack | null> {
-  const cleanedTitle = cleanAutoplaySearchTitle(video.title);
-  const query = `${video.artist} ${cleanedTitle || video.title}`.trim();
-  if (!query) return null;
-
-  try {
-    const response = await withTimeout(
-      searchMusic(query),
-      SEARCH_MATCH_TIMEOUT_MS,
-      "Song lookup took too long.",
-    );
-    const candidates: SearchItem[] = [];
-    if (response.topResult) candidates.push(response.topResult);
-    for (const item of response.results) {
-      if (!candidates.some((existing) => existing.id === item.id)) {
-        candidates.push(item);
-      }
-    }
-
-    const songs = candidates.filter(
-      (item) => item.kind === "song" && !!item.videoId,
-    );
-    if (songs.length === 0) return null;
-
-    const candidateArtist = video.artist;
-    const candidateTitle = cleanedTitle || video.title;
-    const ranked = songs
-      .map((song, index) => {
-        const songArtist = song.artist ?? "";
-        // Route exact-match checks through the same normalize-token pipeline
-        // the overlap scorer uses so diacritics/whitespace don't block the
-        // bypass (e.g. "Café" vs "Cafe").
-        const exactArtist =
-          normalizeAutoplayMatchText(candidateArtist) ===
-          normalizeAutoplayMatchText(songArtist);
-        const exactTitle =
-          normalizeAutoplayMatchText(candidateTitle) ===
-          normalizeAutoplayMatchText(song.title);
-        const artistScore = tokenOverlap(candidateArtist, songArtist);
-        const titleScore = tokenOverlap(candidateTitle, song.title);
-        // Exact (artist, title) hits always outrank partial overlaps so a
-        // close-fuzzy match can't outvote a true equivalent. Otherwise we
-        // rank by weighted overlap (artist more important than title) and
-        // fall back to the original index to keep ties deterministic.
-        const exactPair = exactArtist && exactTitle ? 1 : 0;
-        const score = exactPair + artistScore * 0.6 + titleScore * 0.4;
-        return { song, score, index, exactArtist, exactTitle, artistScore, titleScore };
-      })
-      .sort((a, b) => b.score - a.score || a.index - b.index);
-
-    const best = ranked[0];
-    if (!best) return null;
-    // Both axes must clear an overlap floor to avoid substituting a same-
-    // artist different track or a same-title track by a cover artist.
-    const meetsArtist =
-      best.exactArtist || best.artistScore >= AUTOPLAY_MIN_ARTIST_OVERLAP;
-    const meetsTitle =
-      best.exactTitle || best.titleScore >= AUTOPLAY_MIN_TITLE_OVERLAP;
-    if (!meetsArtist || !meetsTitle) return null;
-    // Runtime guard: a title/artist match isn't enough if the candidate's
-    // length is wildly different — it may be a mislabeled upload.
-    if (!isDurationMatchForAutoplaySwap(video.durationSeconds, best.song.durationSeconds)) {
-      return null;
-    }
-
-    const matched = best.song;
-    const matchedVideoId = matched.videoId!;
-    // Build the new track from the matched song's metadata only. We do NOT
-    // fall back to the music video's title/cover/etc. when the matched song
-    // is missing a field — the caller explicitly wants the song counterpart's
-    // metadata, and silently inheriting the music video's cover would
-    // display the music video's thumbnail while playing the song's audio.
-    return {
-      ...video,
-      id: `yt:${matchedVideoId}`,
-      videoId: matchedVideoId,
-      title: matched.title,
-      artist: matched.artist ?? "",
-      album: matched.album ?? null,
-      albumBrowseId: matched.albumBrowseId ?? null,
-      artistBrowseId: matched.artistBrowseId ?? null,
-      artistCredits: matched.artistCredits ?? null,
-      durationSeconds: matched.durationSeconds ?? null,
-      playCount: matched.playCount ?? null,
-      cover: matched.cover ?? null,
-      kind: "song",
-    };
-  } catch (error) {
-    console.warn("Autoplay song-match lookup failed:", error);
-    return null;
-  }
-}
-
-// Search for the canonical "song" (Topic upload) version of a track and return
-// it. Used by `resolveTrackAudio` to swap a music-video videoId that landed
-// on a song-kind track. YouTube Music sometimes returns a music-video
-// videoId for album/playlist tracks when the music video is the more popular
-// result; this finds the audio-only Topic upload instead.
-//
-// The matched song's metadata (title, cover, etc.) is returned alongside the
-// videoId so the caller can update the track's display fields too. Without
-// this, a track that swaps to the canonical Topic upload's audio keeps
-// showing the music video's thumbnail and name in the UI — the audio
-// corrects but the metadata does not.
-//
-// Key: iterates ALL song-kind search results, skipping any with the same
-// videoId as the track (which would be the music video itself, possibly
-// misclassified as "song" by the backend's normalize_kind fallback). The
-// actual Topic upload has a DIFFERENT videoId and will be found further down
-// the ranked list.
-async function findCanonicalSongVideoId(
-  track: MediaTrack,
-): Promise<SearchItem | null> {
-  const query = `${track.artist} ${track.title}`.trim();
-  if (!query || !track.videoId) return null;
-
-  try {
-    const response = await withTimeout(
-      searchMusic(query),
-      SEARCH_MATCH_TIMEOUT_MS,
-      "Song lookup took too long.",
-    );
-    const candidates: SearchItem[] = [];
-    if (response.topResult) candidates.push(response.topResult);
-    for (const item of response.results) {
-      if (!candidates.some((existing) => existing.id === item.id)) {
-        candidates.push(item);
-      }
-    }
-
-    const songs = candidates.filter(
-      (item) => item.kind === "song" && !!item.videoId,
-    );
-    if (songs.length === 0) return null;
-
-    const candidateArtist = track.artist;
-    const candidateTitle = track.title;
-    const ranked = songs
-      .map((song, index) => {
-        const songArtist = song.artist ?? "";
-        const exactArtist =
-          normalizeAutoplayMatchText(candidateArtist) ===
-          normalizeAutoplayMatchText(songArtist);
-        const exactTitle =
-          normalizeAutoplayMatchText(candidateTitle) ===
-          normalizeAutoplayMatchText(song.title);
-        const artistScore = tokenOverlap(candidateArtist, songArtist);
-        const titleScore = tokenOverlap(candidateTitle, song.title);
-        const exactPair = exactArtist && exactTitle ? 1 : 0;
-        const score = exactPair + artistScore * 0.6 + titleScore * 0.4;
-        return { song, score, index, exactArtist, exactTitle };
-      })
-      .sort((a, b) => b.score - a.score || a.index - b.index);
-
-    // Iterate ALL ranked results — the top result may be the music video
-    // itself (misclassified as "song" by the backend's normalize_kind
-    // fallback) with the SAME videoId as the track. Skip it and keep looking
-    // for a result with a DIFFERENT videoId, which is the Topic upload.
-    // Require exact (artist, title) match to avoid swapping to a different
-    // track (remix, live version, etc.), and verify runtime so a mislabeled
-    // upload cannot sneak through with the right metadata but wrong audio.
-    for (const entry of ranked) {
-      if (!entry.exactArtist || !entry.exactTitle) continue;
-      if (!isDurationMatchForAutoplaySwap(track.durationSeconds, entry.song.durationSeconds)) {
-        continue;
-      }
-      const matchedVideoId = entry.song.videoId!;
-      if (matchedVideoId === track.videoId) continue;
-      return entry.song;
-    }
-    return null;
-  } catch (error) {
-    console.warn("Canonical song videoId lookup failed:", error);
-    return null;
-  }
 }
 
 function describeMediaError(error: MediaError | null): string {
@@ -543,17 +401,6 @@ function readMuted(): boolean | null {
   }
 }
 
-function readAutoplayPref(): boolean {
-  try {
-    const raw = getItem(AUTOPLAY_KEY);
-    if (raw === null) return true;
-    const parsed = JSON.parse(raw);
-    return typeof parsed === "boolean" ? parsed : true;
-  } catch {
-    return true;
-  }
-}
-
 // Audio analysis (loudness, leading silence) is a property of the
 // underlying audio file, so it should be cached by the underlying stream
 // videoId and ignore release/album context. `MediaTrack.id` encodes the
@@ -562,10 +409,14 @@ function readAutoplayPref(): boolean {
 // per-release re-analysis (and re-run the detector pipeline) for tracks
 // that share their audio across singles, EPs, and parent albums.
 function getAudioCacheKey(track: MediaTrack): string {
-  const effectiveVideoId = track.resolvedVideoId ?? track.videoId;
-  if (track.source === "stream" && effectiveVideoId) return `yt:${effectiveVideoId}`;
+  if (track.source === "stream") {
+    const effectiveVideoId = exportStreamVideoId(track);
+    if (effectiveVideoId) return `yt:${effectiveVideoId}`;
+  }
   return track.id;
 }
+
+const LEADING_SILENCE_APPLY_MAX_POSITION = 0.25;
 
 type PlaybackHistoryEntry = {
   track: MediaTrack;
@@ -575,6 +426,8 @@ type PlaybackHistoryEntry = {
   autoplayTrackIds: string[];
   autoplaySeed: AutoplaySeed | null;
   shuffle: boolean;
+  /** Track ids the user actually started in this queue session. */
+  queueVisitedTrackIds: string[];
 };
 
 function queueOriginEquals(left: QueueOrigin | null, right: QueueOrigin | null): boolean {
@@ -606,7 +459,8 @@ function playbackHistoryEntriesEqual(left: PlaybackHistoryEntry, right: Playback
     left.autoplaySeed?.videoId !== right.autoplaySeed?.videoId ||
     left.autoplaySeed?.playlistId !== right.autoplaySeed?.playlistId ||
     left.autoplayTrackIds.length !== right.autoplayTrackIds.length ||
-    left.queue.length !== right.queue.length
+    left.queue.length !== right.queue.length ||
+    left.queueVisitedTrackIds.length !== right.queueVisitedTrackIds.length
   ) {
     return false;
   }
@@ -619,15 +473,41 @@ function playbackHistoryEntriesEqual(left: PlaybackHistoryEntry, right: Playback
     if (left.queue[index]?.id !== right.queue[index]?.id) return false;
   }
 
+  for (let index = 0; index < left.queueVisitedTrackIds.length; index += 1) {
+    if (left.queueVisitedTrackIds[index] !== right.queueVisitedTrackIds[index]) return false;
+  }
+
   return true;
 }
 
-function queueTracksEqual(left: readonly MediaTrack[], right: readonly MediaTrack[]): boolean {
-  if (left.length !== right.length) return false;
-  for (let index = 0; index < left.length; index += 1) {
-    if (left[index]?.id !== right[index]?.id) return false;
+function playbackHistorySessionKey(
+  entry: Pick<PlaybackHistoryEntry, "track" | "queueIndex" | "queueOrigin" | "shuffle">,
+): string {
+  const origin = entry.queueOrigin;
+  let originKey = "";
+  if (origin) {
+    originKey = origin.kind === "user-playlist"
+      ? `user:${origin.id}`
+      : `browse:${"browseId" in origin ? origin.browseId : ""}`;
   }
-  return true;
+  return `${entry.track.id}\0${entry.queueIndex}\0${entry.shuffle ? 1 : 0}\0${originKey}`;
+}
+
+function prependPlaybackHistoryEntry(
+  current: PlaybackHistoryEntry[],
+  entry: PlaybackHistoryEntry,
+): PlaybackHistoryEntry[] {
+  const sessionKey = playbackHistorySessionKey(entry);
+  const withoutDuplicate = current.filter(
+    (existing) => playbackHistorySessionKey(existing) !== sessionKey,
+  );
+  if (
+    withoutDuplicate[0] &&
+    playbackHistoryEntriesEqual(withoutDuplicate[0], entry)
+  ) {
+    return withoutDuplicate;
+  }
+  return [entry, ...withoutDuplicate].slice(0, RECENTLY_PLAYED_LIMIT);
 }
 
 function playbackEntryMatchesQueueSession(
@@ -635,7 +515,65 @@ function playbackEntryMatchesQueueSession(
   activeQueue: readonly MediaTrack[],
   activeOrigin: QueueOrigin | null,
 ): boolean {
-  return queueOriginEquals(entry.queueOrigin, activeOrigin) && queueTracksEqual(entry.queue, activeQueue);
+  if (!queueOriginEquals(entry.queueOrigin, activeOrigin)) return false;
+  if (entry.queue.length > activeQueue.length) return false;
+  for (let index = 0; index < entry.queue.length; index += 1) {
+    if (entry.queue[index]?.id !== activeQueue[index]?.id) return false;
+  }
+  return true;
+}
+
+function historyRestoreWouldDropAppendedTracks(
+  currentQueue: readonly MediaTrack[],
+  historyEntry: PlaybackHistoryEntry,
+): boolean {
+  const historyQueue = historyEntry.queue;
+  if (currentQueue.length <= historyQueue.length) return false;
+  return historyQueue.every((track, index) => currentQueue[index]?.id === track.id);
+}
+
+function findPreviousSessionHistoryIndex(
+  history: readonly PlaybackHistoryEntry[],
+  currentQueue: readonly MediaTrack[],
+  currentIndex: number,
+  currentTrack: MediaTrack | null,
+  activeOrigin: QueueOrigin | null,
+): number {
+  if (!currentTrack) return -1;
+  const aheadIds = new Set(
+    currentQueue.slice(currentIndex + 1).map((track) => track.id),
+  );
+  for (let index = 0; index < history.length; index += 1) {
+    const entry = history[index];
+    if (entry.track.id === currentTrack.id) continue;
+    // Tracks still queued ahead of the playhead were skipped past — not "previous".
+    if (aheadIds.has(entry.track.id)) continue;
+    if (
+      playbackEntryMatchesQueueSession(entry, currentQueue, activeOrigin) &&
+      entry.queueIndex > currentIndex
+    ) {
+      continue;
+    }
+    return index;
+  }
+  return -1;
+}
+
+function isRedoingQueueAdvance(
+  history: readonly PlaybackHistoryEntry[],
+  currentQueue: readonly MediaTrack[],
+  currentIndex: number,
+  activeOrigin: QueueOrigin | null,
+): boolean {
+  const nextTrack = currentQueue[currentIndex + 1];
+  const currentTrack = currentQueue[currentIndex];
+  if (!nextTrack || !currentTrack) return false;
+  return history.some(
+    (entry) =>
+      entry.track.id === nextTrack.id &&
+      entry.queueIndex === currentIndex + 1 &&
+      playbackEntryMatchesQueueSession(entry, currentQueue, activeOrigin),
+  );
 }
 
 type RecentlyPlayedSet = {
@@ -663,17 +601,29 @@ function isInRecentlyPlayed(track: MediaTrack, set: RecentlyPlayedSet): boolean 
 }
 
 export function PlayerProvider({ children }: { children: ReactNode }) {
+  const bootSession = getBootSession();
   const audioRef = useRef<HTMLAudioElement | null>(null);
-  const [currentTrack, setCurrentTrack] = useState<MediaTrack | null>(null);
-  const [queue, setQueue] = useState<MediaTrack[]>([]);
+  const [currentTrack, setCurrentTrack] = useState<MediaTrack | null>(
+    () => bootSession?.track ?? null,
+  );
+  const [queue, setQueue] = useState<MediaTrack[]>(
+    () => (bootSession ? [bootSession.track] : []),
+  );
   const [queueIndex, setQueueIndex] = useState(0);
   const [queueOrigin, setQueueOrigin] = useState<QueueOrigin | null>(null);
   const [autoplayTrackIds, setAutoplayTrackIds] = useState<Set<string>>(() => new Set());
   const [playbackHistory, setPlaybackHistory] = useState<PlaybackHistoryEntry[]>([]);
+  const [queueVisitedTrackIds, setQueueVisitedTrackIds] = useState<ReadonlySet<string>>(
+    () => (bootSession?.track ? resetVisitedQueueTracks(bootSession.track.id) : new Set()),
+  );
   const [isPlaying, setIsPlaying] = useState(false);
   const [isBuffering, setIsBuffering] = useState(false);
-  const [progress, setProgress] = useState(0);
-  const [duration, setDuration] = useState(0);
+  const [progress, setProgress] = useState(() => bootSession?.progress ?? 0);
+  const [seekScrubProgress, setSeekScrubProgress] = useState<number | null>(null);
+  const [seekRevision, setSeekRevision] = useState(0);
+  const [duration, setDuration] = useState(
+    () => bootSession?.track.durationSeconds ?? 0,
+  );
   const savedVolume = readVolume();
   const savedMuted = readMuted();
   const useDefault = savedVolume === null || Number.isNaN(savedVolume) || savedMuted || savedVolume === 0;
@@ -681,12 +631,30 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
   const [muted, setMuted] = useState<boolean>(useDefault ? false : (savedMuted ?? false));
   const [shuffle, setShuffle] = useState(false);
   const [repeat, setRepeat] = useState<RepeatMode>("off");
-  const [autoplay, setAutoplayState] = useState<boolean>(() => readAutoplayPref());
-  const [autoplaySeed, setAutoplaySeed] = useState<AutoplaySeed | null>(null);
+  // Autoplay preference lives in the unified settings blob (atomic
+  // per-tick write) instead of the historical per-key
+  // `velocity-autoplay` localStorage echo. `useSetting` is reactive:
+  // any other call site that fires `setSetting("autoplay", …)` — e.g.
+  // a future Settings page toggle, `resetAllSettings()`, or the
+  // `__all__` broadcast fired by `clearAllUserData()` — re-renders this
+  // component automatically. The legacy `velocity-autoplay` echo had
+  // to round-trip through the IPC channel per-write and could lose a
+  // write when the coalesced flush raced with shutdown; keeping the
+  // preference next to the other settings on the same write removes
+  // that window and matches the persistence shape of every other
+  // user-tunable field.
+  const autoplay = useSetting("autoplay");
+  const [autoplaySeed, setAutoplaySeed] = useState<AutoplaySeed | null>(
+    () => (bootSession ? bootAutoplaySeed(bootSession) : null),
+  );
   const [isReloadingAutoplay, setIsReloadingAutoplay] = useState(false);
   const [lastError, setLastError] = useState<string | null>(null);
   const [normGain, setNormGain] = useState(1);
   const [currentAudioPath, setCurrentAudioPath] = useState<string | null>(null);
+
+  useEffect(() => {
+    currentAudioPathRef.current = currentAudioPath;
+  }, [currentAudioPath]);
   // Bumped by `retry()` to force the load effect to re-run with a fresh
   // set of attempts without otherwise changing the current track.
   const [loadToken, setLoadToken] = useState(0);
@@ -704,12 +672,19 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
   const shuffleRef = useRef(shuffle);
   const queueIndexRef = useRef(queueIndex);
   const trackRef = useRef<MediaTrack | null>(currentTrack);
-  const autoplaySeedRef = useRef<AutoplaySeed | null>(null);
+  const autoplaySeedRef = useRef<AutoplaySeed | null>(
+    bootSession ? bootAutoplaySeed(bootSession) : null,
+  );
   const autoplayTrackIdsRef = useRef<Set<string>>(new Set());
   const autoplayRef = useRef(autoplay);
   const playbackHistoryRef = useRef<PlaybackHistoryEntry[]>([]);
+  const queueVisitedTrackIdsRef = useRef(queueVisitedTrackIds);
   const nextRef = useRef<((recordRecentlyPlayed?: boolean) => void) | null>(null);
   const fetchingAutoplayRef = useRef(false);
+  const fetchAndAppendAutoplayRef = useRef<
+    (overrideSeed?: AutoplaySeed | null) => Promise<void>
+  >(async () => {});
+  const ensureAutoplayTopUpRef = useRef<(waitForInFlight?: boolean) => void>(() => {});
   const autoplayAdvancePendingRef = useRef(false);
   // Tracks how many auto-retries the in-flight autoplay attempt has
   // already consumed. Used to compute the next retry delay so that, after
@@ -719,6 +694,15 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
   // reloadAutoplay, setAutoplay(false), etc.) can cancel it cleanly
   // before the prior retry fires and overwrites new state.
   const autoplayRetryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Bumped whenever the user advances the playhead or replaces the autoplay
+  // seed so an in-flight watch-playlist fetch can bail out immediately
+  // instead of holding the guard (and retry backoff) while the queue has
+  // already moved on.
+  const autoplayFetchGenerationRef = useRef(0);
+  const invalidateAutoplayFetchRef = useRef<() => void>(() => {});
+  // Dedupes in-flight stream prefetch work so effect re-runs and queue
+  // metadata patches don't cancel downloads/analysis already underway.
+  const streamPrefetchInFlightRef = useRef(new Map<string, Promise<void>>());
   const playVersionRef = useRef(0);
   const fadeTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // Set by the load effect while it owns the audio element (loading or
@@ -730,14 +714,31 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
   // surprised by auto-playing audio on app launch. The flag is cleared
   // before the first user-driven play() runs so normal playback is
   // unaffected.
-  const isSessionRestoreRef = useRef(true);
+  const isSessionRestoreRef = useRef(Boolean(bootSession));
   // When restoring a session, carry the saved seek position so the load
   // effect can jump to it before the first paint.
-  const seekOnNextLoadRef = useRef(0);
+  const seekOnNextLoadRef = useRef(bootSession?.progress ?? 0);
+  // Wall-clock time when playback last went idle (paused or loaded-but-not-
+  // playing). Used to decide whether the cached stream file must be
+  // re-resolved before the next play() call.
+  const lastPlaybackIdleAtRef = useRef(0);
+  const streamSourceRefreshNeededRef = useRef(false);
+  const sourceRefreshInProgressRef = useRef(false);
+  const userSeekInProgressRef = useRef(false);
+  const userSeekClearTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pendingSeekTargetRef = useRef<number | null>(null);
+  const resumeAfterSeekRef = useRef(false);
+  const progressRef = useRef(bootSession?.progress ?? 0);
+  const seekScrubProgressRef = useRef<number | null>(null);
+  // User play/pause intent captured while the load effect still owns the audio
+  // element. `null` = no preference (normal play()/next() loads still auto-play);
+  // `true`/`false` = the user explicitly toggled during load.
+  const playWhenReadyRef = useRef<boolean | null>(null);
+  const currentAudioPathRef = useRef<string | null>(null);
+  const leadingSilenceSkipRef = useRef(0);
+
   // Debounce timer for persisting the playback session to localStorage.
   const sessionSaveTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
-
-  const SESSION_KEY = "velocity-session";
 
   useEffect(() => {
     queueRef.current = queue;
@@ -780,8 +781,98 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
   }, [playbackHistory]);
 
   useEffect(() => {
-    setItem(AUTOPLAY_KEY, JSON.stringify(autoplay));
-  }, [autoplay]);
+    queueVisitedTrackIdsRef.current = queueVisitedTrackIds;
+  }, [queueVisitedTrackIds]);
+
+  useEffect(() => {
+    progressRef.current = progress;
+  }, [progress]);
+
+  useEffect(() => {
+    seekScrubProgressRef.current = seekScrubProgress;
+  }, [seekScrubProgress]);
+
+  const applyDurationFromAudio = useCallback((audio: HTMLAudioElement) => {
+    const fromAudio = readAudioElementDuration(audio);
+    if (fromAudio !== null) {
+      setDuration(fromAudio);
+      return;
+    }
+    const trackDuration = trackRef.current?.durationSeconds;
+    if (
+      typeof trackDuration === "number" &&
+      Number.isFinite(trackDuration) &&
+      trackDuration > 0
+    ) {
+      setDuration(trackDuration);
+      return;
+    }
+    setDuration(0);
+  }, []);
+  const applyDurationFromAudioRef = useRef(applyDurationFromAudio);
+  useEffect(() => {
+    applyDurationFromAudioRef.current = applyDurationFromAudio;
+  }, [applyDurationFromAudio]);
+
+  // Autoplay is now persisted through the unified settings blob
+  // (`setSetting("autoplay", ...)` from the `value` setter below) rather
+  // than the per-key `velocity-autoplay` IPC echo. The settings blob is
+  // one atomic write per tick, so a coalesced flush on the backend
+  // can never lose the autoplay value while a different setting key
+  // is being flushed at the same time. The legacy effect below
+  // migrates the old `velocity-autoplay` localStorage entry into the
+  // settings blob on first mount for users upgrading from a prior
+  // build, then removes the legacy key so subsequent boots read from
+  // the unified source of truth.
+  useEffect(() => {
+    // Only inherit from the legacy key when the user has never touched
+    // the new `autoplay` setting on this machine. `getSetting` spreads
+    // `DEFAULTS` over the saved blob, so it can't distinguish a
+    // user-toggled value from a default-fallback — we have to peek at
+    // the raw `velocity-settings` payload to detect "the user has
+    // never set this on the new code path". A user who toggled off in
+    // the new build and then somehow still has a stale legacy entry
+    // would otherwise have their newer choice silently overwritten by
+    // old data from the per-key echo.
+    try {
+      const settingsRaw = getItem(SETTINGS_KEY);
+      const parsedSettings = settingsRaw ? JSON.parse(settingsRaw) : null;
+      const autoplayExplicit =
+        parsedSettings &&
+        typeof parsedSettings === "object" &&
+        Object.prototype.hasOwnProperty.call(parsedSettings, "autoplay");
+      if (autoplayExplicit) {
+        // New code's choice wins — strip the legacy entry so it can't
+        // ever fight back, even on a hypothetical future bug.
+        removeItem(AUTOPLAY_KEY);
+        return;
+      }
+      const legacyRaw = getItem(AUTOPLAY_KEY);
+      if (legacyRaw !== null) {
+        const parsed = JSON.parse(legacyRaw);
+        const migrated: boolean | null =
+          typeof parsed === "boolean" ? parsed : null;
+        if (migrated !== null) {
+          setSetting("autoplay", migrated);
+        }
+        // Remove the legacy entry regardless of value so the migration
+        // runs exactly once per install.
+        removeItem(AUTOPLAY_KEY);
+      }
+    } catch {
+      // Corrupt JSON in either blob — drop the legacy entry so the
+      // next read cycle can't surface a parse error and re-fall-through
+      // forever. The settings blob's own defaults will fill in.
+      try {
+        removeItem(AUTOPLAY_KEY);
+      } catch {
+        // localStorage can throw in private-browsing modes; swallow.
+      }
+    }
+  // Run once on mount; subsequent toggles go through `setSetting` from
+  // the `setAutoplay` callback below.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   useEffect(() => {
     volumeRef.current = volume;
@@ -795,29 +886,45 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
     normGainRef.current = normGain;
   }, [normGain]);
 
-  const previousQueue = useMemo(
-    () =>
-      queue
-        .slice(0, queueIndex)
-        .map((track, index) => ({ track, queueIndex: index }))
-        .reverse(),
-    [queue, queueIndex],
-  );
-  const recentlyPlayed = useMemo(
-    () =>
-      playbackHistory
-        .map((entry, historyIndex) => ({ entry, historyIndex }))
-        .filter(({ entry }) => {
-          if (queueIndex <= 0) return true;
-          return !(
-            entry.queueIndex < queueIndex &&
-            playbackEntryMatchesQueueSession(entry, queue, queueOrigin)
-          );
-        })
-        .reverse()
-        .map(({ entry, historyIndex }) => ({ track: entry.track, historyIndex })),
-    [playbackHistory, queue, queueIndex, queueOrigin],
-  );
+  const recentlyPlayed = useMemo(() => {
+    const seen = new Set<string>();
+    const rows: RecentPlaybackTrack[] = [];
+
+    for (let index = queueIndex - 1; index >= 0; index -= 1) {
+      const track = queue[index];
+      if (!track || seen.has(track.id)) continue;
+      if (!queueVisitedTrackIds.has(track.id)) continue;
+      seen.add(track.id);
+      rows.push({ track, historyIndex: -1, queueIndex: index });
+    }
+
+    for (let historyIndex = 0; historyIndex < playbackHistory.length; historyIndex += 1) {
+      const entry = playbackHistory[historyIndex];
+      if (seen.has(entry.track.id)) continue;
+      if (
+        entry.track.id === currentTrack?.id &&
+        entry.queueIndex === queueIndex &&
+        playbackEntryMatchesQueueSession(entry, queue, queueOrigin)
+      ) {
+        continue;
+      }
+      seen.add(entry.track.id);
+      rows.push({ track: entry.track, historyIndex });
+    }
+
+    return rows;
+  }, [playbackHistory, currentTrack?.id, queue, queueIndex, queueOrigin, queueVisitedTrackIds]);
+
+  const invalidateAutoplayFetch = useCallback(() => {
+    autoplayFetchGenerationRef.current += 1;
+    if (autoplayRetryTimerRef.current) {
+      clearTimeout(autoplayRetryTimerRef.current);
+      autoplayRetryTimerRef.current = null;
+    }
+    autoplayRetryCountRef.current = 0;
+    fetchingAutoplayRef.current = false;
+  }, []);
+  invalidateAutoplayFetchRef.current = invalidateAutoplayFetch;
 
   const setQueueState = useCallback((next: {
     queue: MediaTrack[];
@@ -827,10 +934,18 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
     autoplaySeed: AutoplaySeed | null;
     shuffle?: boolean;
   }) => {
-    const normalizedQueue = next.queue.slice();
-    const normalizedIndex = normalizedQueue.length === 0
+    const sanitizedQueue = filterQueueableTracks(next.queue);
+    const normalizedQueue = sanitizedQueue;
+    let normalizedIndex = normalizedQueue.length === 0
       ? 0
       : Math.max(0, Math.min(next.queueIndex, normalizedQueue.length - 1));
+    if (sanitizedQueue.length !== next.queue.length) {
+      const activeId = next.queue[next.queueIndex]?.id;
+      const remapped = activeId
+        ? sanitizedQueue.findIndex((track) => track.id === activeId)
+        : -1;
+      if (remapped >= 0) normalizedIndex = remapped;
+    }
     const normalizedAutoplayIds = new Set(next.autoplayTrackIds ?? autoplayTrackIdsRef.current);
 
     // Capture the prior seed before mutation so we can detect an explicit
@@ -850,6 +965,23 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
     setAutoplayTrackIds(normalizedAutoplayIds);
     setAutoplaySeed(next.autoplaySeed);
 
+    // Keep `currentTrack` in lockstep with the queue index so the player
+    // bar updates on the same commit as navigation — a follow-up effect
+    // would paint one or more frames (or seconds, when `play()` awaits
+    // resolution) with stale metadata while the new audio is already
+    // loading.
+    if (normalizedQueue.length === 0) {
+      trackRef.current = null;
+      setCurrentTrack(null);
+      setProgress(0);
+      setDuration(0);
+    } else {
+      const activeTrack = normalizedQueue[normalizedIndex] ?? normalizedQueue[0];
+      trackRef.current = activeTrack;
+      setCurrentTrack(activeTrack);
+      setDuration(activeTrack.durationSeconds ?? 0);
+    }
+
     // If the autoplay seed has just been replaced, cancel any pending
     // auto-retry timer so an older retry for the prior seed doesn't
     // accidentally re-overwrite the new state when it eventually fires.
@@ -864,14 +996,7 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
       prevSeedVideoId !== nextSeedVideoId ||
       prevSeedPlaylistId !== nextSeedPlaylistId
     ) {
-      if (autoplayRetryTimerRef.current) {
-        clearTimeout(autoplayRetryTimerRef.current);
-        autoplayRetryTimerRef.current = null;
-      }
-      autoplayRetryCountRef.current = 0;
-      if (fetchingAutoplayRef.current) {
-        fetchingAutoplayRef.current = false;
-      }
+      invalidateAutoplayFetchRef.current();
     }
 
     if (typeof next.shuffle === "boolean") {
@@ -879,6 +1004,91 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
       setShuffle(next.shuffle);
     }
   }, []);
+
+  // Patch queue resolution metadata without touching React queue state.
+  // Prefetch writes here so it doesn't re-trigger the prefetch effect
+  // (which keys off upcoming track ids, not resolvedVideoId). Navigation
+  // always reads queueRef, so the enriched track is visible on load.
+  const patchQueueTrackInRef = useCallback((trackId: string, nextTrack: MediaTrack) => {
+    const activeQueue = queueRef.current.slice();
+    const index = activeQueue.findIndex((entry) => entry.id === trackId);
+    if (index < 0) return;
+    activeQueue[index] = nextTrack;
+    queueRef.current = activeQueue;
+    if (index === queueIndexRef.current) {
+      trackRef.current = nextTrack;
+      setCurrentTrack(nextTrack);
+    }
+  }, []);
+
+  const prefetchStreamTrack = useCallback(async (track: MediaTrack) => {
+    const inFlight = streamPrefetchInFlightRef.current.get(track.id);
+    if (inFlight) return inFlight;
+
+    const work = (async () => {
+      const catalogVideoId = exportStreamVideoId(track);
+      if (!catalogVideoId) return;
+
+      const trackForResolve =
+        track.videoId != null ? track : { ...track, videoId: catalogVideoId };
+      const resolved = await resolveStreamTrackAudio(trackForResolve);
+
+      let trackForStream = resolved ?? trackForResolve;
+      if (resolved?.resolvedVideoId && resolved.resolvedVideoId !== track.resolvedVideoId) {
+        const audioResolved = {
+          ...resolved,
+          id: track.id,
+          videoId: track.videoId ?? catalogVideoId,
+        };
+        patchQueueTrackInRef(track.id, audioResolved);
+        trackForStream = audioResolved;
+      }
+
+      const effectiveVideoId = exportStreamVideoId(trackForStream);
+      if (!effectiveVideoId) return;
+
+      const stream = await resolveStream(effectiveVideoId);
+      if (!stream.filePath) return;
+
+      const cacheKey = getAudioCacheKey(trackForStream);
+      if (!getCachedLoudness(cacheKey) && !hasAttemptedAnalysis(cacheKey)) {
+        try {
+          const data = await analyzeLoudness(stream.filePath);
+          setCachedLoudness(cacheKey, data);
+        } catch (error) {
+          console.warn("Prefetch loudness analysis failed:", error);
+        }
+      }
+
+      if (!hasAttemptedLeadingSilenceAnalysis(cacheKey)) {
+        try {
+          const data = await detectLeadingSilence(stream.filePath);
+          setCachedLeadingSilence(cacheKey, data);
+        } catch (error) {
+          console.warn("Prefetch leading silence detection failed:", error);
+          setCachedLeadingSilence(cacheKey, { skipSeconds: null });
+        }
+      }
+    })().catch((error) => {
+      console.warn("Prefetch stream resolve failed:", error);
+    });
+
+    streamPrefetchInFlightRef.current.set(track.id, work);
+    try {
+      await work;
+    } finally {
+      streamPrefetchInFlightRef.current.delete(track.id);
+    }
+  }, [patchQueueTrackInRef]);
+
+  const upcomingPrefetchKey = useMemo(
+    () =>
+      queue
+        .slice(queueIndex + 1, queueIndex + 1 + PREFETCH_AHEAD)
+        .map((track) => track.id)
+        .join("\0"),
+    [queue, queueIndex],
+  );
 
   const capturePlaybackHistoryEntry = useCallback((): PlaybackHistoryEntry | null => {
     const currentQueue = queueRef.current;
@@ -898,22 +1108,35 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
       autoplayTrackIds: Array.from(autoplayTrackIdsRef.current),
       autoplaySeed: autoplaySeedRef.current,
       shuffle: shuffleRef.current,
+      queueVisitedTrackIds: Array.from(queueVisitedTrackIdsRef.current),
     };
+  }, []);
+
+  const markQueueTrackVisited = useCallback((trackId: string) => {
+    setQueueVisitedTrackIds((current) => addVisitedQueueTrack(current, trackId));
+  }, []);
+
+  const resetQueueVisitedToTrack = useCallback((trackId: string) => {
+    const next = resetVisitedQueueTracks(trackId);
+    queueVisitedTrackIdsRef.current = next;
+    setQueueVisitedTrackIds(next);
+  }, []);
+
+  const restoreQueueVisitedTrackIds = useCallback((ids: readonly string[]) => {
+    const next = restoreVisitedQueueTracks(ids);
+    queueVisitedTrackIdsRef.current = next;
+    setQueueVisitedTrackIds(next);
   }, []);
 
   const rememberPlaybackHistory = useCallback(() => {
     const entry = capturePlaybackHistoryEntry();
     if (!entry) return;
 
-    setPlaybackHistory((current) => {
-      if (current[0] && playbackHistoryEntriesEqual(current[0], entry)) {
-        return current;
-      }
-      return [entry, ...current].slice(0, RECENTLY_PLAYED_LIMIT);
-    });
+    setPlaybackHistory((current) => prependPlaybackHistoryEntry(current, entry));
   }, [capturePlaybackHistoryEntry]);
 
   const applyPlaybackHistoryEntry = useCallback((entry: PlaybackHistoryEntry) => {
+    restoreQueueVisitedTrackIds(resolveHistoryVisitedTrackIds(entry));
     setQueueState({
       queue: entry.queue,
       queueIndex: entry.queueIndex,
@@ -922,28 +1145,26 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
       autoplaySeed: entry.autoplaySeed,
       shuffle: entry.shuffle,
     });
-  }, [setQueueState]);
+  }, [setQueueState, restoreQueueVisitedTrackIds]);
 
   const applyOutputLevels = useCallback((nextVolume: number, nextMuted: boolean, nextGain: number) => {
     const audio = audioRef.current;
     if (!audio) return;
 
-    const cleanVolume = clampVolume(nextVolume);
-    const cleanGain = Number.isFinite(nextGain) && nextGain > 0 ? nextGain : 1;
+    const target = computeAppliedGain(nextVolume, nextGain);
     const gainNode = gainNodeRef.current;
-
-    const masterVolumeDb = getSetting("masterVolume");
-    const masterVolumeGain = Math.pow(10, masterVolumeDb / 20);
-    const normalizationEnabled = getSetting("audioNormalization");
-    const effectiveGain = normalizationEnabled ? cleanGain : 1;
 
     if (gainNode && audioContextRef.current) {
       const now = audioContextRef.current.currentTime;
       gainNode.gain.cancelScheduledValues(now);
-      gainNode.gain.setTargetAtTime(effectiveGain * cleanVolume * masterVolumeGain, now, 0.15);
+      gainNode.gain.setTargetAtTime(target, now, 0.15);
+      // When the gain node is the master, keep the audio element at 1 so
+      // it doesn't double-attenuate the signal. The fallback branch below
+      // computes an equivalent single-stage attenuation when the WebAudio
+      // graph isn't available.
       audio.volume = 1;
     } else {
-      audio.volume = clampVolume(cleanVolume * effectiveGain * masterVolumeGain);
+      audio.volume = clampVolume(target);
     }
     audio.muted = nextMuted;
   }, []);
@@ -951,6 +1172,7 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
   const stopCurrentPlayback = useCallback(() => {
     const audio = audioRef.current;
     if (!audio) return;
+    playWhenReadyRef.current = null;
     audio.pause();
     audio.removeAttribute("src");
     audio.currentTime = 0;
@@ -979,8 +1201,8 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
       const source = context.createMediaElementSource(audio);
       const gainNode = context.createGain();
       const analyserNode = context.createAnalyser();
-      analyserNode.fftSize = 256;
-      analyserNode.smoothingTimeConstant = 0.8;
+      analyserNode.fftSize = 1024;
+      analyserNode.smoothingTimeConstant = 0.65;
       const limiterNode = context.createDynamicsCompressor();
 
       // Configure DynamicsCompressorNode as a brickwall limiter to protect from digital clipping.
@@ -1034,6 +1256,202 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
     }
   }, [applyOutputLevels]);
 
+  const ensureAudioGraphRef = useRef<() => Promise<void>>(async () => undefined);
+  const refreshStaleAudioSourceRef = useRef<() => Promise<void>>(async () => undefined);
+  const proactiveSourceRefreshRef = useRef<() => void>(() => undefined);
+
+  const refreshStaleAudioSource = useCallback(async () => {
+    const track = trackRef.current;
+    const audio = audioRef.current;
+    if (!track || !audio || track.source !== "stream") return;
+
+    const effectiveVideoId = track.resolvedVideoId ?? track.videoId;
+    if (!effectiveVideoId) return;
+
+    const offlinePath = await getOfflinePathForTrack(track);
+    if (offlinePath) {
+      setCurrentAudioPath(offlinePath);
+      const src = convertFileSrc(offlinePath);
+      audio.src = src;
+      audio.load();
+      await waitForMediaReady(audio);
+      return;
+    }
+
+    const idleLongEnough = isPlaybackIdleLongEnough(lastPlaybackIdleAtRef.current);
+    const existingPath = currentAudioPathRef.current;
+    if (!idleLongEnough && existingPath) {
+      try {
+        setCurrentAudioPath(existingPath);
+        const src = convertFileSrc(existingPath);
+        audio.src = src;
+        audio.load();
+        await waitForMediaReady(audio);
+        return;
+      } catch {
+        // Fall through to a full re-resolve below.
+      }
+    }
+
+    if (idleLongEnough) {
+      invalidateStream(effectiveVideoId);
+    }
+    const stream = await withTimeout(
+      resolveStream(effectiveVideoId),
+      STREAM_RESOLVE_TIMEOUT_MS,
+      "Refreshing this track's audio took too long.",
+    );
+    const src = stream.filePath ? convertFileSrc(stream.filePath) : stream.url ?? null;
+    if (!src) throw new Error("No audio source is available for this track.");
+
+    setCurrentAudioPath(stream.filePath ?? null);
+    audio.src = src;
+    audio.load();
+    await waitForMediaReady(audio);
+  }, []);
+
+  useEffect(() => {
+    ensureAudioGraphRef.current = ensureAudioGraph;
+  }, [ensureAudioGraph]);
+
+  useEffect(() => {
+    refreshStaleAudioSourceRef.current = refreshStaleAudioSource;
+  }, [refreshStaleAudioSource]);
+
+  const markUserSeekInProgress = useCallback(() => {
+    userSeekInProgressRef.current = true;
+    if (userSeekClearTimerRef.current) {
+      clearTimeout(userSeekClearTimerRef.current);
+    }
+    userSeekClearTimerRef.current = setTimeout(() => {
+      userSeekInProgressRef.current = false;
+      userSeekClearTimerRef.current = null;
+    }, 2000);
+  }, []);
+
+  const clearUserSeekInProgress = useCallback(() => {
+    userSeekInProgressRef.current = false;
+    if (userSeekClearTimerRef.current) {
+      clearTimeout(userSeekClearTimerRef.current);
+      userSeekClearTimerRef.current = null;
+    }
+  }, []);
+
+  const refreshLeadingSilenceSkipRef = useCallback((cacheKey: string) => {
+    leadingSilenceSkipRef.current = resolveLeadingSilenceSkipSeconds(cacheKey);
+  }, []);
+
+  const applyLeadingSilenceSkipAtStart = useCallback((audio: HTMLAudioElement, force = false) => {
+    const skip = leadingSilenceSkipRef.current;
+    if (skip <= 0) return;
+    if (!force && audio.currentTime > LEADING_SILENCE_APPLY_MAX_POSITION) return;
+    try {
+      audio.currentTime = skip;
+    } catch {
+      // currentTime can throw when the element has no seekable range yet.
+    }
+    progressRef.current = skip;
+    setProgress(skip);
+  }, []);
+
+  const applyLeadingSilenceSkipAtStartRef = useRef(applyLeadingSilenceSkipAtStart);
+  useEffect(() => {
+    applyLeadingSilenceSkipAtStartRef.current = applyLeadingSilenceSkipAtStart;
+  }, [applyLeadingSilenceSkipAtStart]);
+
+  const ensureLeadingSilenceAnalyzed = useCallback(async (cacheKey: string, filePath: string | null) => {
+    refreshLeadingSilenceSkipRef(cacheKey);
+    if (!filePath || hasAttemptedLeadingSilenceAnalysis(cacheKey)) return;
+
+    try {
+      const data = await withTimeout(
+        detectLeadingSilence(filePath),
+        LEADING_SILENCE_DETECT_TIMEOUT_MS,
+        "Leading silence detection timed out.",
+      );
+      if (trackRef.current && getAudioCacheKey(trackRef.current) !== cacheKey) return;
+      setCachedLeadingSilence(cacheKey, data);
+      refreshLeadingSilenceSkipRef(cacheKey);
+    } catch (error) {
+      console.warn("Leading silence detection failed:", error);
+      setCachedLeadingSilence(cacheKey, { skipSeconds: null });
+    }
+  }, [refreshLeadingSilenceSkipRef]);
+
+  const applySeekTarget = useCallback((target: number) => {
+    const audio = audioRef.current;
+    if (!audio) return;
+    markUserSeekInProgress();
+    try {
+      audio.currentTime = target;
+    } catch {
+      // currentTime can throw when the element has no seekable range yet.
+    }
+    progressRef.current = target;
+    setProgress(target);
+    setSeekRevision((n) => n + 1);
+  }, [markUserSeekInProgress]);
+
+  const drainPendingSeek = useCallback(() => {
+    const pending = pendingSeekTargetRef.current;
+    if (pending === null) return;
+    pendingSeekTargetRef.current = null;
+    applySeekTarget(pending);
+    tryResumeAfterSeekScrubRef.current();
+  }, [applySeekTarget]);
+
+  const drainPendingSeekRef = useRef(drainPendingSeek);
+  const tryResumeAfterSeekScrubRef = useRef<() => void>(() => undefined);
+  useEffect(() => {
+    drainPendingSeekRef.current = drainPendingSeek;
+  }, [drainPendingSeek]);
+
+  const proactiveSourceRefresh = useCallback(() => {
+    const audio = audioRef.current;
+    const track = trackRef.current;
+    if (
+      !audio?.paused ||
+      !track ||
+      loadInProgressRef.current ||
+      sourceRefreshInProgressRef.current
+    ) {
+      return;
+    }
+    if (
+      !playbackNeedsSourceRefresh(
+        track,
+        lastPlaybackIdleAtRef.current,
+        streamSourceRefreshNeededRef.current,
+      )
+    ) {
+      return;
+    }
+
+    const savedTime = audio.currentTime;
+    sourceRefreshInProgressRef.current = true;
+    void (async () => {
+      try {
+        await ensureAudioGraphRef.current();
+        await refreshStaleAudioSourceRef.current();
+        streamSourceRefreshNeededRef.current = false;
+        if (Number.isFinite(savedTime) && savedTime > 0) {
+          audio.currentTime = savedTime;
+          progressRef.current = savedTime;
+          setProgress(savedTime);
+        }
+      } catch {
+        streamSourceRefreshNeededRef.current = true;
+      } finally {
+        sourceRefreshInProgressRef.current = false;
+        drainPendingSeekRef.current();
+      }
+    })();
+  }, []);
+
+  useEffect(() => {
+    proactiveSourceRefreshRef.current = proactiveSourceRefresh;
+  }, [proactiveSourceRefresh]);
+
   useEffect(() => {
     const audio = new Audio();
     audio.crossOrigin = "anonymous";
@@ -1043,10 +1461,21 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
     audioRef.current = audio;
     currentAudio.current = audio;
 
-    const syncProgress = () => setProgress(audio.currentTime || 0);
+    const syncProgress = () => {
+      const currentTime = audio.currentTime || 0;
+      // While a session-restore load is still resolving audio, keep showing
+      // the saved position instead of flashing 0:00 on every timeupdate.
+      if (
+        loadInProgressRef.current &&
+        seekOnNextLoadRef.current > 0 &&
+        currentTime === 0
+      ) {
+        return;
+      }
+      setProgress(currentTime);
+    };
     const syncDuration = () => {
-      const nextDuration = Number.isFinite(audio.duration) ? audio.duration : trackRef.current?.durationSeconds ?? 0;
-      setDuration(nextDuration || 0);
+      applyDurationFromAudioRef.current(audio);
     };
 
     const handlePlay = () => {
@@ -1054,6 +1483,48 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
         audio.pause();
         return;
       }
+      if (sourceRefreshInProgressRef.current) {
+        setIsPlaying(true);
+        if (!audio.readyState || audio.readyState < HTMLMediaElement.HAVE_FUTURE_DATA) {
+          setIsBuffering(true);
+        }
+        return;
+      }
+      if (
+        playbackNeedsSourceRefresh(
+          trackRef.current,
+          lastPlaybackIdleAtRef.current,
+          streamSourceRefreshNeededRef.current,
+        )
+      ) {
+        sourceRefreshInProgressRef.current = true;
+        const savedTime = audio.currentTime;
+        lastPlaybackIdleAtRef.current = 0;
+        audio.pause();
+        setIsBuffering(true);
+        void (async () => {
+          try {
+            await ensureAudioGraphRef.current();
+            await refreshStaleAudioSourceRef.current();
+            streamSourceRefreshNeededRef.current = false;
+            if (Number.isFinite(savedTime) && savedTime > 0) {
+              audio.currentTime = savedTime;
+            }
+            await audio.play();
+          } catch (error) {
+            setIsPlaying(false);
+            setIsBuffering(false);
+            setLastError(
+              error instanceof Error ? error.message : "Playback could not resume after refreshing the audio.",
+            );
+          } finally {
+            sourceRefreshInProgressRef.current = false;
+            drainPendingSeekRef.current();
+          }
+        })();
+        return;
+      }
+      lastPlaybackIdleAtRef.current = 0;
       setIsPlaying(true);
       // Mirror the readyState gate togglePlay uses so resuming a
       // pre-buffered track doesn't transiently flash the loading
@@ -1069,18 +1540,38 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
       setIsBuffering(false);
     };
     const handlePause = () => {
+      if (sourceRefreshInProgressRef.current) return;
+      lastPlaybackIdleAtRef.current = Date.now();
       setIsPlaying(false);
       setIsBuffering(false);
     };
-    const handleWaiting = () => setIsBuffering(true);
+    const handleWaiting = () => {
+      setIsBuffering(true);
+      // Seeking fires `waiting` while the decoder buffers the new position.
+      // Treating that as a stale stream would re-resolve mid-scrub and error.
+      if (userSeekInProgressRef.current) return;
+      if (!audio.paused && audio.currentTime > 3) {
+        streamSourceRefreshNeededRef.current = true;
+      }
+    };
+    const handleStalled = () => {
+      if (userSeekInProgressRef.current) return;
+      if (!audio.paused && audio.currentTime > 3) {
+        streamSourceRefreshNeededRef.current = true;
+      }
+    };
+    const handleSeeked = () => {
+      clearUserSeekInProgress();
+    };
     const handleEnded = () => {
-      setProgress(0);
       if (repeatRef.current === "one") {
+        applyLeadingSilenceSkipAtStartRef.current(audio, true);
         void audio.play().catch(() => {
           setIsPlaying(false);
         });
         return;
       }
+      setProgress(0);
       const queue = queueRef.current;
       const index = queueIndexRef.current;
       const hasMore = queue.length > 0 && (
@@ -1100,6 +1591,21 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
       // handler stomped on that, the UI would flicker between load and
       // failure on every retry attempt.
       if (loadInProgressRef.current) return;
+      if (userSeekInProgressRef.current) {
+        const code = audio.error?.code;
+        if (
+          code === MediaError.MEDIA_ERR_ABORTED ||
+          code === MediaError.MEDIA_ERR_NETWORK
+        ) {
+          setIsBuffering(true);
+          return;
+        }
+      }
+      if (audio.paused && trackRef.current?.source === "stream") {
+        streamSourceRefreshNeededRef.current = true;
+        setIsBuffering(false);
+        return;
+      }
       setIsBuffering(false);
       setIsPlaying(false);
       setLastError(describeMediaError(audio.error));
@@ -1112,6 +1618,8 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
     audio.addEventListener("playing", handlePlaying);
     audio.addEventListener("pause", handlePause);
     audio.addEventListener("waiting", handleWaiting);
+    audio.addEventListener("stalled", handleStalled);
+    audio.addEventListener("seeked", handleSeeked);
     audio.addEventListener("ended", handleEnded);
     audio.addEventListener("error", handleError);
 
@@ -1122,6 +1630,10 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
         clearTimeout(fadeTimeoutRef.current);
         fadeTimeoutRef.current = null;
       }
+      if (userSeekClearTimerRef.current) {
+        clearTimeout(userSeekClearTimerRef.current);
+        userSeekClearTimerRef.current = null;
+      }
       void audioContextRef.current?.close().catch(() => undefined);
       audio.removeEventListener("timeupdate", syncProgress);
       audio.removeEventListener("loadedmetadata", syncDuration);
@@ -1130,6 +1642,8 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
       audio.removeEventListener("playing", handlePlaying);
       audio.removeEventListener("pause", handlePause);
       audio.removeEventListener("waiting", handleWaiting);
+      audio.removeEventListener("stalled", handleStalled);
+      audio.removeEventListener("seeked", handleSeeked);
       audio.removeEventListener("ended", handleEnded);
       audio.removeEventListener("error", handleError);
       audioRef.current = null;
@@ -1157,6 +1671,145 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
     applyOutputLevels(volume, muted, normGain);
   }, [applyOutputLevels, volume, muted, normGain, masterVolumeDb, audioNormalizationEnabled]);
 
+  // High-frequency progress sync for the active track. `timeupdate` alone
+  // fires at ~4 Hz and can lag behind the decode clock; gating on
+  // `isPlaying` also let the player bar stall whenever that flag drifted
+  // from the media element. Read `currentTime` directly instead.
+  useEffect(() => {
+    if (!currentTrack) return;
+    const audio = audioRef.current;
+    if (!audio) return;
+
+    let rafId = 0;
+    let running = true;
+
+    const tick = () => {
+      if (!running) return;
+      rafId = window.requestAnimationFrame(tick);
+      if (seekScrubProgressRef.current !== null) return;
+      const currentTime = audio.currentTime;
+      if (!Number.isFinite(currentTime)) return;
+      if (
+        loadInProgressRef.current &&
+        seekOnNextLoadRef.current > 0 &&
+        currentTime === 0
+      ) {
+        return;
+      }
+      if (Math.abs(currentTime - progressRef.current) >= 0.008) {
+        progressRef.current = currentTime;
+        setProgress(currentTime);
+      }
+
+      const liveDuration = readLiveMediaDuration(
+        audio,
+        trackRef.current?.durationSeconds,
+      );
+      if (liveDuration > 0) {
+        setDuration((prev) => (Math.abs(prev - liveDuration) > 0.5 ? liveDuration : prev));
+      }
+    };
+
+    rafId = window.requestAnimationFrame(tick);
+    return () => {
+      running = false;
+      window.cancelAnimationFrame(rafId);
+    };
+  }, [currentTrack?.id]);
+
+  // When stream metadata omits duration, hydrate from the backend or by
+  // probing the cached audio file so the seek bar can render and scrub.
+  useEffect(() => {
+    const track = currentTrack;
+    if (!track) return;
+
+    let cancelled = false;
+
+    const applyResolvedDuration = (seconds: number) => {
+      if (cancelled || !(seconds > 0)) return;
+      setDuration(seconds);
+      const active = trackRef.current;
+      if (active?.id === track.id && active.durationSeconds !== seconds) {
+        patchQueueTrackInRef(track.id, mergeTrackMetadata(active, { durationSeconds: seconds }));
+      }
+    };
+
+    const audio = audioRef.current;
+    if (audio) {
+      const fromAudio = readLiveMediaDuration(audio, track.durationSeconds);
+      if (fromAudio > 0) {
+        applyResolvedDuration(fromAudio);
+        return;
+      }
+    }
+
+    if (typeof track.durationSeconds === "number" && track.durationSeconds > 0) {
+      applyResolvedDuration(track.durationSeconds);
+      return;
+    }
+
+    void (async () => {
+      if (track.videoId) {
+        const updates = await resolveTrackMetadata(track, {
+          needsDuration: true,
+          needsPlayCount: false,
+        });
+        if (updates?.durationSeconds) {
+          applyResolvedDuration(updates.durationSeconds);
+          return;
+        }
+      }
+
+      const filePath =
+        currentAudioPathRef.current ??
+        (track.source === "upload" ? track.filePath ?? null : null);
+      if (!filePath) return;
+
+      const probed = await readDuration(convertFileSrc(filePath));
+      if (probed) applyResolvedDuration(probed);
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [currentTrack?.id, currentTrack?.durationSeconds, currentAudioPath, patchQueueTrackInRef]);
+
+  useEffect(() => {
+    const onVisibilityChange = () => {
+      if (document.visibilityState === "hidden") {
+        const audio = audioRef.current;
+        if (audio?.paused) {
+          streamSourceRefreshNeededRef.current = true;
+        }
+        return;
+      }
+      void audioContextRef.current?.resume().catch(() => undefined);
+      proactiveSourceRefreshRef.current();
+    };
+
+    const onWindowFocus = () => {
+      void audioContextRef.current?.resume().catch(() => undefined);
+      proactiveSourceRefreshRef.current();
+    };
+
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    window.addEventListener("focus", onWindowFocus);
+    return () => {
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+      window.removeEventListener("focus", onWindowFocus);
+    };
+  }, []);
+
+  // While a stream track sits paused, re-resolve its audio source once the
+  // idle window passes so the media element isn't still pointed at a cache
+  // file the backend deleted while the user was away.
+  useEffect(() => {
+    const id = window.setInterval(() => {
+      proactiveSourceRefreshRef.current();
+    }, 60_000);
+    return () => window.clearInterval(id);
+  }, []);
+
   // Apply equalizer band gains to the BiquadFilterNode chain when bands change.
   const equalizerBands = useSetting("equalizerBands");
   useEffect(() => {
@@ -1176,18 +1829,11 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
   }, [muted]);
 
   useEffect(() => {
-    if (queue.length === 0) {
-      setCurrentTrack(null);
-      setProgress(0);
-      setDuration(0);
+    if (!currentTrack) return;
+    if (!isQueueableTrack(currentTrack)) {
+      void nextRef.current?.(true);
       return;
     }
-    const nextTrack = queue[queueIndex] ?? queue[0];
-    setCurrentTrack(nextTrack);
-  }, [queue, queueIndex]);
-
-  useEffect(() => {
-    if (!currentTrack) return;
     const audio = audioRef.current;
     if (!audio) return;
 
@@ -1201,7 +1847,12 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
 
     setLastError(null);
     setIsBuffering(true);
-    setProgress(0);
+    const pendingRestoreProgress =
+      isSessionRestoreRef.current && seekOnNextLoadRef.current > 0
+        ? seekOnNextLoadRef.current
+        : 0;
+    progressRef.current = pendingRestoreProgress;
+    setProgress(pendingRestoreProgress);
     setDuration(currentTrack.durationSeconds ?? 0);
     setCurrentAudioPath(null);
 
@@ -1230,23 +1881,108 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
 
     const attempt = async () => {
       if (cancelled) return;
+
       try {
         await ensureAudioGraph();
+        const loadTrackId = currentTrack.id;
+        const prefetchWait = streamPrefetchInFlightRef.current.get(loadTrackId);
+        if (prefetchWait) {
+          try {
+            await prefetchWait;
+          } catch {
+            // Prefetch is best-effort; load still runs if it failed.
+          }
+        }
+        // Prefer queueRef — prefetch may have already resolved/downloaded
+        // the next track without touching React queue state.
+        let trackForLoad =
+          queueRef.current[queueIndexRef.current]?.id === loadTrackId
+            ? queueRef.current[queueIndexRef.current]!
+            : currentTrack;
+        const catalogVideoId = exportStreamVideoId(trackForLoad);
+        if (
+          trackForLoad.source === "stream" &&
+          catalogVideoId &&
+          !trackForLoad.resolvedVideoId
+        ) {
+          const trackForResolve =
+            trackForLoad.videoId != null
+              ? trackForLoad
+              : { ...trackForLoad, videoId: catalogVideoId };
+          const resolved = await resolveTrackAudio(trackForResolve);
+          if (cancelled || trackRef.current?.id !== loadTrackId) return;
+          if (!resolved) {
+            loadInProgressRef.current = false;
+            setIsBuffering(false);
+            void nextRef.current?.(true);
+            return;
+          }
+          if (resolved.resolvedVideoId && resolved.resolvedVideoId !== trackForLoad.videoId) {
+            const audioResolved = {
+              ...resolved,
+              id: trackForLoad.id,
+              videoId: trackForLoad.videoId ?? catalogVideoId,
+            };
+            patchQueueTrackInRef(trackForLoad.id, audioResolved);
+            trackForLoad = audioResolved;
+            // Keep the autoplay seed on the canonical Topic-upload id. A
+            // fetch started from the pre-resolve music-video id will abort
+            // against the updated seed, so release it and re-kick below.
+            const currentSeed = autoplaySeedRef.current;
+            if (
+              currentSeed &&
+              (currentSeed.videoId === trackForLoad.videoId ||
+                currentSeed.videoId === resolved.resolvedVideoId)
+            ) {
+              const nextSeed = {
+                videoId: resolved.resolvedVideoId,
+                playlistId: currentSeed.playlistId,
+              };
+              if (currentSeed.videoId !== nextSeed.videoId) {
+                if (
+                  fetchingAutoplayRef.current &&
+                  currentSeed.videoId === trackForLoad.videoId
+                ) {
+                  invalidateAutoplayFetchRef.current();
+                }
+                autoplaySeedRef.current = nextSeed;
+                setAutoplaySeed(nextSeed);
+                ensureAutoplayTopUpRef.current(true);
+              }
+            }
+          } else {
+            trackForLoad = resolved;
+          }
+        }
+
+        if (
+          trackForLoad.source === "upload" &&
+          !trackForLoad.filePath &&
+          !trackForLoad.audioSrc
+        ) {
+          trackForLoad = await hydrateUploadTrackForPlayback(trackForLoad);
+          if (cancelled || trackRef.current?.id !== loadTrackId) return;
+          patchQueueTrackInRef(trackForLoad.id, trackForLoad);
+        }
+
         let src: string | null = null;
-        if (currentTrack.source === "upload") {
-          setCurrentAudioPath(currentTrack.filePath ?? null);
-          src = currentTrack.audioSrc ?? null;
+        let resolvedFilePath: string | null = null;
+        if (trackForLoad.source === "upload") {
+          resolvedFilePath = trackForLoad.filePath ?? null;
+          setCurrentAudioPath(resolvedFilePath);
+          src = trackForLoad.audioSrc ?? null;
         } else {
           // Use the resolved videoId (canonical Topic upload) when
           // available, falling back to the original videoId. This is
           // essential for tracks that `playMany` queued without
           // pre-resolving (all tracks except the first).
-          const effectiveVideoId = currentTrack.resolvedVideoId ?? currentTrack.videoId;
+          const effectiveVideoId = exportStreamVideoId(trackForLoad);
           if (effectiveVideoId) {
           // Check for an offline-downloaded file first
-          const offlinePath = await getOfflinePath(effectiveVideoId);
+          const offlinePath = await getOfflinePathForTrack(trackForLoad);
           if (offlinePath) {
-            if (cancelled || trackRef.current?.id !== currentTrack.id) return;
+            if (cancelled || trackRef.current?.id !== loadTrackId) return;
+            resolvedFilePath = offlinePath;
             setCurrentAudioPath(offlinePath);
             src = convertFileSrc(offlinePath);
           } else {
@@ -1255,17 +1991,56 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
             // a poisoned entry in `streamCache` that would otherwise fail
             // identically on every attempt.
             if (retriesLeft < MAX_LOAD_ATTEMPTS - 1) invalidateStream(effectiveVideoId);
-            const stream = await withTimeout(
-              resolveStream(effectiveVideoId),
-              STREAM_RESOLVE_TIMEOUT_MS,
-              "Resolving this track's audio took too long.",
-            );
+            let stream;
+            try {
+              stream = await withTimeout(
+                resolveStream(effectiveVideoId),
+                STREAM_RESOLVE_TIMEOUT_MS,
+                "Resolving this track's audio took too long.",
+              );
+            } catch (streamError) {
+              const streamMessage =
+                streamError instanceof Error ? streamError.message : String(streamError);
+              if (
+                isUnplayableStreamError(streamMessage) &&
+                effectiveVideoId === exportStreamVideoId(trackForLoad)
+              ) {
+                const fallback = await resolveStreamTrackAudioFallback(trackForLoad);
+                if (cancelled || trackRef.current?.id !== loadTrackId) return;
+                const fallbackVideoId = fallback?.resolvedVideoId;
+                if (fallbackVideoId && fallbackVideoId !== effectiveVideoId) {
+                  const audioResolved = fallback
+                    ? {
+                        ...fallback,
+                        id: trackForLoad.id,
+                        videoId: trackForLoad.videoId ?? catalogVideoId,
+                      }
+                    : {
+                        ...trackForLoad,
+                        resolvedVideoId: fallbackVideoId,
+                      };
+                  patchQueueTrackInRef(trackForLoad.id, audioResolved);
+                  trackForLoad = audioResolved;
+                  invalidateStream(fallbackVideoId);
+                  stream = await withTimeout(
+                    resolveStream(fallbackVideoId),
+                    STREAM_RESOLVE_TIMEOUT_MS,
+                    "Resolving this track's audio took too long.",
+                  );
+                } else {
+                  throw streamError;
+                }
+              } else {
+                throw streamError;
+              }
+            }
             // Compare against the actual queue-track id here, not the audio-cache
             // key. Stream tracks may intentionally include an album suffix in
             // `id` (for release-specific UI identity) while still sharing the
             // shorter `yt:<videoId>` cache key for audio analysis.
-            if (cancelled || trackRef.current?.id !== currentTrack.id) return;
-            setCurrentAudioPath(stream.filePath ?? null);
+            if (cancelled || trackRef.current?.id !== loadTrackId) return;
+            resolvedFilePath = stream.filePath ?? null;
+            setCurrentAudioPath(resolvedFilePath);
             src = stream.filePath ? convertFileSrc(stream.filePath) : stream.url ?? null;
           }
           }
@@ -1274,6 +2049,15 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
         if (!src) throw new Error("No audio source is available for this track.");
         if (cancelled) return;
         audio.src = src;
+
+        const loudnessCacheKey = getAudioCacheKey(trackForLoad);
+        refreshLeadingSilenceSkipRef(loudnessCacheKey);
+        if (resolvedFilePath) {
+          void ensureLeadingSilenceAnalyzed(loudnessCacheKey, resolvedFilePath);
+        }
+        await waitForMediaReady(audio);
+        if (cancelled || trackRef.current?.id !== loadTrackId) return;
+        applyDurationFromAudio(audio);
 
         // Re-apply the output gain so a new track loaded after a pause
         // doesn't inherit the gain=0 that togglePlay's pause branch set
@@ -1288,19 +2072,9 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
           const ctx = audioContextRef.current;
           if (gainNode && ctx) {
             const now = ctx.currentTime;
-            const masterVolumeDb = getSetting("masterVolume");
-            const masterVolumeGain = Math.pow(10, masterVolumeDb / 20);
-            const normalizationEnabled = getSetting("audioNormalization");
-            const effectiveGain = normalizationEnabled
-              ? (Number.isFinite(normGainRef.current) && normGainRef.current > 0
-                ? normGainRef.current
-                : 1)
-              : 1;
+            const target = computeAppliedGain(volumeRef.current, normGainRef.current);
             gainNode.gain.cancelScheduledValues(now);
-            gainNode.gain.setValueAtTime(
-              effectiveGain * clampVolume(volumeRef.current) * masterVolumeGain,
-              now,
-            );
+            gainNode.gain.setValueAtTime(target, now);
             // Mirror applyOutputLevels: when the gain node is the master,
             // keep the audio element at 1 so it doesn't double-attenuate
             // the signal. Defensive against setLiveVolume (the slider's
@@ -1318,18 +2092,47 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
         if (isSessionRestoreRef.current) {
           const savedPos = seekOnNextLoadRef.current;
           seekOnNextLoadRef.current = 0;
-          if (savedPos > 0) audio.currentTime = savedPos;
-          audio.pause();
+          if (savedPos > 0) {
+            audio.currentTime = savedPos;
+            progressRef.current = savedPos;
+            setProgress(savedPos);
+          } else {
+            applyLeadingSilenceSkipAtStart(audio);
+          }
+          const shouldPlay = playWhenReadyRef.current === true;
+          playWhenReadyRef.current = null;
           isSessionRestoreRef.current = false;
-          setIsPlaying(false);
-          setIsBuffering(false);
+          lastPlaybackIdleAtRef.current = shouldPlay ? 0 : Date.now();
           loadInProgressRef.current = false;
           setLastError(null);
+          if (shouldPlay) {
+            await audio.play();
+            if (cancelled) return;
+          } else {
+            audio.pause();
+            setIsPlaying(false);
+            setIsBuffering(false);
+          }
+          // Cached/preloaded streams often finish while the session-restore
+          // autoplay fetch is still in flight. Defer a top-up pass that waits
+          // for that fetch to settle before deciding whether to re-kick.
+          ensureAutoplayTopUpRef.current(true);
           return;
         }
 
-        await audio.play();
-        // Successful playback — clear the in-flight flag so the global error
+        applyLeadingSilenceSkipAtStart(audio);
+
+        const userIntent = playWhenReadyRef.current;
+        playWhenReadyRef.current = null;
+        const shouldPlay = userIntent !== false;
+        if (shouldPlay) {
+          await audio.play();
+        } else {
+          audio.pause();
+          setIsPlaying(false);
+          setIsBuffering(false);
+        }
+        // Successful load — clear the in-flight flag so the global error
         // handler resumes normal behavior, and wipe any stale error message
         // captured during earlier failed attempts.
         if (cancelled) return;
@@ -1361,16 +2164,22 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
       audio.pause();
       audio.currentTime = 0;
     };
-  }, [currentTrack, ensureAudioGraph, loadToken]);
+  }, [currentTrack?.id, ensureAudioGraph, loadToken, patchQueueTrackInRef, applyDurationFromAudio]);
 
   useEffect(() => {
     if (!currentTrack) {
       setNormGain(1);
       setCurrentAudioPath(null);
+      leadingSilenceSkipRef.current = 0;
       return;
     }
+    const trackForAnalysis =
+      queueRef.current[queueIndexRef.current]?.id === currentTrack.id
+        ? queueRef.current[queueIndexRef.current]!
+        : currentTrack;
     const targetLufs = loadTargetLufs();
-    const loudnessCacheKey = getAudioCacheKey(currentTrack);
+    const loudnessCacheKey = getAudioCacheKey(trackForAnalysis);
+    refreshLeadingSilenceSkipRef(loudnessCacheKey);
     const loudness = getCachedLoudness(loudnessCacheKey);
     if (loudness) {
       setNormGain(computeLinearGain(loudness, targetLufs));
@@ -1380,18 +2189,25 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
       setNormGain(getInitialGain(targetLufs));
     }
 
-    const filePath = currentAudioPath ?? (currentTrack.source === "upload" ? currentTrack.filePath : null);
+    const filePath =
+      currentAudioPath ??
+      (trackForAnalysis.source === "upload" ? trackForAnalysis.filePath : null);
+    if (filePath) {
+      void ensureLeadingSilenceAnalyzed(loudnessCacheKey, filePath);
+    }
+
     if (!filePath || loudness) return;
 
     let cancelled = false;
+    const analysisTrackId = currentTrack.id;
     void (async () => {
       let previewApplied = false;
 
-      const previewStarts = buildLoudnessPreviewStarts(currentTrack.durationSeconds);
+      const previewStarts = buildLoudnessPreviewStarts(trackForAnalysis.durationSeconds);
       for (const startSeconds of previewStarts) {
         try {
           const preview = await analyzeLoudnessChunk(filePath, startSeconds, LOUDNESS_PREVIEW_CHUNK_SECONDS);
-          if (cancelled || trackRef.current?.id !== currentTrack.id) return;
+          if (cancelled || trackRef.current?.id !== analysisTrackId) return;
           if (!isUsefulPreviewLoudness(preview)) continue;
 
           const previewGain = computeLinearGain(preview, targetLufs);
@@ -1416,7 +2232,7 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
 
       try {
         const data = await analyzeLoudness(filePath);
-        if (cancelled || trackRef.current?.id !== currentTrack.id) return;
+        if (cancelled || trackRef.current?.id !== analysisTrackId) return;
 
         // Cache the analysis result even if unusable/empty, to prevent repeated analyze_loudness calls.
         setCachedLoudness(loudnessCacheKey, data);
@@ -1428,7 +2244,7 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
         }
       } catch (error) {
         console.warn("Loudness analysis failed:", error);
-        if (cancelled || trackRef.current?.id !== currentTrack.id) return;
+        if (cancelled || trackRef.current?.id !== analysisTrackId) return;
         // Cache empty data on error so we don't retry
         setCachedLoudness(loudnessCacheKey, { integratedLufs: null, truePeak: null });
         if (!previewApplied) {
@@ -1445,108 +2261,91 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
   // Prefetch audio for the next several stream tracks and pre-analyze their
   // loudness AND leading silence so playback is seamless.
   useEffect(() => {
-    let cancelled = false;
-    const upcoming = queue
+    const upcoming = queueRef.current
       .slice(queueIndex + 1, queueIndex + 1 + PREFETCH_AHEAD)
-      .filter((track) => track.source === "stream" && (track.resolvedVideoId ?? track.videoId));
+      .filter((track) => track.source === "stream" && exportStreamVideoId(track));
     for (const track of upcoming) {
-      void (async () => {
-        try {
-          const effectiveVideoId = track.resolvedVideoId ?? track.videoId!;
-          const stream = await resolveStream(effectiveVideoId);
-          if (cancelled || !stream.filePath) return;
-
-          const cacheKey = getAudioCacheKey(track);
-          if (!getCachedLoudness(cacheKey) && !hasAttemptedAnalysis(cacheKey)) {
-            try {
-              const data = await analyzeLoudness(stream.filePath);
-              if (cancelled) return;
-              setCachedLoudness(cacheKey, data);
-            } catch (error) {
-              console.warn("Prefetch loudness analysis failed:", error);
-            }
-          }
-
-        } catch (error) {
-          console.warn("Prefetch stream resolve failed:", error);
-        }
-      })();
+      void prefetchStreamTrack(track);
     }
-    return () => {
-      cancelled = true;
-    };
-  }, [queue, queueIndex]);
+  }, [queueIndex, upcomingPrefetchKey, prefetchStreamTrack]);
 
-  // Prefetch synced lyrics for the next several tracks so the lyrics page
-  // opens instantly instead of showing a loading spinner.
+  // Prefetch synced lyrics for the current track first, then stagger
+  // upcoming tracks so rapid skipping doesn't flood the backend with
+  // concurrent multi-provider fetches that delay the active song.
   useEffect(() => {
     let cancelled = false;
+    const timers: ReturnType<typeof setTimeout>[] = [];
+    const current = queue[queueIndex];
+    if (current) prefetchSyncedLyricsForTrack(current);
+
     const upcoming = queue
       .slice(queueIndex + 1, queueIndex + 1 + PREFETCH_AHEAD)
-      .filter((track) => track.source === "stream" && (track.resolvedVideoId ?? track.videoId));
-    for (const track of upcoming) {
-      void getSyncedLyrics(track.resolvedVideoId ?? track.videoId!).then(() => {
+      .filter(
+        (track) =>
+          (track.source === "stream" && streamIdentityVideoIds(track).length > 0) ||
+          (track.source === "upload" && track.findLyrics),
+      );
+
+    upcoming.forEach((track, index) => {
+      const timer = setTimeout(() => {
         if (cancelled) return;
-      }).catch(() => {});
-    }
+        prefetchSyncedLyricsForTrack(track);
+      }, 400 * (index + 1));
+      timers.push(timer);
+    });
+
     return () => {
       cancelled = true;
+      for (const timer of timers) clearTimeout(timer);
     };
   }, [queue, queueIndex]);
 
-  const resolveTrackAudio = useCallback(async (track: MediaTrack): Promise<MediaTrack> => {
-    if (track.source !== "stream" || !track.videoId) return track;
-    // Substitute music-video entries (kind === "video") with the audio-only
-    // song found via search. We set `resolvedVideoId` to the canonical
-    // Topic-upload videoId (rather than mutating `videoId`/`id`, which
-    // would break `isTrackActive` matching against the original track still
-    // shown in track lists) and also apply the matched song's display
-    // metadata so the user sees the Topic upload's title/cover/etc.
-    // instead of the music video's. The load effect and prefetch logic
-    // use `resolvedVideoId ?? videoId` for actual stream resolution.
-    if (track.kind === "video") {
-      try {
-        const matched = await findClosestSongForVideoTrack(track);
-        if (matched && matched.videoId && matched.videoId !== track.videoId) {
-          return {
-            ...track,
-            resolvedVideoId: matched.videoId,
-            ...songMetadataFromMatch(track, matched),
-          };
-        }
-        return track;
-      } catch {
-        return track;
+  // Single-song lyrics-snapshot eviction. After every track change (and
+  // also on the initial mount with the restored session), drop any
+  // cross-session lyrics snapshot in localStorage whose videoId isn't
+  // the one we're now playing. The companion writer lives in
+  // `src/api.ts::getSyncedLyrics`, which persists the active track's
+  // lyrics on a backend-success. Together the two keep at most one
+  // entry on disk at any moment, satisfying the user-facing rule
+  // "don't bother holding it once the user passes the song". Sessions
+  // restore falls back to the in-memory `syncedLyricsCache.peek` plus
+  // this disk layer (see the augmented `peekSyncedLyrics` in api.ts).
+  //
+  // Effect runs on mount AND on every videoId change:
+  //   * on mount, it sweeps any prior-session debris except the freshly
+  //     restored videoId's entry (which we keep so the just-restored
+  //     LyricsPage can render from disk);
+  //   * on every change, it evicts the now-superseded snapshot before
+  //     the next track's prefetch effect writes its replacement.
+  //
+  // Gated on `source === "stream"` because upload tracks have no
+  // videoId and therefore no snapshot to keep — passing `null` would
+  // wipe everything (including any active stream-track snapshot), so
+  // we early-return instead.
+  useEffect(() => {
+    const track = currentTrack;
+    if (!track || track.source !== "stream") return;
+    const effectiveVideoId = track.resolvedVideoId ?? track.videoId;
+    if (!effectiveVideoId) return;
+    evictPersistedLyricsExcept(effectiveVideoId);
+  }, [currentTrack?.resolvedVideoId, currentTrack?.videoId, currentTrack?.source]);
+
+  const resolveTrackAudio = useCallback(async (track: MediaTrack): Promise<MediaTrack | null> => {
+    if (!isQueueableTrack(track)) {
+      if (track.source === "stream" && track.videoId) {
+        return resolveStreamTrackAudio(track);
       }
+      return null;
     }
-    // For song and undefined-kind entries (album tracks typically have no
-    // type label, so `kind` is undefined), check whether the videoId actually
-    // points to a music video instead of the canonical Topic upload. YouTube
-    // Music sometimes assigns a music-video videoId to song-kind entries,
-    // especially when the music video is the top result. If the search finds
-    // a different song-kind videoId for the same (artist, title), swap to
-    // the canonical one and apply the matched song's display metadata so
-    // the UI shows the Topic upload's title/cover rather than the music
-    // video's. `id` is preserved so `isTrackActive` keeps matching the
-    // original track displayed in track lists.
-    if (track.kind !== "episode" && track.kind !== "podcast") {
-      try {
-        const canonical = await findCanonicalSongVideoId(track);
-        if (canonical && canonical.videoId && canonical.videoId !== track.videoId) {
-          return {
-            ...track,
-            resolvedVideoId: canonical.videoId,
-            ...songMetadataFromMatch(track, canonical),
-          };
-        }
-      } catch {
-        // Ignore search errors — play with the original videoId.
-      }
-    }
-    return track;
+    return resolveStreamTrackAudio(track);
   }, []);
 
   const play = useCallback(async (track: MediaTrack) => {
+    if (!isQueueableTrack(track)) {
+      // Saved collection rows can carry `kind: "video"` from the source page.
+      // They should still play — resolution/offline/stream fallbacks handle it.
+      if (track.source !== "stream" || !track.videoId) return;
+    }
     // Record the previous track in history before any async work so that
     // navigating away while a track is still loading still registers it.
     if (trackRef.current) rememberPlaybackHistory();
@@ -1554,12 +2353,37 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
     const version = ++playVersionRef.current;
     stopCurrentPlayback();
     autoplayAdvancePendingRef.current = false;
-    const resolved = await resolveTrackAudio(track);
+    let trackToPlay = track;
+    if (track.source === "upload" && !track.filePath && !track.audioSrc) {
+      trackToPlay = await hydrateUploadTrackForPlayback(track);
+      if (version !== playVersionRef.current) return;
+    }
+    // Commit the requested track immediately so the player bar doesn't keep
+    // showing the prior song while stream resolution runs.
+    resetQueueVisitedToTrack(trackToPlay.id);
+    setQueueState({
+      queue: [trackToPlay],
+      queueIndex: 0,
+      queueOrigin: null,
+      autoplayTrackIds: [],
+      autoplaySeed: null,
+    });
+    const resolved = await resolveTrackAudio(trackToPlay);
     // A newer play() call has superseded this one — bail out so we don't
     // overwrite the queue with stale state.
     if (version !== playVersionRef.current) return;
-    const seedVideoId = resolved.resolvedVideoId ?? resolved.videoId;
-    const nextSeed = resolved.source === "stream" && seedVideoId
+    if (!resolved) return;
+    let seedVideoId = resolved.resolvedVideoId ?? resolved.videoId;
+    if (!seedVideoId && resolved.source === "upload") {
+      const enrichment = await enrichUploadMetadataFromYtm({
+        title: resolved.title,
+        artist: resolved.artist,
+        album: resolved.album,
+      });
+      if (version !== playVersionRef.current) return;
+      seedVideoId = enrichment?.videoId ?? null;
+    }
+    const nextSeed = seedVideoId
       ? { videoId: seedVideoId, playlistId: null }
       : null;
     setQueueState({
@@ -1580,10 +2404,11 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
     if (nextSeed) {
       void fetchAndAppendAutoplay(nextSeed);
     }
-  }, [rememberPlaybackHistory, stopCurrentPlayback, resolveTrackAudio, setQueueState]);
+  }, [rememberPlaybackHistory, stopCurrentPlayback, resolveTrackAudio, setQueueState, resetQueueVisitedToTrack]);
 
   const playMany = useCallback(async (tracks: MediaTrack[], startIndex = 0, origin?: QueueOrigin) => {
-    if (tracks.length === 0) return;
+    const queueable = filterQueueableTracks(tracks);
+    if (queueable.length === 0) return;
     // Record the previous track in history before any async work.
     if (trackRef.current) rememberPlaybackHistory();
     isSessionRestoreRef.current = false;
@@ -1597,34 +2422,65 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
     // until they all settle. The remaining tracks are kept in the queue as-is
     // and are lazily resolved one-at-a-time by the load effect's
     // `resolveTrackAudio` when each becomes current.
-    const clampedStart = Math.max(0, Math.min(startIndex, tracks.length - 1));
-    const resolvedFirst = await resolveTrackAudio(tracks[clampedStart]);
+    let playIndex = remapQueueStartIndex(tracks, queueable, startIndex);
+    const startTrackId = queueable[playIndex]?.id;
+    if (startTrackId) resetQueueVisitedToTrack(startTrackId);
+    // Commit the queue immediately so metadata tracks the user's selection
+    // while the start track is being resolved.
+    setQueueState({
+      queue: queueable,
+      queueIndex: playIndex,
+      queueOrigin: origin ?? null,
+      autoplayTrackIds: [],
+      autoplaySeed: null,
+    });
+    let startTrack = queueable[playIndex];
+    if (
+      startTrack &&
+      startTrack.source === "upload" &&
+      !startTrack.filePath &&
+      !startTrack.audioSrc
+    ) {
+      startTrack = await hydrateUploadTrackForPlayback(startTrack);
+      if (version !== playVersionRef.current) return;
+      queueable[playIndex] = startTrack;
+    }
+    const resolvedFirst = await resolveTrackAudio(queueable[playIndex]);
     if (version !== playVersionRef.current) return;
-    const resolved = tracks.slice();
-    resolved[clampedStart] = resolvedFirst;
+    if (!resolvedFirst) return;
+    const resolved = queueable.slice();
+    resolved[playIndex] = resolvedFirst;
     let finalQueue = resolved;
-    let finalIndex = Math.max(0, Math.min(startIndex, resolved.length - 1));
 
     if (shuffleRef.current && finalQueue.length > 1) {
-      const current = finalQueue[finalIndex];
+      const current = finalQueue[playIndex];
       finalQueue = [
         current,
         ...shuffledCopy([
-          ...finalQueue.slice(0, finalIndex),
-          ...finalQueue.slice(finalIndex + 1),
+          ...finalQueue.slice(0, playIndex),
+          ...finalQueue.slice(playIndex + 1),
         ]),
       ];
-      finalIndex = 0;
+      playIndex = 0;
     }
 
     const lastTrack = finalQueue[finalQueue.length - 1];
-    const lastSeedVideoId = lastTrack ? (lastTrack.resolvedVideoId ?? lastTrack.videoId) : null;
-    const nextSeed = lastTrack && lastTrack.source === "stream" && lastSeedVideoId
+    let lastSeedVideoId = lastTrack ? (lastTrack.resolvedVideoId ?? lastTrack.videoId) : null;
+    if (lastTrack && !lastSeedVideoId && lastTrack.source === "upload") {
+      const enrichment = await enrichUploadMetadataFromYtm({
+        title: lastTrack.title,
+        artist: lastTrack.artist,
+        album: lastTrack.album,
+      });
+      if (version !== playVersionRef.current) return;
+      lastSeedVideoId = enrichment?.videoId ?? null;
+    }
+    const nextSeed = lastTrack && lastSeedVideoId
       ? { videoId: lastSeedVideoId, playlistId: null }
       : null;
     setQueueState({
       queue: finalQueue,
-      queueIndex: finalIndex,
+      queueIndex: playIndex,
       queueOrigin: origin ?? null,
       autoplayTrackIds: [],
       autoplaySeed: nextSeed,
@@ -1636,7 +2492,7 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
     if (nextSeed) {
       void fetchAndAppendAutoplay(nextSeed);
     }
-  }, [rememberPlaybackHistory, stopCurrentPlayback, resolveTrackAudio, setQueueState]);
+  }, [rememberPlaybackHistory, stopCurrentPlayback, resolveTrackAudio, setQueueState, resetQueueVisitedToTrack]);
 
   const playShuffled = useCallback(async (tracks: MediaTrack[], origin?: QueueOrigin) => {
     if (tracks.length === 0) return;
@@ -1654,10 +2510,19 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
       fadeTimeoutRef.current = null;
     }
 
-    const masterVolumeDb = getSetting("masterVolume");
-    const masterVolumeGain = Math.pow(10, masterVolumeDb / 20);
-    const normalizationEnabled = getSetting("audioNormalization");
-    const effectiveNormGain = normalizationEnabled ? normGainRef.current : 1;
+    if (loadInProgressRef.current) {
+      const nextIntent = playWhenReadyRef.current !== true;
+      playWhenReadyRef.current = nextIntent;
+      setIsPlaying(nextIntent);
+      setIsBuffering(nextIntent);
+      return;
+    }
+
+    // `computeAppliedGain` returns the same scalar `applyOutputLevels`
+    // would set, so toggling play here doesn't drift away from the
+    // steady-state gain — the crossfade ramps are anchored to the same
+    // value the rest of the audio graph already knows.
+    const target = computeAppliedGain(volumeRef.current, normGainRef.current);
     const crossfadeOn = getSetting("crossfade");
 
     if (audio.paused) {
@@ -1669,7 +2534,6 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
       const ctx = audioContextRef.current;
       if (ctx && gain) {
         const now = ctx.currentTime;
-        const target = effectiveNormGain * volumeRef.current * masterVolumeGain;
         gain.gain.cancelScheduledValues(now);
         gain.gain.setValueAtTime(0, now);
         if (crossfadeOn) {
@@ -1679,6 +2543,40 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
         }
       }
 
+      const needsRefresh = playbackNeedsSourceRefresh(
+        currentTrack,
+        lastPlaybackIdleAtRef.current,
+        streamSourceRefreshNeededRef.current,
+      );
+      if (needsRefresh) {
+        sourceRefreshInProgressRef.current = true;
+        setIsBuffering(true);
+        const savedTime = audio.currentTime;
+        lastPlaybackIdleAtRef.current = 0;
+        void (async () => {
+          try {
+            await ensureAudioGraph();
+            await refreshStaleAudioSource();
+            streamSourceRefreshNeededRef.current = false;
+            if (Number.isFinite(savedTime) && savedTime > 0) {
+              audio.currentTime = savedTime;
+            }
+            await audio.play();
+          } catch (error) {
+            setIsPlaying(false);
+            setIsBuffering(false);
+            setLastError(
+              error instanceof Error ? error.message : "Playback could not resume after refreshing the audio.",
+            );
+          } finally {
+            sourceRefreshInProgressRef.current = false;
+            drainPendingSeekRef.current();
+          }
+        })();
+        return;
+      }
+
+      lastPlaybackIdleAtRef.current = 0;
       void audio.play().catch((error) => {
         setIsPlaying(false);
         setIsBuffering(false);
@@ -1712,7 +2610,7 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
         audio.pause();
       }
     }
-  }, [currentTrack, ensureAudioGraph]);
+  }, [currentTrack, ensureAudioGraph, refreshStaleAudioSource]);
 
   const fetchAndAppendAutoplay = useCallback(async (overrideSeed?: AutoplaySeed | null) => {
     const seed = overrideSeed ?? autoplaySeedRef.current;
@@ -1733,9 +2631,22 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
     }
     if (fetchingAutoplayRef.current) return;
     fetchingAutoplayRef.current = true;
+    const generation = autoplayFetchGenerationRef.current;
     let appended = false;
     let retryScheduled = false;
     let shouldRetry = true;
+
+    const abortIfStale = (): boolean => {
+      if (generation === autoplayFetchGenerationRef.current) return false;
+      shouldRetry = false;
+      return true;
+    };
+
+    const releaseFetchGuardIfCurrent = () => {
+      if (generation === autoplayFetchGenerationRef.current) {
+        fetchingAutoplayRef.current = false;
+      }
+    };
 
     // Schedule an auto-retry with exponential backoff. The first three
     // retries wait AUTOPLAY_RETRY_BASE_DELAY_MS each; after the 3rd retry
@@ -1746,6 +2657,7 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
         retryScheduled ||
         !autoplayRef.current ||
         !seed.videoId ||
+        generation !== autoplayFetchGenerationRef.current ||
         // If the seed has been replaced mid-fetch (e.g. user chained
         // play(A) → play(B) before the 3s watchdog fired), skip the
         // retry with the now-stale seed: it would just bounce off the
@@ -1762,12 +2674,14 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
       if (autoplayRetryTimerRef.current) {
         clearTimeout(autoplayRetryTimerRef.current);
       }
+      const retryGeneration = generation;
       autoplayRetryTimerRef.current = setTimeout(() => {
         autoplayRetryTimerRef.current = null;
+        if (retryGeneration !== autoplayFetchGenerationRef.current) return;
         // Briefly release the in-flight guard so the retry can re-enter
         // fetchAndAppendAutoplay (its own guard would otherwise block it).
         fetchingAutoplayRef.current = false;
-        void fetchAndAppendAutoplay(seed);
+        void fetchAndAppendAutoplay();
       }, delay);
     };
 
@@ -1778,6 +2692,7 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
     // first-three-fixed-then-doubling schedule).
     const watchdog = setTimeout(() => {
       if (appended || !fetchingAutoplayRef.current) return;
+      if (generation !== autoplayFetchGenerationRef.current) return;
       tryScheduleRetry();
     }, AUTOPLAY_FETCH_TIMEOUT_MS);
 
@@ -1796,7 +2711,7 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
       }
 
       const response = await getWatchPlaylist(seed.videoId, seed.playlistId ?? undefined);
-      if (!autoplayRef.current || autoplaySeedRef.current?.videoId !== seed.videoId) return;
+      if (abortIfStale() || !autoplayRef.current || autoplaySeedRef.current?.videoId !== seed.videoId) return;
       if (response.playlistId) {
         const refreshedSeed = { videoId: seed.videoId, playlistId: response.playlistId ?? null };
         autoplaySeedRef.current = refreshedSeed;
@@ -1805,12 +2720,11 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
       if (response.tracks.length === 0) return;
 
       const incoming = response.tracks.filter(
-        (entry) => entry.kind !== "episode" && entry.kind !== "podcast",
+        isAutoplayWatchPlaylistCandidate,
       );
 
-      const transformed = await Promise.all(
-        incoming.map((entry) => resolveAutoplayEntryToSong(entry)),
-      );
+      const transformed = await resolveAutoplayEntries(incoming);
+      if (abortIfStale()) return;
       const candidates = transformed.filter(
         (entry): entry is MediaTrack => entry !== null,
       );
@@ -1818,6 +2732,7 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
       if (!autoplayRef.current || autoplaySeedRef.current?.videoId !== seed.videoId) return;
 
       const latestQueue = queueRef.current;
+      const latestQueueIndex = queueIndexRef.current;
       // Build a rich dedup index from the queue: same song can appear with
       // different IDs (video vs song track), so we match on id, videoId,
       // and artist+title.
@@ -1878,11 +2793,9 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
             if (autoplayRef.current) {
               secondPlaylistId = secondResponse.playlistId;
               const secondIncoming = secondResponse.tracks.filter(
-                (entry) => entry.kind !== "episode" && entry.kind !== "podcast",
+                isAutoplayWatchPlaylistCandidate,
               );
-              const secondTransformed = await Promise.all(
-                secondIncoming.map((entry) => resolveAutoplayEntryToSong(entry)),
-              );
+              const secondTransformed = await resolveAutoplayEntries(secondIncoming);
               const secondCandidates = secondTransformed.filter(
                 (entry): entry is MediaTrack => entry !== null,
               );
@@ -1925,11 +2838,9 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
             const compResp = await getWatchPlaylist(nextSeedTrack.videoId);
             if (autoplayRef.current) {
               const compIncoming = compResp.tracks.filter(
-                (e) => e.kind !== "episode" && e.kind !== "podcast",
+                isAutoplayWatchPlaylistCandidate,
               );
-              const compTransformed = await Promise.all(
-                compIncoming.map((entry) => resolveAutoplayEntryToSong(entry)),
-              );
+              const compTransformed = await resolveAutoplayEntries(compIncoming);
               const compCandidates = compTransformed.filter(
                 (e): e is MediaTrack => e !== null,
               );
@@ -1955,8 +2866,19 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
         }
       }
 
+      // play()/playMany() can replace the queue while second/compensatory
+      // autoplay fetches are still in flight. Re-check the seed and that the
+      // queue head through the captured playhead is unchanged before commit;
+      // otherwise we'd restore the prior playlist and replay the old song.
+      if (abortIfStale() || !autoplayRef.current || autoplaySeedRef.current?.videoId !== seed.videoId) {
+        return;
+      }
+      for (let i = 0; i <= latestQueueIndex; i += 1) {
+        if (queueRef.current[i]?.id !== latestQueue[i]?.id) return;
+      }
+
       appended = true;
-      const nextQueue = [...latestQueue, ...additions];
+      const nextQueue = [...queueRef.current, ...additions];
       const nextAutoplayIds = new Set(autoplayIds);
       additions.forEach((track) => nextAutoplayIds.add(track.id));
 
@@ -1998,6 +2920,14 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
         autoplayAdvancePendingRef.current = false;
         const nextIndex = queueIndexRef.current + 1;
         if (nextIndex < nextQueue.length) {
+          const advancedTrack = nextQueue[nextIndex];
+          if (advancedTrack) {
+            queueVisitedTrackIdsRef.current = addVisitedQueueTrack(
+              queueVisitedTrackIdsRef.current,
+              advancedTrack.id,
+            );
+            setQueueVisitedTrackIds(queueVisitedTrackIdsRef.current);
+          }
           setQueueState({
             queue: nextQueue,
             queueIndex: nextIndex,
@@ -2016,30 +2946,85 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
         // toppings useEffect can re-fire if more additions are still needed.
         autoplayRetryCountRef.current = 0;
         autoplayAdvancePendingRef.current = false;
-        fetchingAutoplayRef.current = false;
+        releaseFetchGuardIfCurrent();
         if (autoplayRetryTimerRef.current) {
           clearTimeout(autoplayRetryTimerRef.current);
           autoplayRetryTimerRef.current = null;
         }
-      } else if (shouldRetry && !retryScheduled) {
+      } else if (retryScheduled) {
+        // Watchdog or a prior tryScheduleRetry call owns the next attempt.
+      } else if (shouldRetry) {
+        autoplayAdvancePendingRef.current = false;
         // Fast-failure (response empty, all-dedup'd, network error from the
         // watch-playlist backend) bypassed the AUTOPLAY_FETCH_TIMEOUT_MS
         // watchdog — schedule the retry now.
         tryScheduleRetry();
+        if (!retryScheduled) {
+          // Seed was replaced or autoplay was turned off mid-fetch — release
+          // the guard so the toppings effect can start a fresh attempt.
+          releaseFetchGuardIfCurrent();
+        }
+      } else {
+        autoplayAdvancePendingRef.current = false;
+        // Queue was already topped up, or retries are disabled — release the
+        // guard so later toppings passes are not permanently blocked.
+        releaseFetchGuardIfCurrent();
       }
-      // else: retry was scheduled by the watchdog, or shouldRetry is false
-      // (queue was already topped up). Either way the next attempt will
-      // reset the in-flight flag when it actually runs.
+
+      // If this attempt did not append and no retry timer owns the next
+      // pass, schedule a deferred top-up. The toppings effect will not
+      // re-fire when its deps are unchanged — a common startup failure
+      // mode when the restore load wins the race against the first fetch.
+      if (!appended && !retryScheduled && generation === autoplayFetchGenerationRef.current) {
+        ensureAutoplayTopUpRef.current(false);
+      }
     }
   }, [setQueueState]);
+
+  const ensureAutoplayTopUp = useCallback(function ensureAutoplayTopUp(waitForInFlight = false) {
+    const attempt = (inFlightWaitsLeft: number) => {
+      if (!autoplayRef.current) return;
+      const seed = autoplaySeedRef.current;
+      if (!seed?.videoId) return;
+      const autoplayAhead = queueRef.current
+        .slice(queueIndexRef.current + 1)
+        .filter((track) => autoplayTrackIdsRef.current.has(track.id)).length;
+      if (autoplayAhead >= AUTOPLAY_QUEUE_TARGET) return;
+      if (fetchingAutoplayRef.current) {
+        if (waitForInFlight && inFlightWaitsLeft > 0) {
+          window.setTimeout(
+            () => attempt(inFlightWaitsLeft - 1),
+            AUTOPLAY_FETCH_TIMEOUT_MS + 250,
+          );
+        }
+        return;
+      }
+      void fetchAndAppendAutoplay(seed);
+    };
+
+    queueMicrotask(() => attempt(waitForInFlight ? 2 : 0));
+  }, [fetchAndAppendAutoplay]);
+
+  fetchAndAppendAutoplayRef.current = fetchAndAppendAutoplay;
+  ensureAutoplayTopUpRef.current = ensureAutoplayTopUp;
 
   const next = useCallback((recordRecentlyPlayed = false) => {
     const currentQueue = queueRef.current;
     const currentIndex = queueIndexRef.current;
     if (currentQueue.length === 0) return;
     if (currentIndex + 1 < currentQueue.length) {
-      if (recordRecentlyPlayed) rememberPlaybackHistory();
+      autoplayAdvancePendingRef.current = false;
+      const redoingForward = isRedoingQueueAdvance(
+        playbackHistoryRef.current,
+        currentQueue,
+        currentIndex,
+        queueOriginRef.current,
+      );
+      if (recordRecentlyPlayed && !redoingForward) rememberPlaybackHistory();
+      const nextTrack = currentQueue[currentIndex + 1];
+      if (nextTrack) markQueueTrackVisited(nextTrack.id);
       stopCurrentPlayback();
+      invalidateAutoplayFetch();
       setQueueState({
         queue: currentQueue,
         queueIndex: currentIndex + 1,
@@ -2047,11 +3032,16 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
         autoplayTrackIds: autoplayTrackIdsRef.current,
         autoplaySeed: autoplaySeedRef.current,
       });
+      if (autoplayRef.current) ensureAutoplayTopUp(false);
       return;
     }
     if (repeatRef.current === "all") {
+      autoplayAdvancePendingRef.current = false;
       if (recordRecentlyPlayed) rememberPlaybackHistory();
+      const wrapTrack = currentQueue[0];
+      if (wrapTrack) markQueueTrackVisited(wrapTrack.id);
       stopCurrentPlayback();
+      invalidateAutoplayFetch();
       setQueueState({
         queue: currentQueue,
         queueIndex: 0,
@@ -2059,31 +3049,50 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
         autoplayTrackIds: autoplayTrackIdsRef.current,
         autoplaySeed: autoplaySeedRef.current,
       });
+      if (autoplayRef.current) ensureAutoplayTopUp(false);
       return;
     }
     if (autoplayRef.current && autoplaySeedRef.current?.videoId) {
       if (recordRecentlyPlayed) rememberPlaybackHistory();
       stopCurrentPlayback();
       autoplayAdvancePendingRef.current = true;
-      if (!fetchingAutoplayRef.current) void fetchAndAppendAutoplay();
+      invalidateAutoplayFetch();
+      void fetchAndAppendAutoplay();
     }
-  }, [rememberPlaybackHistory, fetchAndAppendAutoplay, stopCurrentPlayback, setQueueState]);
+  }, [rememberPlaybackHistory, fetchAndAppendAutoplay, stopCurrentPlayback, setQueueState, ensureAutoplayTopUp, invalidateAutoplayFetch, markQueueTrackVisited]);
 
   useEffect(() => {
     nextRef.current = next;
   }, [next]);
 
-  const playQueueIndex = useCallback((index: number) => {
+  const playQueueIndex = useCallback((index: number, trackId?: string) => {
     const currentQueue = queueRef.current;
     if (currentQueue.length === 0) return;
-    const nextIndex = Math.max(0, Math.min(index, currentQueue.length - 1));
+    let nextIndex = Math.max(0, Math.min(index, currentQueue.length - 1));
+    if (trackId) {
+      const byId = currentQueue.findIndex((track) => track.id === trackId);
+      if (byId >= 0) nextIndex = byId;
+    }
     if (nextIndex === queueIndexRef.current) {
       togglePlay();
       return;
     }
     autoplayAdvancePendingRef.current = false;
-    rememberPlaybackHistory();
+    if (
+      nextIndex > queueIndexRef.current &&
+      !isRedoingQueueAdvance(
+        playbackHistoryRef.current,
+        currentQueue,
+        queueIndexRef.current,
+        queueOriginRef.current,
+      )
+    ) {
+      rememberPlaybackHistory();
+    }
+    const targetTrack = currentQueue[nextIndex];
+    if (targetTrack) markQueueTrackVisited(targetTrack.id);
     stopCurrentPlayback();
+    invalidateAutoplayFetch();
     setQueueState({
       queue: currentQueue,
       queueIndex: nextIndex,
@@ -2091,22 +3100,15 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
       autoplayTrackIds: autoplayTrackIdsRef.current,
       autoplaySeed: autoplaySeedRef.current,
     });
-  }, [rememberPlaybackHistory, stopCurrentPlayback, togglePlay, setQueueState]);
+    if (autoplayRef.current) ensureAutoplayTopUp(false);
+  }, [rememberPlaybackHistory, stopCurrentPlayback, togglePlay, setQueueState, ensureAutoplayTopUp, invalidateAutoplayFetch, markQueueTrackVisited]);
 
   const restoreHistoryEntry = useCallback((historyIndex: number) => {
     const entry = playbackHistoryRef.current[historyIndex];
     if (!entry) return;
 
-    const currentEntry = capturePlaybackHistoryEntry();
     autoplayAdvancePendingRef.current = false;
     stopCurrentPlayback();
-    setPlaybackHistory((current) => {
-      const remaining = current.filter((_, index) => index !== historyIndex);
-      if (!currentEntry || playbackHistoryEntriesEqual(currentEntry, entry)) {
-        return remaining;
-      }
-      return [currentEntry, ...remaining].slice(0, RECENTLY_PLAYED_LIMIT);
-    });
 
     let restoredEntry = entry;
     if (entry.queueOrigin) {
@@ -2131,7 +3133,7 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
     }
 
     applyPlaybackHistoryEntry(restoredEntry);
-  }, [capturePlaybackHistoryEntry, stopCurrentPlayback, applyPlaybackHistoryEntry]);
+  }, [stopCurrentPlayback, applyPlaybackHistoryEntry]);
 
   const moveQueueItem = useCallback((fromIndex: number, toIndex: number) => {
     const currentQueue = queueRef.current;
@@ -2176,6 +3178,10 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
       autoplaySeed: autoplaySeedRef.current,
     });
   }, [setQueueState]);
+
+  const clearPlaybackHistory = useCallback(() => {
+    setPlaybackHistory([]);
+  }, []);
 
   // Remove a track from the active queue without disturbing the rest of
   // the session. Used when a locally uploaded track is deleted from disk
@@ -2228,6 +3234,7 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
       stopCurrentPlayback();
     }
 
+    setQueueVisitedTrackIds((current) => removeVisitedQueueTrack(current, trackId));
     setQueueState({
       queue: finalQueue,
       queueIndex: finalIndex,
@@ -2247,7 +3254,10 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
   // headers. `queueOrigin` is NOT changed — that only tracks the active
   // playback session and controls the play-button state.
   const appendToQueue = useCallback((tracks: MediaTrack[], origin?: QueueOrigin) => {
-    if (tracks.length === 0) return;
+    void (async () => {
+    const hydrated = await Promise.all(tracks.map(hydrateUploadTrackForPlayback));
+    const queueable = filterQueueableTracks(hydrated);
+    if (queueable.length === 0) return;
     const currentQueue = queueRef.current;
     const currentIndex = queueIndexRef.current;
     const autoplayIds = autoplayTrackIdsRef.current;
@@ -2272,7 +3282,7 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
     // section. Append new tracks.
     const tracksToAdd: MediaTrack[] = [];
     const removedAutoplayIds = new Set<string>();
-    for (const track of tracks) {
+    for (const track of queueable) {
       if (manualIds.has(track.id)) continue;
       if (autoplayIdSet.has(track.id)) {
         removedAutoplayIds.add(track.id);
@@ -2297,46 +3307,212 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
       autoplayTrackIds: nextAutoplayIds,
       autoplaySeed: autoplaySeedRef.current,
     });
+    })();
   }, [setQueueState]);
 
   const prev = useCallback(() => {
     const audio = audioRef.current;
     if (!audio) return;
+    autoplayAdvancePendingRef.current = false;
     // Restart the current track if past the 5-second threshold.
     if (audio.currentTime > 5) {
+      const track = trackRef.current;
+      const needsRefresh = playbackNeedsSourceRefresh(
+        track,
+        lastPlaybackIdleAtRef.current,
+        streamSourceRefreshNeededRef.current,
+      );
+      if (needsRefresh) {
+        const wasPlaying = !audio.paused;
+        sourceRefreshInProgressRef.current = true;
+        setIsBuffering(true);
+        void (async () => {
+          try {
+            lastPlaybackIdleAtRef.current = 0;
+            await ensureAudioGraph();
+            await refreshStaleAudioSource();
+            streamSourceRefreshNeededRef.current = false;
+            audio.currentTime = 0;
+            progressRef.current = 0;
+            setProgress(0);
+            applyLeadingSilenceSkipAtStartRef.current(audio, true);
+            if (wasPlaying) {
+              await audio.play();
+            } else {
+              setIsBuffering(false);
+            }
+          } catch (error) {
+            setIsBuffering(false);
+            audio.currentTime = 0;
+            progressRef.current = 0;
+            setProgress(0);
+            applyLeadingSilenceSkipAtStartRef.current(audio, true);
+            setLastError(
+              error instanceof Error ? error.message : "Could not restart this track.",
+            );
+          } finally {
+            sourceRefreshInProgressRef.current = false;
+            drainPendingSeekRef.current();
+          }
+        })();
+        return;
+      }
       audio.currentTime = 0;
+      progressRef.current = 0;
       setProgress(0);
+      applyLeadingSilenceSkipAtStartRef.current(audio, true);
       return;
     }
-    // Move backward within the queue if possible.
-    if (queueIndex > 0) {
+    // Move backward within the queue only to tracks the user actually started.
+    const previousVisitedIndex = findPreviousVisitedQueueIndex(
+      queueRef.current,
+      queueIndex,
+      queueVisitedTrackIdsRef.current,
+    );
+    if (previousVisitedIndex >= 0) {
       stopCurrentPlayback();
       setQueueState({
         queue: queueRef.current,
-        queueIndex: queueIndex - 1,
+        queueIndex: previousVisitedIndex,
         queueOrigin: queueOriginRef.current,
         autoplayTrackIds: autoplayTrackIdsRef.current,
         autoplaySeed: autoplaySeedRef.current,
       });
       return;
     }
-    // At queue start, restore the most recent playback context instead of
-    // flattening it into a one-song queue.
-    if (playbackHistoryRef.current[0]) {
-      restoreHistoryEntry(0);
-    } else {
-      // No history — just restart the current track.
-      audio.currentTime = 0;
-      setProgress(0);
+    // At the queue head, jump to the prior listening session (Spotify-style)
+    // without mutating history. Skip entries for tracks still queued ahead —
+    // those are forward skips the user backed over, not prior sessions.
+    const historyIndex = findPreviousSessionHistoryIndex(
+      playbackHistoryRef.current,
+      queueRef.current,
+      queueIndex,
+      trackRef.current,
+      queueOriginRef.current,
+    );
+    if (historyIndex >= 0) {
+      const historyEntry = playbackHistoryRef.current[historyIndex];
+      if (
+        historyEntry &&
+        !historyRestoreWouldDropAppendedTracks(queueRef.current, historyEntry)
+      ) {
+        restoreHistoryEntry(historyIndex);
+        return;
+      }
     }
-  }, [queueIndex, stopCurrentPlayback, restoreHistoryEntry, setQueueState]);
+    audio.currentTime = 0;
+    progressRef.current = 0;
+    setProgress(0);
+    applyLeadingSilenceSkipAtStartRef.current(audio, true);
+  }, [queueIndex, stopCurrentPlayback, restoreHistoryEntry, setQueueState, ensureAudioGraph, refreshStaleAudioSource]);
 
   const seek = useCallback((seconds: number) => {
     const audio = audioRef.current;
+    const track = trackRef.current;
     if (!audio) return;
-    audio.currentTime = Math.max(0, Math.min(duration || 0, seconds));
-    setProgress(audio.currentTime);
-  }, [duration]);
+    const target = Math.max(0, Math.min(duration || 0, seconds));
+    if (sourceRefreshInProgressRef.current) {
+      pendingSeekTargetRef.current = target;
+      progressRef.current = target;
+      setProgress(target);
+      return;
+    }
+    const isActivelyPlaying = !audio.paused;
+    const needsRefresh =
+      !isActivelyPlaying &&
+      playbackNeedsSourceRefresh(
+        track,
+        lastPlaybackIdleAtRef.current,
+        streamSourceRefreshNeededRef.current,
+      );
+    if (needsRefresh && track?.source === "stream") {
+      const wasPlaying = !audio.paused;
+      sourceRefreshInProgressRef.current = true;
+      setIsBuffering(true);
+      if (wasPlaying) {
+        lastPlaybackIdleAtRef.current = 0;
+      }
+      void (async () => {
+        try {
+          await ensureAudioGraph();
+          await refreshStaleAudioSource();
+          streamSourceRefreshNeededRef.current = false;
+          applySeekTarget(target);
+          if (wasPlaying) {
+            await audio.play();
+          }
+        } catch (error) {
+          setIsPlaying(false);
+          setIsBuffering(false);
+          setLastError(
+            error instanceof Error ? error.message : "Could not seek after refreshing the audio.",
+          );
+        } finally {
+          sourceRefreshInProgressRef.current = false;
+          if (audio.paused) {
+            setIsBuffering(false);
+          }
+          drainPendingSeek();
+          tryResumeAfterSeekScrubRef.current();
+        }
+      })();
+      return;
+    }
+    applySeekTarget(target);
+    tryResumeAfterSeekScrubRef.current();
+  }, [duration, ensureAudioGraph, refreshStaleAudioSource, applySeekTarget, drainPendingSeek]);
+
+  const tryResumeAfterSeekScrub = useCallback(() => {
+    if (!resumeAfterSeekRef.current) return;
+    resumeAfterSeekRef.current = false;
+    const audio = audioRef.current;
+    if (!audio || !trackRef.current || !audio.paused) return;
+    togglePlay();
+  }, [togglePlay]);
+
+  useEffect(() => {
+    tryResumeAfterSeekScrubRef.current = tryResumeAfterSeekScrub;
+  }, [tryResumeAfterSeekScrub]);
+
+  const beginSeekScrub = useCallback(() => {
+    const audio = audioRef.current;
+    if (!audio || !currentTrack) return false;
+    if (fadeTimeoutRef.current) {
+      clearTimeout(fadeTimeoutRef.current);
+      fadeTimeoutRef.current = null;
+    }
+    const wasPlaying = !audio.paused;
+    if (!wasPlaying) return false;
+
+    lastPlaybackIdleAtRef.current = 0;
+    setIsPlaying(false);
+    setIsBuffering(false);
+    audio.pause();
+
+    const gain = gainNodeRef.current;
+    const ctx = audioContextRef.current;
+    if (ctx && gain) {
+      const target = computeAppliedGain(volumeRef.current, normGainRef.current);
+      const now = ctx.currentTime;
+      gain.gain.cancelScheduledValues(now);
+      gain.gain.setValueAtTime(target, now);
+    }
+    return true;
+  }, [currentTrack]);
+
+  const updateSeekScrubPreview = useCallback((seconds: number | null) => {
+    setSeekScrubProgress(seconds);
+  }, []);
+
+  const finishSeekScrub = useCallback((seconds: number | null, resume: boolean) => {
+    setSeekScrubProgress(null);
+    resumeAfterSeekRef.current = resume;
+    if (seconds !== null) {
+      seek(seconds);
+      return;
+    }
+    tryResumeAfterSeekScrub();
+  }, [seek, tryResumeAfterSeekScrub]);
 
   const setVolume = useCallback((value: number) => {
     setVolumeState(Math.max(0, Math.min(1, value)));
@@ -2346,22 +3522,21 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
   const setLiveVolume = useCallback((value: number) => {
     const audio = audioRef.current;
     if (!audio) return;
-    const cleanVolume = clampVolume(value);
-    const cleanGain = Number.isFinite(normGainRef.current) && normGainRef.current > 0 ? normGainRef.current : 1;
+    // Route through `computeAppliedGain` so the slider uses the same
+    // factor chain (norm-gain × volume × master-dB) as `applyOutputLevels`.
+    // The 0.015s ramp is a bit faster than `applyOutputLevels`' 0.15s
+    // because this fires on every onChange event while dragging — a tight
+    // ramp keeps the slider feeling responsive without audible zipper noise.
+    const target = computeAppliedGain(value, normGainRef.current);
     const gainNode = gainNodeRef.current;
-
-    const masterVolumeDb = getSetting("masterVolume");
-    const masterVolumeGain = Math.pow(10, masterVolumeDb / 20);
-    const normalizationEnabled = getSetting("audioNormalization");
-    const effectiveGain = normalizationEnabled ? cleanGain : 1;
 
     if (gainNode && audioContextRef.current) {
       const now = audioContextRef.current.currentTime;
       gainNode.gain.cancelScheduledValues(now);
-      gainNode.gain.setTargetAtTime(effectiveGain * cleanVolume * masterVolumeGain, now, 0.015);
+      gainNode.gain.setTargetAtTime(target, now, 0.015);
       audio.volume = 1;
     } else {
-      audio.volume = clampVolume(cleanVolume * effectiveGain * masterVolumeGain);
+      audio.volume = clampVolume(target);
     }
     audio.muted = false;
   }, []);
@@ -2408,29 +3583,23 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
 
   const setAutoplay = useCallback((value: boolean) => {
     autoplayRef.current = value;
-    setAutoplayState(value);
+    // Persist through the unified settings blob (atomic per-tick
+    // write) so a coalesced flush on the backend can never drop the
+    // autoplay value mid-write the way the previous per-key `velocity-autoplay` IPC echo could. The React state is owned by `useSetting("autoplay")` above, which subscribes to the settings-notification broadcast and re-renders this provider automatically when `setSetting` fires, so we don’t need a parallel `setAutoplayState` call here.
+    setSetting("autoplay", value);
     if (value) {
       const current = trackRef.current;
       if (!autoplaySeedRef.current && current?.source === "stream" && current.videoId) {
-        const nextSeed = { videoId: current.videoId, playlistId: null };
+        const effectiveVideoId = current.resolvedVideoId ?? current.videoId;
+        const nextSeed = { videoId: effectiveVideoId, playlistId: null };
         autoplaySeedRef.current = nextSeed;
         setAutoplaySeed(nextSeed);
       }
+      ensureAutoplayTopUp(false);
       return;
     }
 
-    // Cancel any pending auto-retry and release the in-flight guard so
-    // re-enabling autoplay later starts from a clean state (otherwise the
-    // toppings useEffect could see `fetchingAutoplayRef.current === true`
-    // and short-circuit).
-    if (fetchingAutoplayRef.current) {
-      fetchingAutoplayRef.current = false;
-    }
-    if (autoplayRetryTimerRef.current) {
-      clearTimeout(autoplayRetryTimerRef.current);
-      autoplayRetryTimerRef.current = null;
-    }
-    autoplayRetryCountRef.current = 0;
+    invalidateAutoplayFetch();
 
     autoplayAdvancePendingRef.current = false;
     const sourceIds = autoplayTrackIdsRef.current;
@@ -2445,7 +3614,7 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
       autoplayTrackIds: [],
       autoplaySeed: autoplaySeedRef.current,
     });
-  }, [setQueueState]);
+  }, [ensureAutoplayTopUp, setQueueState, invalidateAutoplayFetch]);
 
   const reloadAutoplay = useCallback(async () => {
     const current = trackRef.current;
@@ -2581,49 +3750,26 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
   // Persists the current track and playback position so the user can
   // resume where they left off after restarting the app.
 
-  // Session restore on first mount.
+  // Session restore on first mount — queue/progress are seeded synchronously
+  // via getBootSession() so the player bar can paint the saved timestamp
+  // immediately. This effect only kicks off the autoplay fetch.
   useEffect(() => {
-    const isOn = getSetting("saveTimestamp");
-    if (!isOn) return;
+    const data = getBootSession();
+    if (!data) return;
 
-    const raw = getItem(SESSION_KEY);
-    if (!raw) return;
+    const nextSeed = bootAutoplaySeed(data);
+    if (!nextSeed) return;
 
-    let data: { track: MediaTrack; progress: number; savedAt: number } | null = null;
-    try {
-      data = JSON.parse(raw);
-    } catch {
-      removeItem(SESSION_KEY);
-      return;
-    }
-    if (!data?.track?.id || typeof data.progress !== "number") {
-      removeItem(SESSION_KEY);
-      return;
-    }
-    // Stale after 24 hours — discard silently.
-    if (Date.now() - data.savedAt > 86_400_000) {
-      removeItem(SESSION_KEY);
-      return;
-    }
-
-    isSessionRestoreRef.current = true;
-
-    const restored = data.track;
-    setQueueState({
-      queue: [restored],
-      queueIndex: 0,
-      queueOrigin: null,
-      autoplayTrackIds: [],
-      autoplaySeed:
-        restored.source === "stream" && restored.videoId
-          ? { videoId: restored.videoId, playlistId: null }
-          : null,
-    });
-
-    // Carry the saved position so the load effect can seek before the
-    // first paint instead of flashing at 0:00.
-    seekOnNextLoadRef.current = data.progress;
-  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+    // Proactively kick off the autoplay fetch in lockstep with the queue
+    // being seeded — same race closure as play()/playMany(). Relying solely
+    // on the toppings effect is unreliable on startup, especially when the
+    // restored track's stream is already cached and the load effect finishes
+    // before the deferred toppings pass runs.
+    void fetchAndAppendAutoplay(nextSeed);
+    // Belt-and-suspenders: if the first fetch loses the startup race or
+    // aborts after audio resolution, the deferred pass still refills.
+    ensureAutoplayTopUp(true);
+  }, [fetchAndAppendAutoplay, ensureAutoplayTopUp]);
 
   // Periodic session save while a track is active. Toggling
   // `saveTimestamp` mid-session must take effect immediately (otherwise
@@ -2650,6 +3796,7 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
         SESSION_KEY,
         JSON.stringify({ track: currentTrack, progress: ct, savedAt: Date.now() }),
       );
+      persistCachedLyricsForTrack(currentTrack);
     };
 
     sessionSaveTimerRef.current = setInterval(save, 10_000);
@@ -2658,6 +3805,9 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
       if (sessionSaveTimerRef.current) {
         clearInterval(sessionSaveTimerRef.current);
         sessionSaveTimerRef.current = null;
+      }
+      if (currentTrack?.source === "stream") {
+        persistCachedLyricsForTrack(currentTrack);
       }
     };
   }, [currentTrack?.id, saveTimestampEnabled]); // eslint-disable-line react-hooks/exhaustive-deps
@@ -2678,12 +3828,13 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
       queueIndex,
       queueOrigin,
       autoplayTrackIds,
-      previousQueue,
       recentlyPlayed,
       isPlaying,
       isBuffering,
       isReloadingAutoplay,
       progress,
+      seekScrubProgress,
+      seekRevision,
       duration,
       volume,
       muted,
@@ -2700,12 +3851,16 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
       restoreHistoryEntry,
       moveQueueItem,
       clearQueue,
+      clearPlaybackHistory,
       removeTrackFromQueue,
       appendToQueue,
       togglePlay,
       next,
       prev,
       seek,
+      beginSeekScrub,
+      finishSeekScrub,
+      updateSeekScrubPreview,
       setVolume,
       setLiveVolume,
       toggleMute,
@@ -2730,6 +3885,7 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
       muted,
       moveQueueItem,
       clearQueue,
+      clearPlaybackHistory,
       removeTrackFromQueue,
       appendToQueue,
       next,
@@ -2741,16 +3897,20 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
       restoreHistoryEntry,
       prev,
       progress,
+      seekScrubProgress,
+      seekRevision,
       queue,
       queueIndex,
       queueOrigin,
       autoplayTrackIds,
-      previousQueue,
       recentlyPlayed,
       reloadAutoplay,
       repeat,
       retry,
       seek,
+      beginSeekScrub,
+      finishSeekScrub,
+      updateSeekScrubPreview,
       setAutoplay,
       setEqualizerBand,
       setVolume,

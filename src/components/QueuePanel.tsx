@@ -90,8 +90,6 @@ export function QueuePanel({ open, onNavigate }: { open: boolean; onNavigate: (v
     })),
     [player.autoplayTrackIds, player.queue, player.queueIndex],
   );
-  const previousTracks = useMemo(() => player.previousQueue, [player.previousQueue]);
-
   const allTracks = useMemo(() => {
     const list: { cover?: string | null }[] = [];
     if (player.currentTrack) list.push(player.currentTrack);
@@ -433,9 +431,9 @@ export function QueuePanel({ open, onNavigate }: { open: boolean; onNavigate: (v
           />
           <button
             type="button"
-            onClick={() => player.clearQueue()}
+            onClick={() => (tab === "queued" ? player.clearQueue() : player.clearPlaybackHistory())}
             className="ml-auto flex h-10 items-center gap-2 whitespace-nowrap text-sm font-semibold text-white/48 transition-colors hover:text-white/78"
-            title="Clear all upcoming tracks from the queue"
+            title={tab === "queued" ? "Clear all upcoming tracks from the queue" : "Clear recently played history"}
           >
             <Trash2 size={16} />
             <span>Clear All</span>
@@ -508,7 +506,7 @@ export function QueuePanel({ open, onNavigate }: { open: boolean; onNavigate: (v
                           queueIndex={entry.queueIndex}
                           isDragged={dragFromIndex === entry.queueIndex}
                           dragging={dragFromIndex !== null}
-                          onClick={() => runQueueClick(() => player.playQueueIndex(entry.queueIndex))}
+                          onClick={() => runQueueClick(() => player.playQueueIndex(entry.queueIndex, entry.track.id))}
                           onPointerDragStart={(event) => handlePointerDragStart(event, entry.queueIndex)}
                           onNavigate={onNavigate}
                         />
@@ -521,34 +519,29 @@ export function QueuePanel({ open, onNavigate }: { open: boolean; onNavigate: (v
               player.autoplay ? <AutoplayLoading /> : <EmptyQueue label="The queue ends here" />
             )}
           </>
-        ) : previousTracks.length > 0 || player.recentlyPlayed.length > 0 ? (
-          <div className="space-y-4">
-            {previousTracks.length > 0 && (
-              <QueueSection label="Previous">
-                {previousTracks.map((entry) => (
-                  <QueueTrackRow
-                    key={`${entry.track.id}-${entry.queueIndex}`}
-                    track={entry.track}
-                    onClick={() => player.playQueueIndex(entry.queueIndex)}
-                    onNavigate={onNavigate}
-                  />
-                ))}
-              </QueueSection>
-            )}
-
-            {player.recentlyPlayed.length > 0 && (
-              <QueueSection label="Recently played">
-                {player.recentlyPlayed.map((entry) => (
-                  <QueueTrackRow
-                    key={`${entry.track.id}-${entry.historyIndex}`}
-                    track={entry.track}
-                    onClick={() => player.restoreHistoryEntry(entry.historyIndex)}
-                    onNavigate={onNavigate}
-                  />
-                ))}
-              </QueueSection>
-            )}
-          </div>
+        ) : player.recentlyPlayed.length > 0 ? (
+          <QueueSection label="Recently played">
+            {player.recentlyPlayed.map((entry) => (
+              <QueueTrackRow
+                key={
+                  entry.historyIndex >= 0
+                    ? `${entry.track.id}-history-${entry.historyIndex}`
+                    : `${entry.track.id}-queue-${entry.queueIndex}`
+                }
+                track={entry.track}
+                onClick={() => {
+                  if (entry.historyIndex >= 0) {
+                    player.restoreHistoryEntry(entry.historyIndex);
+                    return;
+                  }
+                  if (typeof entry.queueIndex === "number") {
+                    player.playQueueIndex(entry.queueIndex, entry.track.id);
+                  }
+                }}
+                onNavigate={onNavigate}
+              />
+            ))}
+          </QueueSection>
         ) : (
           <EmptyQueue label="Songs you finish or skip will appear here" />
         )}

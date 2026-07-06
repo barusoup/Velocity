@@ -1,4 +1,4 @@
-import { lazy, Suspense, useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react";
 import {
   importTracks,
   listImportedTracks,
@@ -14,17 +14,31 @@ import { SongContextMenu, type AddToPlaylistResolver } from "./components/SongCo
 import { ConfirmDialog } from "./components/Shared";
 import { LoadingPanel } from "./components/PagesShared";
 import { PlayerProvider, usePlayer, type QueueOrigin } from "./player";
+import { useGlobalContextMenus } from "./hooks/useGlobalContextMenus";
+import { useGlobalShortcuts } from "./hooks/useGlobalShortcuts";
+import { useImportedTracksHydration } from "./hooks/useImportedTracksHydration";
+import { useScrollRestoration } from "./hooks/useScrollRestoration";
+import { useDiscordRichPresence } from "./hooks/useDiscordRichPresence";
+import { useStartupMinimized } from "./hooks/useStartupMinimized";
+import { useStartupSplash } from "./hooks/useStartupSplash";
+import { useViewportHeightTracker } from "./hooks/useViewportHeightTracker";
 import type { MediaTrack, SearchItem } from "./types";
 import type { SavedAlbum } from "./collection";
-import { getCurrentWindow } from "@tauri-apps/api/window";
-import { readDuration, readFileImports, withResolvedAudioSrc } from "./utils/media";
+import { readDuration, readFileImports, stripQueueMetadata, withResolvedAudioSrc } from "./utils/media";
+import {
+  displayAlbumName,
+  enrichUploadMetadataFromYtm,
+  isPlaceholderAlbumName,
+} from "./utils/upload-enrichment";
 import { getSearchItemArtist } from "./utils/search";
 import { cn } from "./utils/cn";
-import { getSetting } from "./settings";
 import { getItem, setItem } from "./storage";
+import { getSettings, useSetting } from "./settings";
 import PlayerBar from "./components/PlayerBar";
+import { HomePage } from "./components/HomePage";
 import { SearchPage } from "./components/SearchPage";
 import { Sidebar, TopBar, isSearchWorkspace, type View } from "./components/Sidebar";
+import { useTasteProfileTracking } from "./hooks/useTasteProfileTracking";
 import { DEFAULT_SEARCH_FILTERS, type SearchFilters } from "./components/SearchFilters";
 
 declare global {
@@ -74,6 +88,8 @@ function viewsEqual(left: View, right: View): boolean {
     case "collection":
       if (right.name !== "collection") return false;
       return left.tab === right.tab;
+    case "home":
+      return right.name === "home";
     case "search":
       return right.name === "search" && left.query === right.query;
     case "lyrics":
@@ -112,6 +128,8 @@ function viewsEqual(left: View, right: View): boolean {
 
 function getViewAnimationKey(view: View): string {
   switch (view.name) {
+    case "home":
+      return "home";
     case "collection":
       return "collection";
     case "search":
@@ -189,130 +207,31 @@ function trackFromSearchItem(item: SearchItem): MediaTrack | null {
   };
 }
 
-function shouldIgnoreGlobalKeyShortcut(target: EventTarget | null, defaultPrevented: boolean): boolean {
-  if (defaultPrevented) return true;
-  if (!(target instanceof Element)) return false;
-
-  return Boolean(
-    target.closest(
-      'input, textarea, select, [contenteditable="true"]',
-    ),
-  );
+function getInitialView(): View {
+  return getSettings().showHomeMenu ? { name: "home" } : { name: "collection" };
 }
 
 function Shell() {
   const player = usePlayer();
+  const showHomeMenu = useSetting("showHomeMenu");
   const [sidebarOpen, setSidebarOpen] = useState(true);
-  const startupSettledRef = useRef(false);
 
-  useEffect(() => {
-    if (startupSettledRef.current) return;
+  useStartupSplash();
+  useStartupMinimized();
+  useDiscordRichPresence();
+  useViewportHeightTracker();
 
-    let framesDone = false;
-    let idleDone = false;
-    let firstFrame: number | null = null;
-    let secondFrame: number | null = null;
-    let idleHandle: number | null = null;
-    let fallbackTimer: number | null = null;
-
-    const finalizeStartup = () => {
-      if (startupSettledRef.current) return;
-      if (!framesDone || !idleDone) return;
-      startupSettledRef.current = true;
-
-      if (typeof window.__velocityHideSplash === "function") {
-        window.__velocityHideSplash();
-      } else {
-        const loader = document.getElementById("initial-loader");
-        loader?.classList.add("fade-out");
-        window.setTimeout(() => loader?.remove(), 500);
-      }
-
-      // Defer the startup chime until the browser is idle so the AudioContext
-      // construction and media element setup don't compete with the first
-      // real paint of the app shell. The chime is a nice-to-have; the splash
-      // teardown above is the user-visible "boot is done" signal.
-      const playStartupChime = () => {
-        const audio = new Audio("/startupdone.mp3");
-        const ctx = new AudioContext();
-        const source = ctx.createMediaElementSource(audio);
-        const gain = ctx.createGain();
-        gain.gain.value = 1.75;
-        source.connect(gain);
-        gain.connect(ctx.destination);
-        void audio.play().catch(() => undefined);
-        audio.addEventListener("ended", () => {
-          void ctx.close().catch(() => undefined);
-        }, { once: true });
-      };
-      if (typeof window.requestIdleCallback === "function") {
-        window.requestIdleCallback(() => playStartupChime(), { timeout: 2000 });
-      } else {
-        window.setTimeout(playStartupChime, 400);
-      }
-    };
-
-    // Wait for both a double rAF (shell painted) AND requestIdleCallback
-    // (event loop caught up — layout, lazy chunks, pending effects done)
-    // before dismissing the splash. A 3-second fallback ensures it always
-    // goes away.
-    firstFrame = window.requestAnimationFrame(() => {
-      secondFrame = window.requestAnimationFrame(() => {
-        framesDone = true;
-        finalizeStartup();
-      });
-    });
-
-    const scheduleIdle =
-      typeof window.requestIdleCallback === "function"
-        ? window.requestIdleCallback
-        : ((handler: IdleRequestCallback) =>
-            window.setTimeout(
-              () => handler({ didTimeout: false, timeRemaining: () => 0 } as IdleDeadline),
-              350,
-            ));
-
-    idleHandle = scheduleIdle(() => {
-      idleDone = true;
-      finalizeStartup();
-    });
-
-    fallbackTimer = window.setTimeout(() => {
-      if (!startupSettledRef.current) {
-        framesDone = true;
-        idleDone = true;
-        finalizeStartup();
-      }
-    }, 3000);
-
-    return () => {
-      if (firstFrame !== null) window.cancelAnimationFrame(firstFrame);
-      if (secondFrame !== null) window.cancelAnimationFrame(secondFrame);
-      if (typeof window.cancelIdleCallback === "function" && idleHandle !== null) {
-        window.cancelIdleCallback(idleHandle);
-      } else if (idleHandle !== null) {
-        window.clearTimeout(idleHandle);
-      }
-      if (fallbackTimer !== null) window.clearTimeout(fallbackTimer);
-    };
+  const handleToggleSidebar = useCallback(() => {
+    setSidebarOpen((current) => !current);
   }, []);
 
-  // Start minimized: after the splash screen settles, minimize the window
-  // if the user has the preference enabled.
-  useEffect(() => {
-    if (!getSetting("startMinimized")) return;
-    const frame = requestAnimationFrame(() => {
-      requestAnimationFrame(() => {
-        getCurrentWindow().minimize().catch((e) => console.warn("Failed to minimize on startup:", e));
-      });
-    });
-    return () => cancelAnimationFrame(frame);
-  }, []);
+  useGlobalShortcuts({ onToggleSidebar: handleToggleSidebar });
+  useTasteProfileTracking();
 
-  const [historyState, setHistoryState] = useState<HistoryState>({
-    entries: [{ view: { name: "search", query: "" }, scrollTop: 0 }],
+  const [historyState, setHistoryState] = useState<HistoryState>(() => ({
+    entries: [{ view: getInitialView(), scrollTop: 0 }],
     index: 0,
-  });
+  }));
   const [transientView, setTransientView] = useState<View | null>(null);
   // Mirror of `transientView` so the synchronous setHistoryState callback can
   // read the latest pending transient without relying on the (stale)
@@ -322,7 +241,6 @@ function Shell() {
   const transientViewRef = useRef<View | null>(null);
   const scrollContainerRef = useRef<HTMLDivElement | null>(null);
   const transientScrollTopRef = useRef(0);
-  const scrollRestoreFrameRef = useRef<number | null>(null);
   const committedView = historyState.entries[historyState.index].view;
   const view = transientView ?? committedView;
   const pageAnimationKey = getViewAnimationKey(view);
@@ -340,6 +258,24 @@ function Shell() {
     view.name === "artist" ||
     view.name === "lyrics";
 
+  const hideSearchOnLyrics = useSetting("hideSearchOnLyrics");
+  const hidePlayerOnLyrics = useSetting("hidePlayerOnLyrics");
+  const onLyricsPage = view.name === "lyrics";
+  const lyricsPlayerHidden = onLyricsPage && hidePlayerOnLyrics;
+
+  // Derived each render from refs + state. The hook reads it at render
+  // time, then re-runs its layout effect when transientView or
+  // historyState.index changes — covering both the \"transient
+  // commit\" path and the \"history back/forward\" path.
+  const savedScrollTop = transientView
+    ? transientScrollTopRef.current
+    : historyState.entries[historyState.index]?.scrollTop ?? 0;
+  useScrollRestoration({
+    containerRef: scrollContainerRef,
+    savedScrollTop,
+    enabled: true,
+  });
+
   const transitionView = useCallback((updater: () => void) => {
     const currentScrollTop = scrollContainerRef.current?.scrollTop ?? 0;
     if (transientView) {
@@ -356,68 +292,6 @@ function Shell() {
     updater();
   }, [transientView]);
 
-  useLayoutEffect(() => {
-    const container = scrollContainerRef.current;
-    const saved = transientView ? transientScrollTopRef.current : historyState.entries[historyState.index]?.scrollTop ?? 0;
-    if (!(container instanceof HTMLDivElement)) return;
-
-    if (scrollRestoreFrameRef.current) {
-      window.cancelAnimationFrame(scrollRestoreFrameRef.current);
-      scrollRestoreFrameRef.current = null;
-    }
-
-    let cancelled = false;
-    let timeoutId: number | null = null;
-    const resizeObserver = new ResizeObserver(() => restoreScrollPosition());
-
-    const stopRestoring = () => {
-      if (cancelled) return;
-      cancelled = true;
-      resizeObserver.disconnect();
-      if (timeoutId !== null) window.clearTimeout(timeoutId);
-      if (scrollRestoreFrameRef.current) {
-        window.cancelAnimationFrame(scrollRestoreFrameRef.current);
-        scrollRestoreFrameRef.current = null;
-      }
-    };
-
-    const restoreScrollPosition = () => {
-      if (cancelled) return;
-      container.scrollTop = saved;
-
-      const maxScrollTop = Math.max(0, container.scrollHeight - container.clientHeight);
-      const contentIsTallEnough = saved === 0 || maxScrollTop >= saved - 1;
-      const closeEnough = Math.abs(container.scrollTop - saved) <= 1;
-
-      if (contentIsTallEnough && closeEnough) stopRestoring();
-    };
-
-    // Only watch the scrollport; child mutations that change its scrollHeight
-    // already bubble up to the container's ResizeObserver. Observing the
-    // first child as well doubled the callback volume on pages with many
-    // loading placeholders, costing layout cycles for no benefit.
-    resizeObserver.observe(container);
-
-    container.addEventListener("wheel", stopRestoring, { passive: true, capture: true });
-    container.addEventListener("touchstart", stopRestoring, { passive: true, capture: true });
-    container.addEventListener("pointerdown", stopRestoring, { passive: true, capture: true });
-
-    // Put history entries at their saved position before the browser paints.
-    // The observer keeps correcting it while async content fills in; the
-    // hard timeout ensures the observer is always disconnected so it can't
-    // leak or keep forcing layouts after the page has settled.
-    restoreScrollPosition();
-    if (!cancelled) {
-      timeoutId = window.setTimeout(stopRestoring, 2500);
-    }
-
-    return () => {
-      container.removeEventListener("wheel", stopRestoring, true);
-      container.removeEventListener("touchstart", stopRestoring, true);
-      container.removeEventListener("pointerdown", stopRestoring, true);
-      stopRestoring();
-    };
-  }, [historyState.index, pageAnimationKey, transientView]);
   const [searchInput, setSearchInput] = useState("");
   const [recentSearches, setRecentSearches] = useState<string[]>(() =>
     readStoredArray<string>(RECENT_SEARCHES_KEY, []),
@@ -437,10 +311,15 @@ function Shell() {
 
   useEffect(() => {
     const mq = window.matchMedia("(max-width: 900px)");
-    const sync = () => setSidebarOpen(!mq.matches);
-    sync();
-    mq.addEventListener?.("change", sync);
-    return () => mq.removeEventListener?.("change", sync);
+    const collapseIfNarrow = () => {
+      if (mq.matches) setSidebarOpen(false);
+    };
+    // Only auto-collapse on narrow viewports. Never auto-expand when the
+    // viewport widens — Win+Shift+Arrow monitor moves in fullscreen can
+    // briefly flicker this query and would reopen a sidebar the user closed.
+    collapseIfNarrow();
+    mq.addEventListener?.("change", collapseIfNarrow);
+    return () => mq.removeEventListener?.("change", collapseIfNarrow);
   }, []);
 
   useEffect(() => {
@@ -496,87 +375,62 @@ function Shell() {
     return () => clearTimer(searchTimeoutRef);
   }, [searchSessionView, view]);
 
-  useEffect(() => {
-    const handler = (event: KeyboardEvent) => {
-      if (shouldIgnoreGlobalKeyShortcut(event.target, event.defaultPrevented)) return;
-      if (event.key === " " || event.code === "Space") {
-        event.preventDefault();
-        if (player.currentTrack) player.togglePlay();
-      }
-      if ((event.ctrlKey || event.metaKey) && (event.key === "b" || event.key === "B")) {
-        event.preventDefault();
-        setSidebarOpen((current) => !current);
-      }
-      if (event.key === "ArrowLeft") {
-        event.preventDefault();
-        if (player.currentTrack) player.seek(player.progress - 5);
-      }
-      if (event.key === "ArrowRight") {
-        event.preventDefault();
-        if (player.currentTrack) player.seek(player.progress + 5);
-      }
-      if (event.key === "ArrowUp") {
-        event.preventDefault();
-        player.setVolume(player.volume + 0.05);
-      }
-      if (event.key === "ArrowDown") {
-        event.preventDefault();
-        player.setVolume(player.volume - 0.05);
-      }
-      if (event.key === "s" || event.key === "S") {
-        event.preventDefault();
-        player.toggleShuffle();
-      }
-      if (event.key === "l" || event.key === "L") {
-        event.preventDefault();
-        player.cycleRepeat();
-      }
-      if (event.key === "m" || event.key === "M") {
-        event.preventDefault();
-        player.toggleMute();
-      }
-      if (event.key === "F11") {
-        event.preventDefault();
-        const win = getCurrentWindow();
-        win.isFullscreen().then((fs) => win.setFullscreen(!fs));
-      }
-    };
-    window.addEventListener("keydown", handler);
-    return () => window.removeEventListener("keydown", handler);
-  }, [player]);
+  const hydrateImportedDurations = useCallback(async (tracks: MediaTrack[]) => {
+    // Batch the duration probes so we don't spin up an `<audio>` element
+    // for every imported track at once. Each `readDuration` call creates a
+    // new media element and waits for metadata; with a large library this
+    // floods the audio subsystem and slows the first paint. Processing in
+    // fixed-size chunks keeps the boot responsive while still hydrating
+    // every track.
+    const BATCH_SIZE = 4;
+    for (let i = 0; i < tracks.length; i += BATCH_SIZE) {
+      const batch = tracks.slice(i, i + BATCH_SIZE);
+      await Promise.all(
+        batch.map(async (track) => {
+          const updates: { durationSeconds?: number; album?: string; artist?: string } = {};
 
-  // Pin the outer layout height to the actual window size. Tauri 2 on
-  // Windows has been observed to leave `100dvh` stuck at the pre-toggle
-  // value when the user enters or leaves OS fullscreen, so the bottom of
-  // the app ends up clipped against the new (larger) viewport. We track
-  // the real height in a CSS custom property, refreshed on both the DOM
-  // resize event and Tauri's `onResized` (which fires reliably for OS
-  // fullscreen transitions).
-  useEffect(() => {
-    const updateAppHeight = () => {
-      document.documentElement.style.setProperty(
-        "--app-height",
-        `${window.innerHeight}px`,
+          if (track.audioSrc && !track.durationSeconds) {
+            const durationSeconds = await readDuration(track.audioSrc);
+            if (durationSeconds) updates.durationSeconds = durationSeconds;
+          }
+
+          if (
+            track.title &&
+            track.artist &&
+            isPlaceholderAlbumName(displayAlbumName(track.album))
+          ) {
+            try {
+              const enrichment = await enrichUploadMetadataFromYtm({
+                title: track.title,
+                artist: track.artist,
+                album: track.album,
+              });
+              if (enrichment?.album) updates.album = enrichment.album;
+              if (enrichment?.artist && isPlaceholderAlbumName(track.artist)) {
+                updates.artist = enrichment.artist;
+              }
+            } catch {
+              // best-effort
+            }
+          }
+
+          if (Object.keys(updates).length === 0) return;
+
+          setUploadedTracks((current) =>
+            current.map((entry) =>
+              entry.id === track.id ? { ...entry, ...updates } : entry,
+            ),
+          );
+          void updateImportedTrackMetadata(track.id, updates).catch(() => undefined);
+        }),
       );
-    };
-    updateAppHeight();
-
-    const handleWindowResize = () => updateAppHeight();
-    window.addEventListener("resize", handleWindowResize);
-
-    let unlistenTauriResize: (() => void) | undefined;
-    getCurrentWindow()
-      .onResized(() => updateAppHeight())
-      .then((unlisten) => {
-        unlistenTauriResize = unlisten;
-      })
-      .catch(() => {});
-
-    return () => {
-      window.removeEventListener("resize", handleWindowResize);
-      unlistenTauriResize?.();
-    };
+    }
   }, []);
+
+  useImportedTracksHydration({
+    onLoaded: setUploadedTracks,
+    onHydrate: hydrateImportedDurations,
+  });
 
   const navigate = useCallback((nextView: View) => {
     transitionView(() => {
@@ -607,6 +461,12 @@ function Shell() {
     });
   }, [transitionView, transientView, view]);
 
+  useEffect(() => {
+    if (!showHomeMenu && view.name === "home") {
+      navigate({ name: "collection" });
+    }
+  }, [showHomeMenu, view.name, navigate]);
+
   const playTrack = useCallback(
     (track: MediaTrack) => {
       void player.play(track);
@@ -620,64 +480,6 @@ function Shell() {
     },
     [player],
   );
-
-  const hydrateImportedDurations = useCallback(async (tracks: MediaTrack[]) => {
-    // Batch the duration probes so we don't spin up an `<audio>` element
-    // for every imported track at once. Each `readDuration` call creates a
-    // new media element and waits for metadata; with a large library this
-    // floods the audio subsystem and slows the first paint. Processing in
-    // fixed-size chunks keeps the boot responsive while still hydrating
-    // every track.
-    const BATCH_SIZE = 4;
-    for (let i = 0; i < tracks.length; i += BATCH_SIZE) {
-      const batch = tracks.slice(i, i + BATCH_SIZE);
-      await Promise.all(
-        batch.map(async (track) => {
-          if (!track.audioSrc || track.durationSeconds) return;
-          const durationSeconds = await readDuration(track.audioSrc);
-          if (!durationSeconds) return;
-          setUploadedTracks((current) =>
-            current.map((entry) => (entry.id === track.id ? { ...entry, durationSeconds } : entry)),
-          );
-          void updateImportedTrackMetadata(track.id, { durationSeconds }).catch(() => undefined);
-        }),
-      );
-    }
-  }, []);
-
-  useEffect(() => {
-    // Defer the imports load until the browser is idle so it doesn't
-    // compete with the first paint and splash teardown. `requestIdleCallback`
-    // gives the layout/paint pipeline priority; we fall back to a short
-    // timeout where it's unavailable.
-    const schedule =
-      typeof window.requestIdleCallback === "function"
-        ? window.requestIdleCallback
-        : ((handler: IdleRequestCallback) => window.setTimeout(() => handler({ didTimeout: false, timeRemaining: () => 0 } as IdleDeadline), 350));
-
-    const handle = schedule(() => {
-      const loadImports = async () => {
-        try {
-          const tracks = await listImportedTracks();
-          const hydrated = tracks.map(withResolvedAudioSrc);
-          setUploadedTracks(hydrated);
-          void hydrateImportedDurations(hydrated);
-        } catch {
-          setUploadedTracks([]);
-        }
-      };
-
-      void loadImports();
-    });
-
-    return () => {
-      if (typeof window.cancelIdleCallback === "function" && typeof handle === "number") {
-        window.cancelIdleCallback(handle);
-      } else if (typeof handle === "number") {
-        window.clearTimeout(handle);
-      }
-    };
-  }, [hydrateImportedDurations]);
 
   const rememberSearch = useCallback((query: string) => {
     setRecentSearches((current) => [query, ...current.filter((value) => value !== query)].slice(0, 8));
@@ -784,7 +586,7 @@ function Shell() {
       setUploadedTracks((current) => [...hydrated, ...current]);
       await hydrateImportedDurations(hydrated);
     },
-    [],
+    [hydrateImportedDurations],
   );
 
   const handleRemoveUpload = useCallback((trackId: string) => {
@@ -799,6 +601,24 @@ function Shell() {
     player.removeTrackFromQueue(trackId);
   }, [player]);
 
+  // Optimistic flip of an upload track's lyrics-fetching preference, mirrored
+  // to the Rust store. Follows `handleRemoveUpload`'s silent-fail convention
+  // — a transient backend hiccup on an idempotent toggle shouldn't be
+  // visibly worse than the same on a destructive delete.
+  const handleToggleUploadLyrics = useCallback(
+    (trackId: string, nextValue: boolean) => {
+      setUploadedTracks((current) =>
+        current.map((track) =>
+          track.id === trackId ? { ...track, findLyrics: nextValue } : track,
+        ),
+      );
+      void updateImportedTrackMetadata(trackId, { findLyrics: nextValue }).catch(
+        () => undefined,
+      );
+    },
+    [],
+  );
+
   const handleRefreshImports = useCallback(async () => {
     try {
       const tracks = await listImportedTracks();
@@ -808,7 +628,7 @@ function Shell() {
     } catch {
       // keep current state on failure
     }
-  }, []);
+  }, [hydrateImportedDurations]);
 
   // ── Collection bridge handlers ──────────────────────────────────────
   //
@@ -902,11 +722,7 @@ function Shell() {
       // via the provider's setter (which has its own sanitizer, but
       // staying consistent avoids any drift if the provider's policy
       // changes).
-      const sanitized = tracks.map((track) => {
-        const { _labelOrigin: _lo, ...rest } = track;
-        void _lo;
-        return rest;
-      });
+      const sanitized = tracks.map(stripQueueMetadata);
       // Enrich tracks that are missing album metadata so the "Album"
       // column in the playlist view shows a name. This is best-effort;
       // failures are silently skipped.
@@ -914,40 +730,6 @@ function Shell() {
       for (const track of enriched) {
         playlistsCtx.addTrackToPlaylist(id, track);
       }
-    },
-    [playlistsCtx, enrichAlbum],
-  );
-
-  // Composite "create + seed" handler surfaced as an inline affordance in the
-  // Add-to-Playlist submenu's empty state. Without it, a fresh user (or a
-  // single-playlist owner currently sitting on that one playlist) sees the
-  // resolver return zero rows and a misleading "we're working on it"
-  // message instead of a way to land the song/album into a brand-new
-  // playlist.
-  //
-  // The order is fixed: we call `createPlaylist()` first so it stamps the
-  // maker, then loop `addTrackToPlaylist` with the maker's id. Both calls
-  // pass through PlaylistsProvider's functional setState, so each add sees
-  // the state produced by the most recent setState (including the create),
-  // and the final playlist ends up with every track appended in order.
-  // Tracks are sanitized using the same rule as `handleAddAlbumToPlaylist`
-  // so the first seeded playlist is indistinguishable from one populated
-  // later through the menu's existing add path.
-  const handleCreatePlaylistAndAddTracks = useCallback<
-    NonNullable<AddToPlaylistResolver["createPlaylistAndAddTracks"]>
-  >(
-    async (tracks: MediaTrack[]) => {
-      const playlist = playlistsCtx.createPlaylist();
-      const sanitized = tracks.map((track) => {
-        const { _labelOrigin: _lo, ...rest } = track;
-        void _lo;
-        return rest;
-      });
-      const enriched = await enrichAlbum(sanitized);
-      for (const track of enriched) {
-        playlistsCtx.addTrackToPlaylist(playlist.id, track);
-      }
-      return { browseId: playlist.id, title: playlist.title };
     },
     [playlistsCtx, enrichAlbum],
   );
@@ -981,12 +763,12 @@ function Shell() {
             setHistoryState((prev) => ({ ...prev, index: prev.index - 1 }));
           });
         } else {
-          navigate({ name: "search", query: "" });
+          navigate(showHomeMenu ? { name: "home" } : { name: "collection" });
         }
       }
       playlistsCtx.deletePlaylist(id);
     },
-    [view, navigate, playlistsCtx, canBack, transitionView, transientView, transientViewRef, setTransientView, setHistoryState],
+    [view, navigate, playlistsCtx, canBack, transitionView, transientView, transientViewRef, setTransientView, setHistoryState, showHomeMenu],
   );
 
   // ── Playlist deletion confirmation (sidebar path) ───────────────────
@@ -1031,43 +813,6 @@ function Shell() {
   } | null>(null);
   const songMenuTriggerRef = useRef<HTMLButtonElement | null>(null);
 
-  useEffect(() => {
-    const handler = (event: MouseEvent) => {
-      // Accept both mouse right-click (button === 2) AND keyboard triggers
-      // for the menu (Shift+F10, the Context Menu key). Keyboard contextmenu
-      // events fire with button === 0 because no mouse button initiated
-      // them; we still want to surface the custom menu to keyboard users
-      // so they aren't locked out of Go to Album / Save to collection.
-      if (event.button === 1) return; // middle-click — irrelevant
-      const target = event.target;
-      if (!(target instanceof Element)) return;
-      const trigger = target.closest("[data-song-context-target]");
-      if (!trigger) return;
-      const raw = trigger.getAttribute("data-track");
-      if (!raw) return;
-      try {
-        const parsed = JSON.parse(raw) as MediaTrack;
-        event.preventDefault();
-        // Preserve source if `data-track-source` was set (upload tracks
-        // vs stream tracks). Default to "stream" for backward compat with
-        // rows that only encode the payload.
-        const sourceRaw = trigger.getAttribute("data-track-source");
-        const source: MediaTrack["source"] =
-          sourceRaw === "upload" || sourceRaw === "stream"
-            ? sourceRaw
-            : parsed.source ?? "stream";
-        setSongMenuState({
-          track: { ...parsed, source },
-          position: { x: event.clientX, y: event.clientY },
-        });
-      } catch {
-        // Ignore unparseable rows — the menu only opens on valid payload.
-      }
-    };
-    document.addEventListener("contextmenu", handler, { capture: true });
-    return () => document.removeEventListener("contextmenu", handler, { capture: true });
-  }, []);
-
   const closeSongMenu = useCallback(() => setSongMenuState(null), []);
 
   // ── Global album context menu ──────────────────────────────────────
@@ -1082,40 +827,22 @@ function Shell() {
   } | null>(null);
   const albumMenuTriggerRef = useRef<HTMLButtonElement | null>(null);
 
-  useEffect(() => {
-    const handler = (event: MouseEvent) => {
-      if (event.button === 1) return;
-      const target = event.target;
-      if (!(target instanceof Element)) return;
-      // Don't open album menu on song targets (they have their own menu)
-      if (target.closest("[data-song-context-target]")) return;
-      const trigger = target.closest("[data-album-context-target]");
-      if (!trigger) return;
-      const raw = trigger.getAttribute("data-album");
-      if (!raw) return;
-      try {
-        const parsed = JSON.parse(raw) as SavedAlbum;
-        event.preventDefault();
-        setAlbumMenuState({
-          album: parsed,
-          position: { x: event.clientX, y: event.clientY },
-        });
-      } catch {
-        // Ignore unparseable rows
-      }
-    };
-    document.addEventListener("contextmenu", handler, { capture: true });
-    return () => document.removeEventListener("contextmenu", handler, { capture: true });
-  }, []);
-
   const closeAlbumMenu = useCallback(() => setAlbumMenuState(null), []);
+
+  useGlobalContextMenus({
+    onSongContextMenu: useCallback((track, position) => {
+      setSongMenuState({ track, position });
+    }, []),
+    onAlbumContextMenu: useCallback((album, position) => {
+      setAlbumMenuState({ album, position });
+    }, []),
+  });
 
   // App root has no `bg-black` here on purpose. body's `#000000`
   // background provides the base black backdrop for every page, and each
   // page renders its own (opaque or semi-transparent) bg on the nearest
-  // container. The lyrics page's waveform canvas is portalled to <body>
-  // at zIndex 1, above body's background — an opaque bg on this root
-  // would cover it.
+  // container. The lyrics page's waveform canvas is fixed at z-0 above
+  // body's background — an opaque bg on this root would cover it.
   return (
     <div className="flex h-[var(--app-height)] w-full flex-col overflow-hidden text-neutral-100">
       <div className="relative flex min-h-0 flex-1 overflow-hidden">
@@ -1124,7 +851,6 @@ function Shell() {
           expanded={sidebarOpen}
           onToggle={() => setSidebarOpen((current) => !current)}
           onNavigate={navigate}
-          onReturnToSearch={() => navigate({ name: "search", query: "" })}
           playlists={playlistsCtx.playlists}
           playlistsSortMode={playlistsCtx.sortMode}
           playlistsSortDirection={playlistsCtx.sortDirection}
@@ -1143,7 +869,7 @@ function Shell() {
             canForward={canForward}
             suppressHistoryControls={false}
 
-            suppressSearchBar={false}
+            suppressSearchBar={onLyricsPage && hideSearchOnLyrics}
             onBack={() =>
               canBack &&
               transitionView(() => {
@@ -1177,7 +903,9 @@ function Shell() {
               "nice-scroll main-scrollport min-h-0 flex-1 overflow-y-auto",
               isFullBleedView ? "pt-0" : "pt-[var(--ui-topbar-height)]",
               isFullBleedView ? "px-0" : "px-[var(--ui-page-pad)]",
-              player.currentTrack ? "pb-[clamp(5rem,8vw,7.5rem)]" : "pb-[clamp(1.5rem,2vw,2.5rem)]",
+              player.currentTrack && !lyricsPlayerHidden
+                ? "pb-[clamp(5rem,8vw,7.5rem)]"
+                : "pb-[clamp(1.5rem,2vw,2.5rem)]",
             )}
           >
             <div
@@ -1188,6 +916,13 @@ function Shell() {
               )}
             >
               <Suspense fallback={<LoadingPanel label="Loading page" />}>
+                {view.name === "home" ? (
+                  <HomePage
+                    onPlayTrack={playTrack}
+                    onNavigate={navigate}
+                  />
+                ) : null}
+
                 {view.name === "collection" ? (
                   <CollectionPage
                     uploadedTracks={uploadedTracks}
@@ -1221,7 +956,6 @@ function Shell() {
                     onAddAlbumToQueue={handleAddAlbumToQueue}
                     onAddAlbumToPlaylist={handleAddAlbumToPlaylist}
                     resolvePlaylists={playlistResolver}
-                    createPlaylistAndAddTracks={handleCreatePlaylistAndAddTracks}
                   />
                 )}
 
@@ -1233,7 +967,6 @@ function Shell() {
                     onAddAlbumToQueue={handleAddAlbumToQueue}
                     onAddAlbumToPlaylist={handleAddAlbumToPlaylist}
                     resolvePlaylists={playlistResolver}
-                    createPlaylistAndAddTracks={handleCreatePlaylistAndAddTracks}
                   />
                 )}
 
@@ -1326,11 +1059,15 @@ function Shell() {
           addToPlaylistResolver={{
             resolvePlaylists: playlistResolver,
             addTracksToPlaylist: handleAddAlbumToPlaylist,
-            createPlaylistAndAddTracks: handleCreatePlaylistAndAddTracks,
           }}
           onRemoveTrack={
             songMenuState.track.source === "upload"
               ? handleRemoveUpload
+              : undefined
+          }
+          onToggleUploadLyrics={
+            songMenuState.track.source === "upload"
+              ? handleToggleUploadLyrics
               : undefined
           }
           onRemoveFromPlaylist={
@@ -1357,7 +1094,6 @@ function Shell() {
           onAddAlbumToQueue={handleAddAlbumToQueue}
           onAddAlbumToPlaylist={handleAddAlbumToPlaylist}
           resolvePlaylists={playlistResolver}
-          createPlaylistAndAddTracks={handleCreatePlaylistAndAddTracks}
           onNavigate={navigate}
           currentAlbumBrowseId={view.name === "album" ? view.browseId : undefined}
           currentUserPlaylistId={view.name === "user-playlist" ? view.id : undefined}

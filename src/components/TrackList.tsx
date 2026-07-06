@@ -18,6 +18,11 @@ export const COMPACT_TRACK_GRID =
 export const PLAYLIST_TRACK_GRID =
   "grid-cols-[2.25rem_minmax(0,1fr)_minmax(5rem,18rem)_minmax(6rem,8rem)_3.75rem] sm:grid-cols-[2.25rem_minmax(0,1fr)_minmax(6rem,22rem)_minmax(7rem,9.5rem)_4.5rem]";
 
+// Collection Songs / Local tabs: a modestly wider album column than the
+// default 8rem cap so long names can marquee without stealing title space.
+export const COLLECTION_TRACK_GRID =
+  "grid-cols-[2.25rem_minmax(0,1fr)_minmax(5.5rem,9.5rem)_3.5rem_4rem] sm:grid-cols-[2.25rem_minmax(0,1fr)_minmax(6rem,11rem)_3.5rem_4rem]";
+
 export function TrackListHeader({
   showPlays = false,
   showArtist = false,

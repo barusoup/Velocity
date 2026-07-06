@@ -14,6 +14,11 @@ export default defineConfig({
   server: {
     strictPort: true,
     port: 1420,
+    // Cargo's incremental builds lock velocity.exe on Windows and trip
+    // chokidar's EBUSY. cargo watches src-tauri on its own.
+    watch: {
+      ignored: ["**/src-tauri/**"],
+    },
   },
   envPrefix: ["VITE_", "TAURI_ENV_"],
 });
