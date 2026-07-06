@@ -24,8 +24,23 @@ import {
 } from "../api";
 import { AnimatedShuffle } from "./PlayerButtonIcons";
 import { convertFileSrc } from "@tauri-apps/api/core";
-import { useCollection, type SavedAlbum } from "../collection";
-import { usePlayer } from "../player";
+import { type SavedAlbum } from "../collection";
+import {
+  useIsAlbumSaved,
+  useIsArtistSaved,
+  useIsTrackSaved,
+  useToggleAlbumSave,
+  useToggleArtistSave,
+  useToggleTrackSave,
+} from "../hooks/useCollectionSelectors";
+import { usePlayer, usePlayerActions } from "../player";
+import { useContextTrackTarget } from "../hooks/useContextTrackTarget";
+import {
+  useAlbumQueuePlaybackState,
+  useReleasePlaybackState,
+  useTrackPlaybackState,
+} from "../hooks/usePlayerSelectors";
+import { VirtualList } from "./VirtualList";
 import type { ArtistDetail, EntityDetail, MediaTrack, SearchItem } from "../types";
 import { extractInterestingArtworkColor, mixRgb, peekArtworkAccent, rgbToCss } from "../utils/artwork-color";
 import {
@@ -508,8 +523,18 @@ function ArtistOverview({
   onNavigate: (view: View) => void;
 }) {
   const player = usePlayer();
-  const collection = useCollection();
-  const isArtistSaved = collection.isArtistSaved(browseId);
+  const isArtistSaved = useIsArtistSaved(browseId);
+  const savedArtist = useMemo(
+    () => ({
+      browseId,
+      title: detail.title,
+      cover: displayCover ?? null,
+      banner: displayBanner ?? null,
+      monthlyListeners: monthlyListeners ?? null,
+    }),
+    [browseId, detail.title, displayCover, displayBanner, monthlyListeners],
+  );
+  const toggleArtistSave = useToggleArtistSave(savedArtist);
   const [topTrackHovered, setTopTrackHovered] = useState(false);
   const firstTopTrackActive = topSongs[0] ? isSameSongTrack(player.currentTrack, topSongs[0]) : false;
   const handlePlayRelease = useCallback((item: ReleaseItem) => {
@@ -696,15 +721,7 @@ function ArtistOverview({
 
           <SaveButton
             isSaved={isArtistSaved}
-            onToggle={() =>
-              collection.toggleArtist({
-                browseId,
-                title: detail.title,
-                cover: displayCover ?? null,
-                banner: displayBanner ?? null,
-                monthlyListeners: monthlyListeners ?? null,
-              })
-            }
+            onToggle={toggleArtistSave}
             ariaLabel={isArtistSaved ? "Remove from collection" : "Save artist to collection"}
           />
         </div>
@@ -854,7 +871,7 @@ function PopularTrackRow({
   onNavigateToAlbum,
   onNavigate,
   onHoverChange,
-  queueOrigin,
+  queueOrigin: _queueOrigin,
 }: {
   track: MediaTrack;
   index: number;
@@ -865,12 +882,11 @@ function PopularTrackRow({
   onHoverChange?: (hovered: boolean) => void;
   queueOrigin?: import("../player").QueueOrigin | null;
 }) {
-  const player = usePlayer();
-  const collection = useCollection();
-  const active = isSameSongTrack(player.currentTrack, track);
-  const playingActive = active && player.isPlaying;
-  const bufferingActive = active && player.isBuffering;
-  const isSaved = collection.isTrackSaved(track);
+  const { togglePlay } = usePlayerActions();
+  const { active, playingActive, bufferingActive } = useTrackPlaybackState(track);
+  const contextTarget = useContextTrackTarget(track);
+  const isSaved = useIsTrackSaved(track);
+  const toggleSave = useToggleTrackSave(track);
   const directArtistBrowseId = onNavigate ? getDirectArtistBrowseId(track) : null;
   const handleResolveNavigate = useCallback(() => {
     if (!onNavigate) return;
@@ -893,11 +909,10 @@ function PopularTrackRow({
 
   return (
     <div
-      data-song-context-target="true"
-      data-track={JSON.stringify(stripTrack(track))}
+      {...contextTarget}
       className={`popular-track-row group grid ${POPULAR_TRACK_GRID} cursor-pointer items-center gap-3 rounded-xl px-3 py-3 transition-colors hover:bg-neutral-900 ${active ? "bg-white/[0.04]" : ""} ${isExtra ? "is-extra" : ""}`}
       style={isExtra ? ({ "--domino-index": index - 5 } as CSSProperties) : undefined}
-      onClick={active ? player.togglePlay : onPlay}
+      onClick={active ? togglePlay : onPlay}
       onMouseEnter={() => onHoverChange?.(true)}
       onMouseLeave={() => onHoverChange?.(false)}
     >
@@ -909,7 +924,7 @@ function PopularTrackRow({
           type="button"
           onClick={(event) => {
             event.stopPropagation();
-            (active ? player.togglePlay : onPlay)();
+            (active ? togglePlay : onPlay)();
           }}
           className={`absolute inset-0 flex items-center justify-center text-white animate-none ${
             active ? "opacity-100" : "opacity-0 group-hover:opacity-100"
@@ -976,7 +991,7 @@ function PopularTrackRow({
             <SaveButton
               isSaved={isSaved}
               size="sm"
-              onToggle={() => collection.toggleSong(track)}
+              onToggle={toggleSave}
               ariaLabel={isSaved ? "Remove from collection" : "Save to collection"}
             />
           </div>
@@ -994,17 +1009,6 @@ function PopularTrackRow({
       </div>
     </div>
   );
-}
-
-// Strip large fields from a track before serializing into the right-click
-// context menu's data-track attribute. The menu only needs id/browse ids +
-// small text fields and never needs the cover blob path.
-function stripTrack(track: MediaTrack) {
-  const { cover: _cover, filePath: _filePath, audioSrc: _audioSrc, ...rest } = track;
-  void _cover;
-  void _filePath;
-  void _audioSrc;
-  return rest;
 }
 
 function TrackListHeaderIcon() {
@@ -1046,15 +1050,12 @@ export function ReleaseCard({
   artistBrowseId?: string | null;
   playButtonSize?: "md" | "lg";
 }) {
-  const player = usePlayer();
-  // A release card is "current" when the player's queueOrigin is an
-  // album matching this release's browseId. We no longer require the
-  // queueOrigin to be "artist" — playing an album from the artist page
-  // sets the queueOrigin to { kind: "album", browseId }, not "artist".
-  const isCurrentAlbum =
-    player.queueOrigin?.kind === "album" && player.queueOrigin.browseId === item.browseId;
-  const playing = isCurrentAlbum && player.isPlaying;
-  const buffering = isCurrentAlbum && player.isBuffering;
+  const { togglePlay } = usePlayerActions();
+  const {
+    active: isCurrentAlbum,
+    playingActive: playing,
+    bufferingActive: buffering,
+  } = useAlbumQueuePlaybackState(item.browseId);
   const playButtonClass = playButtonSize === "lg" ? "h-14 w-14" : "h-12 w-12";
   const playIconSize = playButtonSize === "lg" ? 24 : 20;
 
@@ -1091,7 +1092,7 @@ export function ReleaseCard({
           onClick={(event) => {
             event.stopPropagation();
             if (isCurrentAlbum) {
-              player.togglePlay();
+              togglePlay();
             } else if (onPlay) {
               onPlay();
             }
@@ -2011,10 +2012,10 @@ function DiscographyRelease({
   state,
   onOpen,
   onPlayTrack,
-  currentTrack,
-  playing,
-  buffering,
-  togglePlay,
+  currentTrack: _currentTrack,
+  playing: _playing,
+  buffering: _buffering,
+  togglePlay: _togglePlay,
   playMany,
   onAddAlbumToQueue,
   onAddAlbumToPlaylist,
@@ -2039,8 +2040,16 @@ function DiscographyRelease({
   onNavigate?: (view: View) => void;
   artistBrowseId?: string | null;
 }) {
-  const player = usePlayer();
-  const collection = useCollection();
+  void _currentTrack;
+  void _playing;
+  void _buffering;
+  void _togglePlay;
+  const { togglePlay, playMany: playManyTracks } = usePlayerActions();
+  const {
+    active: isReleaseActive,
+    playingActive: isReleasePlaying,
+    bufferingActive: isReleaseBuffering,
+  } = useReleasePlaybackState(release.browseId, artistBrowseId);
   const detail = state?.status === "ready" ? state.data : null;
   const tracks = useMemo(() => {
     const mapped =
@@ -2058,14 +2067,18 @@ function DiscographyRelease({
   }, [tracks]);
 
   useTrackMetadataBackfill(displayTracks, setDisplayTracks);
-  const isReleaseActive =
-    player.currentTrack?.albumBrowseId === release.browseId &&
-    (!artistBrowseId || (player.queueOrigin?.kind === "artist" && player.queueOrigin.browseId === artistBrowseId));
-  const isReleasePlaying = isReleaseActive && player.isPlaying;
-  const isReleaseBuffering = isReleaseActive && player.isBuffering;
   const meta = detail ? formatFullReleaseMeta(release, detail.tracks.length) : formatReleaseMeta(release);
   const [firstTrackHovered, setFirstTrackHovered] = useState(false);
-  const firstTrackActive = displayTracks[0] ? isSameSongTrack(currentTrack, displayTracks[0]) : false;
+  const firstTrack = displayTracks[0];
+  const { active: firstTrackActive } = useTrackPlaybackState(
+    firstTrack ?? {
+      id: "__discography-none__",
+      title: "",
+      artist: "",
+      source: "stream",
+    },
+  );
+  const firstTrackActiveResolved = Boolean(firstTrack) && firstTrackActive;
   const [ellipsisOpen, setEllipsisOpen] = useState(false);
   const [ellipsisPosition, setEllipsisPosition] = useState<{ x: number; y: number } | undefined>(undefined);
   const ellipsisButtonRef = useRef<HTMLButtonElement | null>(null);
@@ -2078,6 +2091,8 @@ function DiscographyRelease({
     year: release.yearLabel ?? null,
     artistBrowseId: release.artistBrowseId ?? null,
   }), [release]);
+  const isReleaseSaved = useIsAlbumSaved(release.browseId);
+  const toggleAlbumSave = useToggleAlbumSave(savedAlbum);
   return (
     <section
       ref={sectionRef}
@@ -2116,9 +2131,9 @@ function DiscographyRelease({
               type="button"
               onClick={() => {
                 if (isReleaseActive) {
-                  player.togglePlay();
+                  togglePlay();
                 } else if (displayTracks.length > 0) {
-                  void player.playMany(displayTracks, 0, release.browseId ? { kind: "album", browseId: release.browseId } : undefined);
+                  void playManyTracks(displayTracks, 0, release.browseId ? { kind: "album", browseId: release.browseId } : undefined);
                 } else {
                   onOpen();
                 }
@@ -2136,18 +2151,8 @@ function DiscographyRelease({
             </button>
             {release.browseId ? (
               <SaveButton
-                isSaved={collection.isAlbumSaved(release.browseId)}
-                onToggle={() =>
-                  collection.toggleAlbum({
-                    browseId: release.browseId!,
-                    title: release.title,
-                    subtitle: release.subtitle ?? "",
-                    cover: release.cover ?? null,
-                    byline: release.artist ?? null,
-                    year: release.yearLabel ?? null,
-                    artistBrowseId: release.artistBrowseId ?? null,
-                  })
-                }
+                isSaved={isReleaseSaved}
+                onToggle={toggleAlbumSave}
                 size="md"
                 ariaLabel="Add release to collection"
               />
@@ -2190,10 +2195,10 @@ function DiscographyRelease({
         resolvePlaylists={resolvePlaylists}
 
         onNavigate={onNavigate}
-        currentAlbumBrowseId={player.currentTrack?.albumBrowseId ?? undefined}
+        currentAlbumBrowseId={release.browseId ?? undefined}
       />
 
-      <TrackListHeader showPlays gridClassName={RELEASE_TRACK_GRID} dividerHidden={firstTrackHovered || firstTrackActive} />
+      <TrackListHeader showPlays gridClassName={RELEASE_TRACK_GRID} dividerHidden={firstTrackHovered || firstTrackActiveResolved} />
 
       {state?.status === "loading" || !state ? (
         <div className="flex h-24 items-center px-4 text-sm font-semibold text-white/42">
@@ -2203,20 +2208,19 @@ function DiscographyRelease({
       ) : state.status === "error" ? (
         <div className="px-4 py-5 text-sm font-semibold text-white/42">{state.message}</div>
       ) : (
-        <div>
-          {displayTracks.map((track, index) => (
+        <VirtualList
+          items={displayTracks}
+          estimateSize={56}
+          getItemKey={(track) => track.id}
+          renderItem={(track, index) => (
             <DiscographyTrackRow
-              key={track.id}
               track={track}
               index={index}
               dominoIndex={Math.min(index, 14)}
-              active={isSameSongTrack(currentTrack, track)}
-              playing={playing && isSameSongTrack(currentTrack, track)}
-              buffering={buffering && isSameSongTrack(currentTrack, track)}
               onPlay={() => {
                 if (displayTracks.length > 0) {
                   if (release.browseId) {
-                    void player.playMany(displayTracks, index, { kind: "album", browseId: release.browseId });
+                    void playManyTracks(displayTracks, index, { kind: "album", browseId: release.browseId });
                   } else {
                     playMany(displayTracks, index);
                   }
@@ -2224,11 +2228,10 @@ function DiscographyRelease({
                   onPlayTrack(track);
                 }
               }}
-              togglePlay={togglePlay}
               onHoverChange={index === 0 ? setFirstTrackHovered : undefined}
             />
-          ))}
-        </div>
+          )}
+        />
       )}
     </section>
   );
@@ -2238,29 +2241,23 @@ function DiscographyTrackRow({
   track,
   index,
   dominoIndex,
-  active,
-  playing,
-  buffering,
   onPlay,
-  togglePlay,
   onHoverChange,
 }: {
   track: MediaTrack;
   index: number;
   dominoIndex: number;
-  active: boolean;
-  playing: boolean;
-  buffering: boolean;
   onPlay: () => void;
-  togglePlay: () => void;
   onHoverChange?: (hovered: boolean) => void;
 }) {
-  const collection = useCollection();
-  const isSaved = collection.isTrackSaved(track);
+  const { togglePlay } = usePlayerActions();
+  const { active, playingActive: playing, bufferingActive: buffering } = useTrackPlaybackState(track);
+  const contextTarget = useContextTrackTarget(track);
+  const isSaved = useIsTrackSaved(track);
+  const toggleSave = useToggleTrackSave(track);
   return (
     <div
-      data-song-context-target="true"
-      data-track={JSON.stringify(stripTrack(track))}
+      {...contextTarget}
       style={{ "--domino-index": dominoIndex } as CSSProperties}
       className={`artist-discography-track group grid cursor-pointer ${RELEASE_TRACK_GRID} gap-3 rounded-lg px-4 py-2 transition-colors ${
         active ? "bg-white/[0.04]" : "hover:bg-neutral-900"
@@ -2307,7 +2304,7 @@ function DiscographyTrackRow({
             <SaveButton
               isSaved={isSaved}
               size="sm"
-              onToggle={() => collection.toggleSong(track)}
+              onToggle={toggleSave}
               ariaLabel={isSaved ? "Remove from collection" : "Save to collection"}
             />
           </div>

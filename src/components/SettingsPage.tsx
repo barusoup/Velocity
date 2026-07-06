@@ -8,7 +8,7 @@ import {
   type ReactNode,
 } from "react";
 import { HardDrive, Monitor, Settings as SettingsIcon, Volume2 } from "lucide-react";
-import { scheduleOfflineSyncForTrack, useCollection } from "../collection";
+import { scheduleOfflineSyncForTrack, useCollectionActions, useCollectionData } from "../collection";
 import { usePlayer } from "../player";
 import {
   type Settings,
@@ -158,7 +158,8 @@ function DangerButton({
 }
 
 export function SettingsPage() {
-  const collection = useCollection();
+  const { savedSongs } = useCollectionData();
+  const { updateSongMetadata } = useCollectionActions();
   const player = usePlayer();
   const [tab, setTab] = useState<SettingsTab>(_lastSettingsTab ?? "general");
   const [settings, setSettingsState] = useState<Settings>(getSettings);
@@ -203,10 +204,10 @@ export function SettingsPage() {
   // function identity on each `savedSongs` mutation, which then re-renders
   // every ToggleRow in this page even though nothing about the toggles
   // actually changed.
-  const savedSongsRef = useRef(collection.savedSongs);
-  savedSongsRef.current = collection.savedSongs;
-  const updateSongMetadataRef = useRef(collection.updateSongMetadata);
-  updateSongMetadataRef.current = collection.updateSongMetadata;
+  const savedSongsRef = useRef(savedSongs);
+  savedSongsRef.current = savedSongs;
+  const updateSongMetadataRef = useRef(updateSongMetadata);
+  updateSongMetadataRef.current = updateSongMetadata;
 
   useEffect(() => {
     const unsub = subscribe((key, _value) => {
@@ -392,7 +393,7 @@ export function SettingsPage() {
           ))}
         </div>
         <p className="shrink-0 text-xs font-medium tracking-[0.04em] text-neutral-500">
-          Velocity v0.1.0 Experimental
+          Velocity v0.1.1 Experimental
         </p>
       </div>
 

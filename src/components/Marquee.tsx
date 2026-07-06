@@ -200,7 +200,25 @@ export function Marquee({
     }
   };
 
+  const [isVisible, setIsVisible] = useState(false);
+
+  useEffect(() => {
+    const container = containerRef.current;
+    if (!container) return;
+    const observer = new IntersectionObserver(
+      ([entry]) => setIsVisible(entry?.isIntersecting ?? false),
+      { rootMargin: "120px" },
+    );
+    observer.observe(container);
+    return () => observer.disconnect();
+  }, []);
+
   useLayoutEffect(() => {
+    if (!isVisible) {
+      setOverflow(0);
+      return;
+    }
+
     const measure = () => {
       const container = containerRef.current;
       const text = textRef.current;
@@ -256,7 +274,7 @@ export function Marquee({
         document.fonts.removeEventListener("loadingdone", onFontLoadingDone);
       }
     };
-  }, [children]);
+  }, [children, isVisible]);
 
   // Surface the dead-banded overflow to any parent coordinator so two
   // Marquees in the same parent can be synced without duplicating the

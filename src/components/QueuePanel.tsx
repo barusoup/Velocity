@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
 import { createPortal } from "react-dom";
 import { GripVertical, History, List, Pause, Play, LoaderCircle, RefreshCw, Trash2 } from "lucide-react";
-import { usePlayer } from "../player";
+import { usePlayerActions, usePlayerState } from "../player";
 import type { MediaTrack } from "../types";
 import { formatDuration } from "../utils/media";
 import { rgbToCss } from "../utils/artwork-color";
@@ -9,6 +9,7 @@ import { ArtworkImage, DefaultArtwork, getArtworkRoundedClass } from "./Shared";
 import { ArtistCreditText, DEFAULT_ALBUM_ACCENT, useTrackAccents } from "./PagesShared";
 import type { View } from "./Sidebar";
 import { getDirectArtistBrowseId, resolveArtistBrowseId } from "../utils/navigation";
+import { VirtualList } from "./VirtualList";
 
 type QueueTab = "queued" | "recent";
 type DragOverlayFrame = { top: number; left: number; width: number };
@@ -48,7 +49,8 @@ function muteForOverlay(c: { r: number; g: number; b: number }): { r: number; g:
 }
 
 export function QueuePanel({ open, onNavigate }: { open: boolean; onNavigate: (view: View) => void }) {
-  const player = usePlayer();
+  const player = usePlayerState();
+  const playerActions = usePlayerActions();
   const [tab, setTab] = useState<QueueTab>("queued");
   const scrollRef = useRef<HTMLDivElement>(null);
   const listRef = useRef<HTMLDivElement>(null);
@@ -97,7 +99,7 @@ export function QueuePanel({ open, onNavigate }: { open: boolean; onNavigate: (v
     return list;
   }, [player.currentTrack, futureTracks]);
 
-  const accentColors = useTrackAccents(allTracks);
+  const accentColors = useTrackAccents(open ? allTracks : []);
 
   const accentMap = useMemo(() => {
     const map = new Map<string, { r: number; g: number; b: number }>();
@@ -111,7 +113,7 @@ export function QueuePanel({ open, onNavigate }: { open: boolean; onNavigate: (v
   }, [allTracks, accentColors]);
 
   useLayoutEffect(() => {
-    if (dragState.current?.moved) return;
+    if (!open || dragState.current?.moved) return;
     const listEl = listRef.current;
     if (!listEl) { rowLayoutRef.current = []; return; }
     const rows = listEl.querySelectorAll<HTMLElement>("[data-queue-index]");
@@ -123,7 +125,7 @@ export function QueuePanel({ open, onNavigate }: { open: boolean; onNavigate: (v
       layout.push({ queueIndex: qi, top: rect.top - listTop, height: rect.height });
     }
     rowLayoutRef.current = layout;
-  });
+  }, [open, futureTracks.length, dragFromIndex]);
 
   const measureQueueRows = useCallback(() => {
     const listEl = listRef.current;
@@ -354,7 +356,7 @@ export function QueuePanel({ open, onNavigate }: { open: boolean; onNavigate: (v
         // `over` is the queue index of the row the gap currently sits before.
         // When moving down, removing the dragged item shifts that target row one
         // slot earlier, so the insert index needs the same one-slot adjustment.
-        player.moveQueueItem(from, from < over ? over - 1 : over);
+        playerActions.moveQueueItem(from, from < over ? over - 1 : over);
       }
     };
 
@@ -371,7 +373,7 @@ export function QueuePanel({ open, onNavigate }: { open: boolean; onNavigate: (v
         if (d.autoscrollRaf) cancelAnimationFrame(d.autoscrollRaf);
       }
     };
-  }, [player.moveQueueItem, player.queueIndex]);
+  }, [playerActions.moveQueueItem, player.queueIndex]);
 
   const getRowShift = (queueIndex: number): number => {
     if (dragFromIndex === null || dragOverIndex === null) return 0;
@@ -431,7 +433,7 @@ export function QueuePanel({ open, onNavigate }: { open: boolean; onNavigate: (v
           />
           <button
             type="button"
-            onClick={() => (tab === "queued" ? player.clearQueue() : player.clearPlaybackHistory())}
+            onClick={() => (tab === "queued" ? playerActions.clearQueue() : playerActions.clearPlaybackHistory())}
             className="ml-auto flex h-10 items-center gap-2 whitespace-nowrap text-sm font-semibold text-white/48 transition-colors hover:text-white/78"
             title={tab === "queued" ? "Clear all upcoming tracks from the queue" : "Clear recently played history"}
           >
@@ -451,7 +453,7 @@ export function QueuePanel({ open, onNavigate }: { open: boolean; onNavigate: (v
                   active
                   playing={player.isPlaying}
                   buffering={player.isBuffering}
-                  onClick={player.togglePlay}
+                  onClick={playerActions.togglePlay}
                   onNavigate={onNavigate}
                 />
               </QueueSection>
@@ -481,7 +483,7 @@ export function QueuePanel({ open, onNavigate }: { open: boolean; onNavigate: (v
                           {entry.autoplay && (
                             <button
                               type="button"
-                              onClick={() => player.reloadAutoplay()}
+                              onClick={() => playerActions.reloadAutoplay()}
                               disabled={player.autoplaySeed?.videoId === player.currentTrack?.videoId || player.isReloadingAutoplay}
                               aria-label="Reload autoplay"
                               className={`flex h-5 w-5 items-center justify-center rounded-full transition-colors duration-150 ${
@@ -506,7 +508,7 @@ export function QueuePanel({ open, onNavigate }: { open: boolean; onNavigate: (v
                           queueIndex={entry.queueIndex}
                           isDragged={dragFromIndex === entry.queueIndex}
                           dragging={dragFromIndex !== null}
-                          onClick={() => runQueueClick(() => player.playQueueIndex(entry.queueIndex, entry.track.id))}
+                          onClick={() => runQueueClick(() => playerActions.playQueueIndex(entry.queueIndex, entry.track.id))}
                           onPointerDragStart={(event) => handlePointerDragStart(event, entry.queueIndex)}
                           onNavigate={onNavigate}
                         />
@@ -521,26 +523,32 @@ export function QueuePanel({ open, onNavigate }: { open: boolean; onNavigate: (v
           </>
         ) : player.recentlyPlayed.length > 0 ? (
           <QueueSection label="Recently played">
-            {player.recentlyPlayed.map((entry) => (
-              <QueueTrackRow
-                key={
-                  entry.historyIndex >= 0
-                    ? `${entry.track.id}-history-${entry.historyIndex}`
-                    : `${entry.track.id}-queue-${entry.queueIndex}`
-                }
-                track={entry.track}
-                onClick={() => {
-                  if (entry.historyIndex >= 0) {
-                    player.restoreHistoryEntry(entry.historyIndex);
-                    return;
-                  }
-                  if (typeof entry.queueIndex === "number") {
-                    player.playQueueIndex(entry.queueIndex, entry.track.id);
-                  }
-                }}
-                onNavigate={onNavigate}
-              />
-            ))}
+            <VirtualList
+              items={player.recentlyPlayed}
+              estimateSize={ROW_HEIGHT}
+              scrollElement={scrollRef}
+              overscan={8}
+              getItemKey={(entry) =>
+                entry.historyIndex >= 0
+                  ? `${entry.track.id}-history-${entry.historyIndex}`
+                  : `${entry.track.id}-queue-${entry.queueIndex}`
+              }
+              renderItem={(entry) => (
+                <QueueTrackRow
+                  track={entry.track}
+                  onClick={() => {
+                    if (entry.historyIndex >= 0) {
+                      playerActions.restoreHistoryEntry(entry.historyIndex);
+                      return;
+                    }
+                    if (typeof entry.queueIndex === "number") {
+                      playerActions.playQueueIndex(entry.queueIndex, entry.track.id);
+                    }
+                  }}
+                  onNavigate={onNavigate}
+                />
+              )}
+            />
           </QueueSection>
         ) : (
           <EmptyQueue label="Songs you finish or skip will appear here" />

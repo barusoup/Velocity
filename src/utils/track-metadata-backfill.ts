@@ -107,3 +107,18 @@ export function mergeTrackListMetadata(
     track.id === trackId ? mergeTrackMetadata(track, updates) : track,
   );
 }
+
+export function mergeTrackListMetadataBatch(
+  tracks: MediaTrack[],
+  updatesById: ReadonlyMap<string, TrackMetadataUpdates>,
+): MediaTrack[] {
+  if (updatesById.size === 0) return tracks;
+  let changed = false;
+  const next = tracks.map((track) => {
+    const updates = updatesById.get(track.id);
+    if (!updates) return track;
+    changed = true;
+    return mergeTrackMetadata(track, updates);
+  });
+  return changed ? next : tracks;
+}

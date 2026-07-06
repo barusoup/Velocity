@@ -25,13 +25,14 @@ import {
   PLAYLIST_TRACK_GRID,
   TrackListHeader,
 } from "./TrackList";
-import { DefaultArtwork, ConfirmDialog, encodeTrackForContextMenu } from "./Shared";
+import { DefaultArtwork, ConfirmDialog } from "./Shared";
 import { PlaylistContextMenu } from "./PlaylistContextMenu";
 import { SaveButton } from "./SaveButton";
-import { useCollection } from "../collection";
+import { useIsTrackSaved, useToggleTrackSave } from "../hooks/useCollectionSelectors";
 import { Marquee } from "./Marquee";
 import { usePlaylists, DESCRIPTION_MAX_LENGTH, PLAYLIST_TITLE_MAX_LENGTH } from "../playlists";
-import { usePlayer, type QueueOrigin } from "../player";
+import { usePlayer, usePlayerActions, type QueueOrigin } from "../player";
+import { useContextTrackTarget } from "../hooks/useContextTrackTarget";
 import type { MediaTrack } from "../types";
 import { ArtistCreditText, useArtworkAccent } from "./PagesShared";
 import { formatOptionalDuration, isSameSongTrack, withResolvedAudioSrc } from "../utils/media";
@@ -40,6 +41,8 @@ import type { View } from "./Sidebar";
 import { getDirectArtistBrowseId, resolveArtistBrowseId } from "../utils/navigation";
 import { AnimatedShuffle } from "./PlayerButtonIcons";
 import { useSetting, setSetting } from "../settings";
+import { useTrackPlaybackState } from "../hooks/usePlayerSelectors";
+import { VirtualList } from "./VirtualList";
 
 // ---------------------------------------------------------------------------
 // UserPlaylistPage
@@ -409,11 +412,13 @@ export function UserPlaylistPage({
         {tracks.length === 0 ? (
           <EmptyPlaylistTracksState onAddToQueue={onAddAlbumToQueue} />
         ) : (
-          <div>
-            {tracks.map((track, index) =>
+          <VirtualList
+            items={tracks}
+            estimateSize={viewMode === "compact" ? 44 : 56}
+            getItemKey={(track) => track.id}
+            renderItem={(track, index) =>
               viewMode === "compact" ? (
                 <CompactTrackRow
-                  key={track.id}
                   track={track}
                   index={index}
                   playColor={playColor}
@@ -433,7 +438,6 @@ export function UserPlaylistPage({
                 />
               ) : (
                 <AlbumTrackRow
-                  key={track.id}
                   track={track}
                   index={index}
                   playColor={playColor}
@@ -452,9 +456,9 @@ export function UserPlaylistPage({
                   onHoverChange={index === 0 ? setFirstTrackHovered : undefined}
                   queueOrigin={playlistOrigin}
                 />
-              ),
-            )}
-          </div>
+              )
+            }
+          />
         )}
       </section>
 
@@ -677,7 +681,7 @@ function AlbumTrackRow({
   onNavigate,
   onNavigateToAlbum,
   onHoverChange,
-  queueOrigin,
+  queueOrigin: _queueOrigin,
 }: {
   track: MediaTrack;
   index: number;
@@ -688,13 +692,11 @@ function AlbumTrackRow({
   onHoverChange?: (hovered: boolean) => void;
   queueOrigin?: QueueOrigin | null;
 }) {
-  const player = usePlayer();
-  const collection = useCollection();
-  const active = isSameSongTrack(player.currentTrack, track);
-  const playingActive = active && player.isPlaying;
-  const bufferingActive = active && player.isBuffering;
-  const contextPayload = useMemo(() => encodeTrackForContextMenu(track), [track]);
-  const isSaved = collection.isTrackSaved(track);
+  const { togglePlay } = usePlayerActions();
+  const { active, playingActive, bufferingActive } = useTrackPlaybackState(track);
+  const contextTarget = useContextTrackTarget(track);
+  const isSaved = useIsTrackSaved(track);
+  const toggleSave = useToggleTrackSave(track);
   const directArtistBrowseId = onNavigate ? getDirectArtistBrowseId(track) : null;
   const handleResolveNavigate = useCallback(() => {
     if (!onNavigate) return;
@@ -717,13 +719,11 @@ function AlbumTrackRow({
 
   return (
     <div
-      data-song-context-target="true"
-      data-track={contextPayload}
-      data-track-source={track.source ?? "stream"}
+      {...contextTarget}
       className={`group grid cursor-pointer ${PLAYLIST_TRACK_GRID} gap-3 rounded-lg px-4 py-2 transition-colors animate-none ${
         active ? "bg-white/[0.04]" : "hover:bg-neutral-900"
       }`}
-      onClick={active ? player.togglePlay : onPlay}
+      onClick={active ? togglePlay : onPlay}
       onContextMenu={(event) => {
         event.stopPropagation();
       }}
@@ -743,7 +743,7 @@ function AlbumTrackRow({
           type="button"
           onClick={(event) => {
             event.stopPropagation();
-            (active ? player.togglePlay : onPlay)();
+            (active ? togglePlay : onPlay)();
           }}
           className={`absolute flex h-7 w-7 items-center justify-center text-white animate-none ${
             active ? "opacity-100" : "opacity-0 group-hover:opacity-100"
@@ -795,7 +795,7 @@ function AlbumTrackRow({
             <SaveButton
               isSaved={isSaved}
               size="sm"
-              onToggle={() => collection.toggleSong(track)}
+              onToggle={toggleSave}
               ariaLabel={isSaved ? "Remove from collection" : "Save to collection"}
             />
           </div>
@@ -841,7 +841,7 @@ function CompactTrackRow({
   onPlay,
   onNavigateToAlbum,
   onHoverChange,
-  queueOrigin,
+  queueOrigin: _queueOrigin2,
 }: {
   track: MediaTrack;
   index: number;
@@ -851,21 +851,17 @@ function CompactTrackRow({
   onHoverChange?: (hovered: boolean) => void;
   queueOrigin?: QueueOrigin | null;
 }) {
-  const player = usePlayer();
-  const active = isSameSongTrack(player.currentTrack, track);
-  const playingActive = active && player.isPlaying;
-  const bufferingActive = active && player.isBuffering;
-  const contextPayload = useMemo(() => encodeTrackForContextMenu(track), [track]);
+  const { togglePlay } = usePlayerActions();
+  const { active, playingActive, bufferingActive } = useTrackPlaybackState(track);
+  const contextTarget = useContextTrackTarget(track);
 
   return (
     <div
-      data-song-context-target="true"
-      data-track={contextPayload}
-      data-track-source={track.source ?? "stream"}
+      {...contextTarget}
       className={`group grid cursor-pointer ${PLAYLIST_TRACK_GRID} gap-3 rounded-lg px-4 py-1.5 transition-colors animate-none ${
         active ? "bg-white/[0.04]" : "hover:bg-neutral-900"
       }`}
-      onClick={active ? player.togglePlay : onPlay}
+      onClick={active ? togglePlay : onPlay}
       onContextMenu={(event) => {
         event.stopPropagation();
       }}
@@ -885,7 +881,7 @@ function CompactTrackRow({
           type="button"
           onClick={(event) => {
             event.stopPropagation();
-            (active ? player.togglePlay : onPlay)();
+            (active ? togglePlay : onPlay)();
           }}
           className={`absolute flex h-7 w-7 items-center justify-center text-white animate-none ${
             active ? "opacity-100" : "opacity-0 group-hover:opacity-100"

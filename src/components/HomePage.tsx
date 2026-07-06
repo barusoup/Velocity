@@ -8,7 +8,9 @@ import {
   useState,
 } from "react";
 import { LoaderCircle } from "lucide-react";
-import { usePlayer } from "../player";
+import { usePlayerActions } from "../player";
+import { useContextTrackTarget } from "../hooks/useContextTrackTarget";
+import { useTrackPlaybackState } from "../hooks/usePlayerSelectors";
 import { useSetting } from "../settings";
 import type { MediaTrack } from "../types";
 import {
@@ -24,7 +26,7 @@ import {
   generateDailyRecommendations,
 } from "../utils/home-recommendations";
 import { useHorizontalDragScroll } from "../hooks/useHorizontalDragScroll";
-import { isSameSongTrack } from "../utils/media";
+
 import {
   getDirectAlbumBrowseId,
   getDirectArtistBrowseId,
@@ -44,13 +46,7 @@ const PERIOD_OPTIONS: Array<{ value: TopSongsPeriod; label: string }> = [
   { value: "allTime", label: "All Time" },
 ];
 
-function stripTrack(track: MediaTrack) {
-  const { cover: _cover, filePath: _filePath, audioSrc: _audioSrc, ...rest } = track;
-  void _cover;
-  void _filePath;
-  void _audioSrc;
-  return rest;
-}
+
 
 const PeriodTabButton = forwardRef<
   HTMLButtonElement,
@@ -78,17 +74,16 @@ const PeriodTabButton = forwardRef<
 
 function HomeTrackCard({
   track,
-  playing,
   onPlayTrack,
   onNavigate,
 }: {
   track: MediaTrack;
-  playing: boolean;
   onPlayTrack: (track: MediaTrack) => void;
   onNavigate: (view: View) => void;
 }) {
-  const player = usePlayer();
-  const active = isSameSongTrack(player.currentTrack, track);
+  const { togglePlay } = usePlayerActions();
+  const { active, playingActive: playing } = useTrackPlaybackState(track);
+  const contextTarget = useContextTrackTarget(track);
   const directAlbumBrowseId = getDirectAlbumBrowseId(track);
   const albumLabel = displayAlbumName(track.album);
   const canNavigateToAlbum = Boolean(directAlbumBrowseId || track.videoId || albumLabel);
@@ -139,13 +134,13 @@ function HomeTrackCard({
       : undefined;
 
   return (
-    <div data-song-context-target="true" data-track={JSON.stringify(stripTrack(track))}>
+    <div {...contextTarget}>
       <Card
         cover={track.cover}
         title={track.title}
         playing={playing}
         playButtonSize="lg"
-        onPlay={() => (active ? player.togglePlay() : onPlayTrack(track))}
+        onPlay={() => (active ? togglePlay() : onPlayTrack(track))}
         onClick={onCardClick}
         subtitleContent={
           <div className="mt-0.5 truncate text-xs text-neutral-400">
@@ -174,7 +169,6 @@ function HomeTrackCardRail({
   onPlayTrack: (track: MediaTrack) => void;
   onNavigate: (view: View) => void;
 }) {
-  const player = usePlayer();
   const { stripRef, isDragging, onPointerDown, onClickCapture } = useHorizontalDragScroll();
 
   return (
@@ -187,23 +181,15 @@ function HomeTrackCardRail({
       onPointerDown={onPointerDown}
       onClickCapture={onClickCapture}
     >
-      {tracks.map((track) => {
-        const active = isSameSongTrack(player.currentTrack, track);
-        const playing = active && player.isPlaying;
-        return (
-          <div
-            key={track.id}
-            className="w-[var(--ui-home-card-width)] shrink-0"
-          >
-            <HomeTrackCard
-              track={track}
-              playing={playing}
-              onPlayTrack={onPlayTrack}
-              onNavigate={onNavigate}
-            />
-          </div>
-        );
-      })}
+      {tracks.map((track) => (
+        <div key={track.id} className="w-[var(--ui-home-card-width)] shrink-0">
+          <HomeTrackCard
+            track={track}
+            onPlayTrack={onPlayTrack}
+            onNavigate={onNavigate}
+          />
+        </div>
+      ))}
     </div>
   );
 }

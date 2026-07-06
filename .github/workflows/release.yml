@@ -179,37 +179,39 @@ jobs:
           export WIN_SIG=$(sig_of "_assets/build-windows/Velocity-Setup-x64.exe.sig")
           export MAC_A_SIG=$(sig_of "_assets/build-macos-arm64/Velocity-macOS-arm64.app.tar.gz.sig")
 
-          if [ "$EXPERIMENTAL" != "true" ]; then
-            # node reads the values from env so JSON.stringify handles all
-            # escaping (release notes carry newlines/quotes; signatures are base64).
-            # Platforms with no signature (skipped in the build matrix) are
-            # omitted from the manifest entirely, so the Tauri updater on
-            # those platforms never tries to validate an empty signature and
-            # users stay on their current build.
-            node <<'JS' > latest.json
-            const env = process.env;
-            const trim = (v) => (v || "").replace(/\r?\n/g, "");
-            const platform = (sig, url) => sig ? { signature: sig, url } : null;
-            const all = {
-              "windows-x86_64": platform(trim(env.WIN_SIG),  env.BASE + "/Velocity-Setup-x64.exe"),
-              "darwin-aarch64": platform(trim(env.MAC_A_SIG), env.BASE + "/Velocity-macOS-arm64.app.tar.gz")
-            };
-            const platforms = Object.fromEntries(Object.entries(all).filter(([, v]) => v !== null));
-            const m = {
-              version: env.VER,
-              notes: env.NOTES,
-              pub_date: env.PUB_DATE,
-              platforms
-            };
-            process.stdout.write(JSON.stringify(m, null, 2));
-            JS
+          # node reads the values from env so JSON.stringify handles all
+          # escaping (release notes carry newlines/quotes; signatures are base64).
+          # Platforms with no signature (skipped in the build matrix) are
+          # omitted from the manifest entirely, so the Tauri updater on
+          # those platforms never tries to validate an empty signature and
+          # users stay on their current build. Experimental releases skip
+          # attaching latest.json so releases/latest stays on the stable build.
+          node <<'JS' > latest.json
+          const env = process.env;
+          const trim = (v) => (v || "").replace(/\r?\n/g, "");
+          const platform = (sig, url) => sig ? { signature: sig, url } : null;
+          const all = {
+            "windows-x86_64": platform(trim(env.WIN_SIG),  env.BASE + "/Velocity-Setup-x64.exe"),
+            "darwin-aarch64": platform(trim(env.MAC_A_SIG), env.BASE + "/Velocity-macOS-arm64.app.tar.gz")
+          };
+          const platforms = Object.fromEntries(Object.entries(all).filter(([, v]) => v !== null));
+          const m = {
+            version: env.VER,
+            notes: env.NOTES,
+            pub_date: env.PUB_DATE,
+            platforms
+          };
+          process.stdout.write(JSON.stringify(m, null, 2));
+          JS
 
+          if [ "$EXPERIMENTAL" != "true" ]; then
             echo "--- manifest ---"
             cat latest.json
-
             # Upload the manifest too so the app can always reach it at
             # releases/latest/download/latest.json (future-proof across releases).
             cp latest.json "_assets/build-windows/latest.json" 2>/dev/null || true
+          else
+            rm -f latest.json
           fi
 
           # The public repo must have at least one commit for gh release create

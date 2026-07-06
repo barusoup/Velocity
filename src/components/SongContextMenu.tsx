@@ -12,8 +12,9 @@ import {
 } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { save as saveDialog } from "@tauri-apps/plugin-dialog";
-import { useCollection } from "../collection";
-import { usePlayer } from "../player";
+import { useCollectionActions } from "../collection";
+import { usePlayerActions, usePlayerState } from "../player";
+import { useIsTrackSaved } from "../hooks/useCollectionSelectors";
 import type { MediaTrack } from "../types";
 import { deviceExportVideoIds, hydrateUploadTrackForPlayback, saveTrackToMp3 } from "../api";
 import { useDeviceExport } from "../hooks/useDeviceExport";
@@ -134,14 +135,15 @@ function SongContextMenuContent({
   currentArtistBrowseId,
   currentUserPlaylistId,
 }: { track: MediaTrack; position: { x: number; y: number } } & Omit<SongContextMenuProps, "track" | "position">) {
-  const player = usePlayer();
-  const collection = useCollection();
+  const playerState = usePlayerState();
+  const playerActions = usePlayerActions();
+  const { toggleSong } = useCollectionActions();
   const directAlbumId = getDirectAlbumBrowseId(track);
   const directArtistId = getDirectArtistBrowseId(track);
-  const isSaved = collection.isTrackSaved(track);
+  const isSaved = useIsTrackSaved(track);
   const isCurrentAlbum = directAlbumId && currentAlbumBrowseId && directAlbumId === currentAlbumBrowseId;
   const isCurrentArtist = directArtistId && currentArtistBrowseId && directArtistId === currentArtistBrowseId;
-  const isInQueue = player.queue.some((t) => t.id === track.id);
+  const isInQueue = playerState.queue.some((t) => t.id === track.id);
   // Confirmation state for the destructive Delete option. Only meaningful
   // for upload-sourced tracks. When true, the menu's children swap to a
   // two-button confirmation panel instead of the standard row list.
@@ -179,14 +181,14 @@ function SongContextMenuContent({
   const handleAddToQueue = () => {
     void hydrateUploadTrackForPlayback(track)
       .then((hydrated) => {
-        player.appendToQueue([hydrated]);
+        playerActions.appendToQueue([hydrated]);
         onClose();
       })
       .catch(() => onClose());
   };
 
   const handleToggleSave = () => {
-    collection.toggleSong(track);
+    toggleSong(track);
     onClose();
   };
 
@@ -220,7 +222,7 @@ function SongContextMenuContent({
     onRemoveTrack?.(id);
   };
 
-  const exportTrack = enrichTrackForDeviceExport(track, player.currentTrack, player.queue);
+  const exportTrack = enrichTrackForDeviceExport(track, playerState.currentTrack, playerState.queue);
   const deviceExport = useDeviceExport({ onClose });
   const {
     status: savingState,

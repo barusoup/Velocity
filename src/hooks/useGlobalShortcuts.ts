@@ -1,5 +1,6 @@
 import { useCallback, useEffect } from "react";
 
+import { getPlayerProgress } from "../store/playerUiStore";
 import { usePlayer } from "../player";
 import { toggleFullscreenWithBoundsRestore } from "../utils/window-fullscreen";
 
@@ -46,13 +47,13 @@ export function useGlobalShortcuts({
         // other OS shortcuts can still deliver ArrowLeft/Right to the webview.
         if (event.shiftKey || event.altKey || event.ctrlKey || event.metaKey) return;
         event.preventDefault();
-        if (player.currentTrack) player.seek(player.progress - 5);
+        if (player.currentTrack) player.seek(getPlayerProgress() - 5);
         return;
       }
       if (event.key === "ArrowRight") {
         if (event.shiftKey || event.altKey || event.ctrlKey || event.metaKey) return;
         event.preventDefault();
-        if (player.currentTrack) player.seek(player.progress + 5);
+        if (player.currentTrack) player.seek(getPlayerProgress() + 5);
         return;
       }
       if (event.key === "ArrowUp") {

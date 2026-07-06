@@ -216,20 +216,66 @@ affects the private repo.
 ### Release notes
 
 The release body on Velocity-Public is user-facing — it appears in the
-auto-updater dialog and on the public Releases page. Follow these rules:
+auto-updater dialog and on the public Releases page. The publish workflow
+reads notes from the **annotated tag message** (`git tag -a`). Put the final,
+user-facing text in the tag body (not just the commit subject). Same content
+goes into the `"notes"` field of `latest.json` on **stable** releases only;
+experimental pre-releases skip `latest.json` (see below).
+
+#### Writing rules
 
 - **Never reference source code.** No filenames, no function names, no
   commit hashes, no PR numbers, no internal identifiers.
-- **Be concise.** A few natural-language sentences summarizing notable
-  additions and fixes. Omit internal trivia (dependency bumps, refactors,
-  CI changes) that don't affect the user.
-- **Format:** short Markdown list or paragraph. Same content goes into the
-  `"notes"` field of `latest.json`.
+- **Rewrite for users.** Turn rough dev notes into plain, specific sentences
+  a player would understand. Prefer "Fixed the 100-song cap when importing
+  Spotify playlists" over "fix spotify import limit".
+- **Be concise but complete.** Cover everything the user would notice. Omit
+  internal trivia (dependency bumps, refactors, CI changes) that don't affect
+  the player.
+- **Use present tense for features, past tense for fixes** where it reads
+  naturally ("Adds …", "Fixed …", "Reworked …").
 
-Good:
+#### Layout (required for non-trivial releases)
+
+Organize notes into a short intro, then **bold category headers**, then
+`- ` bullets under each. Section order is flexible — group by what makes sense
+for the release — but always use this structure instead of one flat list.
+
+1. **Intro (1–2 sentences).** What this release is. For experimental builds,
+   state that it is early access, may be unstable, and that the auto-updater
+   will not offer it to stable installs.
+2. **New** — features and additions.
+3. **Thematic fix/improvement sections** — name them for the release (e.g.
+   *Queue & playback*, *Imports & library*, *UI & windowing*, *Lyrics &
+   video*). Use as many sections as needed; merge small related items rather
+   than creating one-item sections.
+4. **And more** (optional) — one line catching smaller polish items not worth
+   their own bullet.
+
+Good (structure and tone — v0.1.0 Experimental):
 ```
-- Tab navigation: switch between pages with Ctrl+Tab / Cmd+Tab.
-- Fixes a crash when opening large log files.
+Experimental pre-release. Early access build — features may be unstable and
+the auto-updater will not offer this version to stable installs.
+
+**New**
+- Home page with personalized recommendations and daily picks
+- Save artists to your Collection
+- Inline search suggestions as you type
+
+**Queue & playback**
+- Reworked queue and listening history logic
+- Remade the song preload system for smoother playback
+- Clear All in the queue menu now clears the right list depending on which tab you're on
+
+**Imports & library**
+- Fixed the 100-song cap when importing Spotify playlists
+- Fixed some songs failing to load due to API data handling
+
+**UI & windowing**
+- Fixed window size not restoring after leaving fullscreen
+- Fixed inertial scrolling on song lists fighting with marquee scrolling
+
+**And more** — numerous smaller player, search, and stability improvements throughout the app.
 ```
 
 Bad:
@@ -237,7 +283,21 @@ Bad:
 - feat: add TabNavigation component (closes #42, 7a3f1e9)
 - fix: handle OOM in src/parsers/LogParser.ts
 - chore: bump serde to 1.0.200
+- reworked queue, fixed spotify cap, sidebar bug, fullscreen, marquee scroll collision, ...
 ```
+
+After publish, verify the public release body on Velocity-Public matches the
+tag notes. If the workflow picked up the wrong text (e.g. commit subject
+instead of tag annotation), patch the release body on the public repo.
+
+#### Experimental pre-releases
+
+Tag annotations containing "experimental" (case-insensitive), or
+`workflow_dispatch` with `experimental: true`, publish a **pre-release** on
+Velocity-Public: title suffix " Experimental", `--prerelease`, and no
+`latest.json` asset so `releases/latest` stays on the current stable build.
+Release notes still use the same layout and writing rules above; the intro
+must call out the experimental / no-auto-update behavior.
 
 ## Making a release without a git tag
 The workflow also accepts `workflow_dispatch` with a `version` input. Prefer

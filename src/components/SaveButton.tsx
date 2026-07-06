@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { memo, useEffect, useRef, useState } from "react";
 import { Check, CirclePlus, LoaderCircle } from "lucide-react";
 import { cn } from "../utils/cn";
 
@@ -31,7 +31,7 @@ export type SaveButtonProps = {
   onToggle: (nextSaved: boolean) => void;
 };
 
-export function SaveButton({
+export const SaveButton = memo(function SaveButton({
   isSaved,
   isLoading = false,
   ariaLabel,
@@ -141,7 +141,7 @@ export function SaveButton({
       )}
     </button>
   );
-}
+});
 
 // Convenience: render an "unsaved / saved" pill (no animation) for spot UI
 // (e.g. inside a context menu label) where we don't have a click handler but

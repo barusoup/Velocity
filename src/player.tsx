@@ -26,6 +26,12 @@ import {
   resolveStream,
 } from "./api";
 import type { LoudnessData, MediaTrack, QueueOrigin } from "./types";
+import { usePlayerUiStore } from "./store/playerUiStore";
+import {
+  DEFAULT_VOLUME,
+  subscribeTransport,
+  usePlayerTransportStore,
+} from "./store/playerTransportStore";
 import {
   getCachedLoudness,
   isUsableLoudness,
@@ -72,6 +78,7 @@ import {
   resolveHistoryVisitedTrackIds,
   restoreVisitedQueueTracks,
 } from "./utils/queue-visited";
+import { compactQueueForHistorySnapshot } from "./utils/playback-history-snapshot";
 
 export const currentAudio: { current: HTMLAudioElement | null } = { current: null };
 
@@ -99,9 +106,6 @@ type PlayerState = {
   isPlaying: boolean;
   isBuffering: boolean;
   isReloadingAutoplay: boolean;
-  progress: number;
-  /** Live scrubber position while dragging; `null` when not scrubbing. */
-  seekScrubProgress: number | null;
   /** Bumps on every `seek()` so consumers (e.g. Discord RPC) can force-sync. */
   seekRevision: number;
   duration: number;
@@ -148,25 +152,22 @@ type PlayerActions = {
 
 type PlayerContextValue = PlayerState & PlayerActions;
 
-// HMR-stable PlayerContext. Vite re-evaluates this file whenever a
-// downstream consumer (anything importing `usePlayer`) is edited in dev
-// mode, which would otherwise mint a fresh Context identity on every
-// reload. If a sibling lazy chunk in the same HMR batch fails to fetch
-// mid-batch, React Fast Refresh aborts its commit phase without rolling
-// back the module evaluation — the fiber tree keeps the old
-// <PlayerContext.Provider> while `useContext` reads the new Context's
-// default `null`, throwing "usePlayer must be used within PlayerProvider".
-// Stashing on `globalThis` keeps the identity stable across re-evaluations
-// so the chunk failure surfaces only as a bare "Unhandled Rejection"
-// overlay, never a context-tree crash.
-const playerContextSlot = globalThis as {
-  __VelocityPlayerContext?: Context<PlayerContextValue | null>;
+// HMR-stable contexts. Split state from actions so list rows can subscribe
+// to `usePlayerActions()` (stable across playback ticks) and
+// `useTrackPlaybackState()` without re-rendering on every queue mutation.
+const playerActionsContextSlot = globalThis as {
+  __VelocityPlayerActionsContext?: Context<PlayerActions | null>;
 };
-const PlayerContext = (playerContextSlot.__VelocityPlayerContext ??= createContext<PlayerContextValue | null>(null));
+const playerStateContextSlot = globalThis as {
+  __VelocityPlayerStateContext?: Context<PlayerState | null>;
+};
+const PlayerActionsContext = (playerActionsContextSlot.__VelocityPlayerActionsContext ??=
+  createContext<PlayerActions | null>(null));
+const PlayerStateContext = (playerStateContextSlot.__VelocityPlayerStateContext ??=
+  createContext<PlayerState | null>(null));
 const VOLUME_KEY = "velocity-volume";
 const MUTED_KEY = "velocity-muted";
 const AUTOPLAY_KEY = "velocity-autoplay";
-const DEFAULT_VOLUME = 0.8;
 const AUTOPLAY_QUEUE_TARGET = 10;
 const AUTOPLAY_QUEUE_BATCH_LIMIT = 20;
 const PREFETCH_AHEAD = 5;
@@ -618,17 +619,16 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
   );
   const [isPlaying, setIsPlaying] = useState(false);
   const [isBuffering, setIsBuffering] = useState(false);
-  const [progress, setProgress] = useState(() => bootSession?.progress ?? 0);
-  const [seekScrubProgress, setSeekScrubProgress] = useState<number | null>(null);
   const [seekRevision, setSeekRevision] = useState(0);
   const [duration, setDuration] = useState(
     () => bootSession?.track.durationSeconds ?? 0,
   );
-  const savedVolume = readVolume();
-  const savedMuted = readMuted();
-  const useDefault = savedVolume === null || Number.isNaN(savedVolume) || savedMuted || savedVolume === 0;
-  const [volume, setVolumeState] = useState(useDefault ? DEFAULT_VOLUME : savedVolume!);
-  const [muted, setMuted] = useState<boolean>(useDefault ? false : (savedMuted ?? false));
+  const volume = usePlayerTransportStore((state) => state.volume);
+  const muted = usePlayerTransportStore((state) => state.muted);
+  const normGain = usePlayerTransportStore((state) => state.normGain);
+  const setVolumeTransport = usePlayerTransportStore((state) => state.setVolume);
+  const setMutedTransport = usePlayerTransportStore((state) => state.setMuted);
+  const setNormGainTransport = usePlayerTransportStore((state) => state.setNormGain);
   const [shuffle, setShuffle] = useState(false);
   const [repeat, setRepeat] = useState<RepeatMode>("off");
   // Autoplay preference lives in the unified settings blob (atomic
@@ -649,7 +649,6 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
   );
   const [isReloadingAutoplay, setIsReloadingAutoplay] = useState(false);
   const [lastError, setLastError] = useState<string | null>(null);
-  const [normGain, setNormGain] = useState(1);
   const [currentAudioPath, setCurrentAudioPath] = useState<string | null>(null);
 
   useEffect(() => {
@@ -730,6 +729,16 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
   const resumeAfterSeekRef = useRef(false);
   const progressRef = useRef(bootSession?.progress ?? 0);
   const seekScrubProgressRef = useRef<number | null>(null);
+
+  const writeProgress = useCallback((value: number) => {
+    progressRef.current = value;
+    usePlayerUiStore.getState().setProgress(value);
+  }, []);
+
+  const writeSeekScrub = useCallback((value: number | null) => {
+    seekScrubProgressRef.current = value;
+    usePlayerUiStore.getState().setSeekScrubProgress(value);
+  }, []);
   // User play/pause intent captured while the load effect still owns the audio
   // element. `null` = no preference (normal play()/next() loads still auto-play);
   // `true`/`false` = the user explicitly toggled during load.
@@ -785,12 +794,23 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
   }, [queueVisitedTrackIds]);
 
   useEffect(() => {
-    progressRef.current = progress;
-  }, [progress]);
+    usePlayerUiStore.getState().resetProgress(bootSession?.progress ?? 0);
+    usePlayerUiStore.getState().syncPlaybackIdentity({
+      currentTrack: bootSession?.track ?? null,
+      isPlaying: false,
+      isBuffering: false,
+      queueOrigin: null,
+    });
+  }, []);
 
   useEffect(() => {
-    seekScrubProgressRef.current = seekScrubProgress;
-  }, [seekScrubProgress]);
+    usePlayerUiStore.getState().syncPlaybackIdentity({
+      currentTrack,
+      isPlaying,
+      isBuffering,
+      queueOrigin,
+    });
+  }, [currentTrack, isPlaying, isBuffering, queueOrigin]);
 
   const applyDurationFromAudio = useCallback((audio: HTMLAudioElement) => {
     const fromAudio = readAudioElementDuration(audio);
@@ -875,16 +895,23 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
   }, []);
 
   useEffect(() => {
-    volumeRef.current = volume;
-  }, [volume]);
-
-  useEffect(() => {
-    mutedRef.current = muted;
-  }, [muted]);
-
-  useEffect(() => {
-    normGainRef.current = normGain;
-  }, [normGain]);
+    const savedVolume = readVolume();
+    const savedMuted = readMuted();
+    const useDefault =
+      savedVolume === null || Number.isNaN(savedVolume) || savedMuted || savedVolume === 0;
+    const transport = usePlayerTransportStore.getState();
+    transport.setVolume(useDefault ? DEFAULT_VOLUME : savedVolume!);
+    transport.setMuted(useDefault ? false : (savedMuted ?? false));
+    transport.setNormGain(1);
+    volumeRef.current = transport.volume;
+    mutedRef.current = transport.muted;
+    normGainRef.current = transport.normGain;
+    return subscribeTransport(({ volume: nextVolume, muted: nextMuted, normGain: nextNormGain }) => {
+      volumeRef.current = nextVolume;
+      mutedRef.current = nextMuted;
+      normGainRef.current = nextNormGain;
+    });
+  }, []);
 
   const recentlyPlayed = useMemo(() => {
     const seen = new Set<string>();
@@ -973,7 +1000,7 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
     if (normalizedQueue.length === 0) {
       trackRef.current = null;
       setCurrentTrack(null);
-      setProgress(0);
+      writeProgress(0);
       setDuration(0);
     } else {
       const activeTrack = normalizedQueue[normalizedIndex] ?? normalizedQueue[0];
@@ -1095,10 +1122,12 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
     const activeTrack = trackRef.current;
     if (!activeTrack) return null;
 
-    const snapshotQueue = currentQueue.length > 0 ? currentQueue.slice() : [activeTrack];
-    const snapshotIndex = snapshotQueue.length === 0
+    const rawQueue = currentQueue.length > 0 ? currentQueue : [activeTrack];
+    const rawIndex = rawQueue.length === 0
       ? 0
-      : Math.max(0, Math.min(queueIndexRef.current, snapshotQueue.length - 1));
+      : Math.max(0, Math.min(queueIndexRef.current, rawQueue.length - 1));
+    const { queue: snapshotQueue, queueIndex: snapshotIndex } =
+      compactQueueForHistorySnapshot(rawQueue, rawIndex);
 
     return {
       track: activeTrack,
@@ -1176,7 +1205,7 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
     audio.pause();
     audio.removeAttribute("src");
     audio.currentTime = 0;
-    setProgress(0);
+    writeProgress(0);
     setIsPlaying(false);
     setIsBuffering(false);
   }, []);
@@ -1351,7 +1380,7 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
       // currentTime can throw when the element has no seekable range yet.
     }
     progressRef.current = skip;
-    setProgress(skip);
+    writeProgress(skip);
   }, []);
 
   const applyLeadingSilenceSkipAtStartRef = useRef(applyLeadingSilenceSkipAtStart);
@@ -1388,7 +1417,7 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
       // currentTime can throw when the element has no seekable range yet.
     }
     progressRef.current = target;
-    setProgress(target);
+    writeProgress(target);
     setSeekRevision((n) => n + 1);
   }, [markUserSeekInProgress]);
 
@@ -1437,7 +1466,7 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
         if (Number.isFinite(savedTime) && savedTime > 0) {
           audio.currentTime = savedTime;
           progressRef.current = savedTime;
-          setProgress(savedTime);
+          writeProgress(savedTime);
         }
       } catch {
         streamSourceRefreshNeededRef.current = true;
@@ -1472,7 +1501,7 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
       ) {
         return;
       }
-      setProgress(currentTime);
+      writeProgress(currentTime);
     };
     const syncDuration = () => {
       applyDurationFromAudioRef.current(audio);
@@ -1571,7 +1600,7 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
         });
         return;
       }
-      setProgress(0);
+      writeProgress(0);
       const queue = queueRef.current;
       const index = queueIndexRef.current;
       const hasMore = queue.length > 0 && (
@@ -1671,10 +1700,9 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
     applyOutputLevels(volume, muted, normGain);
   }, [applyOutputLevels, volume, muted, normGain, masterVolumeDb, audioNormalizationEnabled]);
 
-  // High-frequency progress sync for the active track. `timeupdate` alone
-  // fires at ~4 Hz and can lag behind the decode clock; gating on
-  // `isPlaying` also let the player bar stall whenever that flag drifted
-  // from the media element. Read `currentTime` directly instead.
+  // High-frequency progress sync for the active track. Progress lives in
+  // `playerUiStore` — not React context — so list rows and the app shell
+  // are not re-rendered ~60×/sec. The loop parks while paused (no scrub).
   useEffect(() => {
     if (!currentTrack) return;
     const audio = audioRef.current;
@@ -1682,11 +1710,17 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
 
     let rafId = 0;
     let running = true;
+    let lastMediaSessionAt = 0;
 
     const tick = () => {
       if (!running) return;
+
+      const scrubbing = seekScrubProgressRef.current !== null;
+      if (audio.paused && !scrubbing) return;
+
       rafId = window.requestAnimationFrame(tick);
-      if (seekScrubProgressRef.current !== null) return;
+      if (scrubbing) return;
+
       const currentTime = audio.currentTime;
       if (!Number.isFinite(currentTime)) return;
       if (
@@ -1698,7 +1732,7 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
       }
       if (Math.abs(currentTime - progressRef.current) >= 0.008) {
         progressRef.current = currentTime;
-        setProgress(currentTime);
+        usePlayerUiStore.getState().setProgress(currentTime);
       }
 
       const liveDuration = readLiveMediaDuration(
@@ -1707,13 +1741,49 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
       );
       if (liveDuration > 0) {
         setDuration((prev) => (Math.abs(prev - liveDuration) > 0.5 ? liveDuration : prev));
+        const session = navigator.mediaSession;
+        const now = Date.now();
+        if (session && now - lastMediaSessionAt >= 1000) {
+          lastMediaSessionAt = now;
+          session.setPositionState({
+            duration: liveDuration,
+            playbackRate: 1,
+            position: Math.min(currentTime, liveDuration),
+          });
+        }
       }
     };
 
-    rafId = window.requestAnimationFrame(tick);
+    const schedule = () => {
+      if (!running) return;
+      window.cancelAnimationFrame(rafId);
+      rafId = window.requestAnimationFrame(tick);
+    };
+
+    const onWake = () => schedule();
+
+    audio.addEventListener("play", onWake);
+    audio.addEventListener("seeking", onWake);
+    audio.addEventListener("seeked", onWake);
+
+    const unsubScrub = usePlayerUiStore.subscribe(
+      (state) => state.seekScrubProgress,
+      (scrub) => {
+        if (scrub !== null) schedule();
+      },
+    );
+
+    if (!audio.paused || seekScrubProgressRef.current !== null) {
+      schedule();
+    }
+
     return () => {
       running = false;
       window.cancelAnimationFrame(rafId);
+      audio.removeEventListener("play", onWake);
+      audio.removeEventListener("seeking", onWake);
+      audio.removeEventListener("seeked", onWake);
+      unsubScrub();
     };
   }, [currentTrack?.id]);
 
@@ -1852,7 +1922,7 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
         ? seekOnNextLoadRef.current
         : 0;
     progressRef.current = pendingRestoreProgress;
-    setProgress(pendingRestoreProgress);
+    writeProgress(pendingRestoreProgress);
     setDuration(currentTrack.durationSeconds ?? 0);
     setCurrentAudioPath(null);
 
@@ -2095,7 +2165,7 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
           if (savedPos > 0) {
             audio.currentTime = savedPos;
             progressRef.current = savedPos;
-            setProgress(savedPos);
+            writeProgress(savedPos);
           } else {
             applyLeadingSilenceSkipAtStart(audio);
           }
@@ -2168,7 +2238,7 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
 
   useEffect(() => {
     if (!currentTrack) {
-      setNormGain(1);
+      setNormGainTransport(1);
       setCurrentAudioPath(null);
       leadingSilenceSkipRef.current = 0;
       return;
@@ -2182,11 +2252,11 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
     refreshLeadingSilenceSkipRef(loudnessCacheKey);
     const loudness = getCachedLoudness(loudnessCacheKey);
     if (loudness) {
-      setNormGain(computeLinearGain(loudness, targetLufs));
+      setNormGainTransport(computeLinearGain(loudness, targetLufs));
     } else if (hasAttemptedAnalysis(loudnessCacheKey)) {
-      setNormGain(1);
+      setNormGainTransport(1);
     } else {
-      setNormGain(getInitialGain(targetLufs));
+      setNormGainTransport(getInitialGain(targetLufs));
     }
 
     const filePath =
@@ -2221,7 +2291,7 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
           // float-noise guard — anything smaller is treated as "no change"
           // to avoid pointless React re-renders.
           if (Math.abs(previewGain - normGainRef.current) > 0.01) {
-            setNormGain(previewGain);
+            setNormGainTransport(previewGain);
           }
           break;
         } catch (error) {
@@ -2238,9 +2308,9 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
         setCachedLoudness(loudnessCacheKey, data);
 
         if (isUsableLoudness(data)) {
-          setNormGain(computeLinearGain(data, targetLufs));
+          setNormGainTransport(computeLinearGain(data, targetLufs));
         } else if (!previewApplied) {
-          setNormGain(1);
+          setNormGainTransport(1);
         }
       } catch (error) {
         console.warn("Loudness analysis failed:", error);
@@ -2248,7 +2318,7 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
         // Cache empty data on error so we don't retry
         setCachedLoudness(loudnessCacheKey, { integratedLufs: null, truePeak: null });
         if (!previewApplied) {
-          setNormGain(1);
+          setNormGainTransport(1);
         }
       }
     })();
@@ -3334,7 +3404,7 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
             streamSourceRefreshNeededRef.current = false;
             audio.currentTime = 0;
             progressRef.current = 0;
-            setProgress(0);
+            writeProgress(0);
             applyLeadingSilenceSkipAtStartRef.current(audio, true);
             if (wasPlaying) {
               await audio.play();
@@ -3345,7 +3415,7 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
             setIsBuffering(false);
             audio.currentTime = 0;
             progressRef.current = 0;
-            setProgress(0);
+            writeProgress(0);
             applyLeadingSilenceSkipAtStartRef.current(audio, true);
             setLastError(
               error instanceof Error ? error.message : "Could not restart this track.",
@@ -3359,7 +3429,7 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
       }
       audio.currentTime = 0;
       progressRef.current = 0;
-      setProgress(0);
+      writeProgress(0);
       applyLeadingSilenceSkipAtStartRef.current(audio, true);
       return;
     }
@@ -3402,7 +3472,7 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
     }
     audio.currentTime = 0;
     progressRef.current = 0;
-    setProgress(0);
+    writeProgress(0);
     applyLeadingSilenceSkipAtStartRef.current(audio, true);
   }, [queueIndex, stopCurrentPlayback, restoreHistoryEntry, setQueueState, ensureAudioGraph, refreshStaleAudioSource]);
 
@@ -3414,7 +3484,7 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
     if (sourceRefreshInProgressRef.current) {
       pendingSeekTargetRef.current = target;
       progressRef.current = target;
-      setProgress(target);
+      writeProgress(target);
       return;
     }
     const isActivelyPlaying = !audio.paused;
@@ -3501,11 +3571,11 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
   }, [currentTrack]);
 
   const updateSeekScrubPreview = useCallback((seconds: number | null) => {
-    setSeekScrubProgress(seconds);
+    writeSeekScrub(seconds);
   }, []);
 
   const finishSeekScrub = useCallback((seconds: number | null, resume: boolean) => {
-    setSeekScrubProgress(null);
+    writeSeekScrub(null);
     resumeAfterSeekRef.current = resume;
     if (seconds !== null) {
       seek(seconds);
@@ -3515,9 +3585,9 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
   }, [seek, tryResumeAfterSeekScrub]);
 
   const setVolume = useCallback((value: number) => {
-    setVolumeState(Math.max(0, Math.min(1, value)));
-    setMuted(false);
-  }, []);
+    setVolumeTransport(value);
+    setMutedTransport(false);
+  }, [setMutedTransport, setVolumeTransport]);
 
   const setLiveVolume = useCallback((value: number) => {
     const audio = audioRef.current;
@@ -3542,7 +3612,7 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const toggleMute = useCallback(() => {
-    setMuted((value) => !value);
+    usePlayerTransportStore.getState().toggleMuted();
   }, []);
 
   const toggleShuffle = useCallback(() => {
@@ -3689,18 +3759,6 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     const session = navigator.mediaSession;
     if (!session) return;
-    if (duration > 0 && Number.isFinite(duration)) {
-      session.setPositionState({
-        duration: duration,
-        playbackRate: 1,
-        position: Math.min(progress, duration),
-      });
-    }
-  }, [progress, duration]);
-
-  useEffect(() => {
-    const session = navigator.mediaSession;
-    if (!session) return;
 
     session.setActionHandler("play", () => {
       togglePlay();
@@ -3821,29 +3879,8 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
     }
   }, []);
 
-  const value = useMemo<PlayerContextValue>(
+  const actionsValue = useMemo<PlayerActions>(
     () => ({
-      currentTrack,
-      queue,
-      queueIndex,
-      queueOrigin,
-      autoplayTrackIds,
-      recentlyPlayed,
-      isPlaying,
-      isBuffering,
-      isReloadingAutoplay,
-      progress,
-      seekScrubProgress,
-      seekRevision,
-      duration,
-      volume,
-      muted,
-      shuffle,
-      repeat,
-      autoplay,
-      autoplaySeed,
-      lastError,
-      normGain,
       play,
       playMany,
       playShuffled,
@@ -3874,63 +3911,107 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
       setEqualizerBand,
     }),
     [
-      clearError,
-      currentTrack,
-      duration,
-      getAnalyser,
-      isBuffering,
-      isPlaying,
-      isReloadingAutoplay,
-      lastError,
-      muted,
-      moveQueueItem,
-      clearQueue,
-      clearPlaybackHistory,
-      removeTrackFromQueue,
       appendToQueue,
+      beginSeekScrub,
+      clearError,
+      clearPlaybackHistory,
+      clearQueue,
+      cycleRepeat,
+      finishSeekScrub,
+      getAnalyser,
+      moveQueueItem,
       next,
-      normGain,
       play,
       playMany,
-      playShuffled,
       playQueueIndex,
-      restoreHistoryEntry,
+      playShuffled,
       prev,
-      progress,
-      seekScrubProgress,
-      seekRevision,
+      reloadAutoplay,
+      removeTrackFromQueue,
+      restoreHistoryEntry,
+      retry,
+      seek,
+      setAutoplay,
+      setEqualizerBand,
+      setLiveVolume,
+      setVolume,
+      toggleMute,
+      togglePlay,
+      toggleShuffle,
+      updateSeekScrubPreview,
+    ],
+  );
+
+  const stateValue = useMemo<PlayerState>(
+    () => ({
+      currentTrack,
       queue,
       queueIndex,
       queueOrigin,
       autoplayTrackIds,
       recentlyPlayed,
-      reloadAutoplay,
-      repeat,
-      retry,
-      seek,
-      beginSeekScrub,
-      finishSeekScrub,
-      updateSeekScrubPreview,
-      setAutoplay,
-      setEqualizerBand,
-      setVolume,
-      setLiveVolume,
-      shuffle,
-      toggleMute,
-      togglePlay,
-      toggleShuffle,
-      cycleRepeat,
+      isPlaying,
+      isBuffering,
+      isReloadingAutoplay,
+      seekRevision,
+      duration,
       volume,
+      muted,
+      shuffle,
+      repeat,
       autoplay,
       autoplaySeed,
+      lastError,
+      normGain,
+    }),
+    [
+      autoplay,
+      autoplaySeed,
+      autoplayTrackIds,
+      currentTrack,
+      duration,
+      isBuffering,
+      isPlaying,
+      isReloadingAutoplay,
+      lastError,
+      muted,
+      normGain,
+      queue,
+      queueIndex,
+      queueOrigin,
+      recentlyPlayed,
+      repeat,
+      seekRevision,
+      shuffle,
+      volume,
     ],
   );
 
-  return <PlayerContext.Provider value={value}>{children}</PlayerContext.Provider>;
+  return (
+    <PlayerActionsContext.Provider value={actionsValue}>
+      <PlayerStateContext.Provider value={stateValue}>
+        {children}
+      </PlayerStateContext.Provider>
+    </PlayerActionsContext.Provider>
+  );
 }
 
-export function usePlayer() {
-  const ctx = useContext(PlayerContext);
-  if (!ctx) throw new Error("usePlayer must be used within PlayerProvider");
+export function usePlayerActions(): PlayerActions {
+  const ctx = useContext(PlayerActionsContext);
+  if (!ctx) throw new Error("usePlayerActions must be used within PlayerProvider");
   return ctx;
 }
+
+export function usePlayerState(): PlayerState {
+  const ctx = useContext(PlayerStateContext);
+  if (!ctx) throw new Error("usePlayerState must be used within PlayerProvider");
+  return ctx;
+}
+
+export function usePlayer(): PlayerContextValue {
+  const state = usePlayerState();
+  const actions = usePlayerActions();
+  return useMemo(() => ({ ...state, ...actions }), [state, actions]);
+}
+
+export { getPlayerProgress, getPlayerSeekScrubProgress } from "./store/playerUiStore";

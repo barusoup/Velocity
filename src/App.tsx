@@ -14,6 +14,7 @@ import { SongContextMenu, type AddToPlaylistResolver } from "./components/SongCo
 import { ConfirmDialog } from "./components/Shared";
 import { LoadingPanel } from "./components/PagesShared";
 import { PlayerProvider, usePlayer, type QueueOrigin } from "./player";
+import { usePlayerHasTrack } from "./hooks/usePlayerSelectors";
 import { useGlobalContextMenus } from "./hooks/useGlobalContextMenus";
 import { useGlobalShortcuts } from "./hooks/useGlobalShortcuts";
 import { useImportedTracksHydration } from "./hooks/useImportedTracksHydration";
@@ -213,6 +214,7 @@ function getInitialView(): View {
 
 function Shell() {
   const player = usePlayer();
+  const hasActiveTrack = usePlayerHasTrack();
   const showHomeMenu = useSetting("showHomeMenu");
   const [sidebarOpen, setSidebarOpen] = useState(true);
 
@@ -903,7 +905,7 @@ function Shell() {
               "nice-scroll main-scrollport min-h-0 flex-1 overflow-y-auto",
               isFullBleedView ? "pt-0" : "pt-[var(--ui-topbar-height)]",
               isFullBleedView ? "px-0" : "px-[var(--ui-page-pad)]",
-              player.currentTrack && !lyricsPlayerHidden
+              hasActiveTrack && !lyricsPlayerHidden
                 ? "pb-[clamp(5rem,8vw,7.5rem)]"
                 : "pb-[clamp(1.5rem,2vw,2.5rem)]",
             )}
