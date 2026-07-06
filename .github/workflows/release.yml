@@ -1,0 +1,233 @@
+name: release
+
+# Builds Velocity for Windows, macOS (arm64 + x86_64), and Linux on every
+# annotated `vX.Y.Z` tag, signs the auto-updater bundles, and publishes the
+# installers + a Tauri v2 updater manifest to the PUBLIC repository
+# (barusoup/Velocity-Public) as a GitHub Release. Source code lives only in
+# this private repo.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to build and publish (e.g. 0.0.1)"
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build (${{ matrix.rid }})
+    runs-on: ${{ matrix.os }}
+    env:
+      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+      CI: "true"
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            rid: windows
+            target: ""
+          - os: macos-latest
+            rid: macos-arm64
+            target: aarch64-apple-darwin
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install Linux system deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev \
+            libssl-dev libglib2.0-dev libgtk-3-dev dpkg file
+
+      - name: Install JS deps
+        run: npm ci
+
+      - name: Build signed bundles
+        shell: bash
+        run: npm run tauri -- build ${{ matrix.target != '' && format('--target {0}', matrix.target) || '' }}
+
+      - name: Stage release assets (fixed names)
+        shell: bash
+        run: |
+          set -eu
+          REL=dist-release
+          mkdir -p "$REL"
+          case "${{ matrix.rid }}" in
+            windows)
+              exe=$(find src-tauri/target/release/bundle/nsis -name '*-setup.exe' | head -1)
+              cp "$exe" "$REL/Velocity-Setup-x64.exe"
+              cp "$exe.sig" "$REL/Velocity-Setup-x64.exe.sig"
+              ;;
+            macos-arm64)
+              tgz=$(find src-tauri/target/aarch64-apple-darwin/release/bundle/macos -name '*.app.tar.gz' | head -1)
+              cp "$tgz"     "$REL/Velocity-macOS-arm64.app.tar.gz"
+              cp "$tgz.sig" "$REL/Velocity-macOS-arm64.app.tar.gz.sig"
+              dmg=$(find src-tauri/target/aarch64-apple-darwin/release/bundle/dmg -name '*.dmg' | head -1)
+              cp "$dmg" "$REL/Velocity-macOS-arm64.dmg"
+              ;;
+            macos-x64)
+              tgz=$(find src-tauri/target/x86_64-apple-darwin/release/bundle/macos -name '*.app.tar.gz' | head -1)
+              cp "$tgz"     "$REL/Velocity-macOS-x64.app.tar.gz"
+              cp "$tgz.sig" "$REL/Velocity-macOS-x64.app.tar.gz.sig"
+              dmg=$(find src-tauri/target/x86_64-apple-darwin/release/bundle/dmg -name '*.dmg' | head -1)
+              cp "$dmg" "$REL/Velocity-macOS-x64.dmg"
+              ;;
+            linux)
+              img=$(find src-tauri/target/release/bundle/appimage -name '*.AppImage' ! -name '*.sig' | head -1)
+              cp "$img"     "$REL/Velocity-Linux-x86_64.AppImage"
+              cp "$img.sig" "$REL/Velocity-Linux-x86_64.AppImage.sig"
+              ;;
+          esac
+          echo "--- staged ---"
+          ls -la "$REL"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: build-${{ matrix.rid }}
+          path: dist-release/*
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish to public repo
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-tags: true
+          fetch-depth: 0
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: _assets
+
+      # Idempotent overwrite: drop any prior release + git tag at $TAG on
+      # the public repo so this run can recreate it cleanly. Source repo
+      # (private) tag deletion is the caller's job before re-pushing, since
+      # this workflow's GH_TOKEN scopes only to Velocity-Public.
+      - name: Drop prior public release for overwrite
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.PUBLIC_REPO_TOKEN }}
+        run: |
+          set -eu
+          PUB_REPO="barusoup/Velocity-Public"
+          if [ -n "${{ github.event.inputs.version }}" ]; then
+            TAG="v${{ github.event.inputs.version }}"
+          else
+            TAG="${GITHUB_REF_NAME}"
+          fi
+          gh release delete "$TAG" --repo "$PUB_REPO" --yes --cleanup-tag 2>/dev/null || true
+
+      - name: Compose manifest + create release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.PUBLIC_REPO_TOKEN }}
+        run: |
+          set -eu
+          PUB_REPO="barusoup/Velocity-Public"
+          BASE="https://github.com/${PUB_REPO}/releases/latest/download"
+
+          if [ -n "${{ github.event.inputs.version }}" ]; then
+            TAG="v${{ github.event.inputs.version }}"
+          else
+            TAG="${GITHUB_REF_NAME}"
+          fi
+          VER="${TAG#v}"
+          PUB_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          NOTES=$(git tag -l --format='%(contents:subject)%0a%0a%(contents:body)' "$TAG" 2>/dev/null | tr -d '\000' | head -c 60000 || true)
+          if [ -z "$NOTES" ]; then NOTES="Velocity $VER"; fi
+
+          sig_of() { cat "$1" 2>/dev/null | tr -d '\r\n' || true; }
+          export VER PUB_DATE NOTES BASE
+          export WIN_SIG=$(sig_of "_assets/build-windows/Velocity-Setup-x64.exe.sig")
+          export MAC_A_SIG=$(sig_of "_assets/build-macos-arm64/Velocity-macOS-arm64.app.tar.gz.sig")
+          export MAC_X_SIG=$(sig_of "_assets/build-macos-x64/Velocity-macOS-x64.app.tar.gz.sig")
+          export LIN_SIG=$(sig_of "_assets/build-linux/Velocity-Linux-x86_64.AppImage.sig")
+
+          # node reads the values from env so JSON.stringify handles all
+          # escaping (release notes carry newlines/quotes; signatures are base64).
+          node <<'JS' > latest.json
+          const env = process.env;
+          const trim = (v) => (v || "").replace(/\r?\n/g, "");
+          const m = {
+            version: env.VER,
+            notes: env.NOTES,
+            pub_date: env.PUB_DATE,
+            platforms: {
+              "windows-x86_64": { signature: trim(env.WIN_SIG),  url: env.BASE + "/Velocity-Setup-x64.exe" },
+              "darwin-aarch64": { signature: trim(env.MAC_A_SIG), url: env.BASE + "/Velocity-macOS-arm64.app.tar.gz" },
+              "darwin-x86_64":  { signature: trim(env.MAC_X_SIG), url: env.BASE + "/Velocity-macOS-x64.app.tar.gz" },
+              "linux-x86_64":   { signature: trim(env.LIN_SIG),   url: env.BASE + "/Velocity-Linux-x86_64.AppImage" }
+            }
+          };
+          process.stdout.write(JSON.stringify(m, null, 2));
+          JS
+
+          echo "--- manifest ---"
+          cat latest.json
+
+          # Upload the manifest too so the app can always reach it at
+          # releases/latest/download/latest.json (future-proof across releases).
+          cp latest.json "_assets/build-windows/latest.json" 2>/dev/null || true
+
+          # The public repo must have at least one commit for gh release create
+          # to anchor the release tag. Initialize it with a README on the first
+          # run; subsequent runs skip this (the PUT 422s, file already exists).
+          printf '%s\n\n%s\n' '# Velocity' 'Public releases and issue tracker for the Velocity desktop music player.' | base64 -w0 > /tmp/readme_b64
+          gh api --method PUT "repos/${PUB_REPO}/contents/README.md" \
+            -f message="Initialize public repository" \
+            -f content="$(cat /tmp/readme_b64)" \
+            2>/dev/null || true
+          rm -f /tmp/readme_b64
+
+          # Attach every staged asset. `nullglob` collapses globs for
+          # platforms we didn't build this run, so `gh release create`
+          # doesn't error on missing directories.
+          shopt -s nullglob
+          ASSETS=(
+            _assets/build-windows/*
+            _assets/build-macos-arm64/*
+            _assets/build-macos-x64/*
+            _assets/build-linux/*
+          )
+          gh release create "$TAG" \
+            --repo "$PUB_REPO" \
+            --title "Velocity $VER" \
+            --notes "$NOTES" \
+            "${ASSETS[@]}"
+
+      - name: Verify
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.PUBLIC_REPO_TOKEN }}
+        run: |
+          TAG="${{ github.event.inputs.version && format('v{0}', github.event.inputs.version) || github.ref_name }}"
+          gh release view "$TAG" --repo barusoup/Velocity-Public --json tagName,assets --jq '{tag:.tagName, assets:[.assets[].name]}'

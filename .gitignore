@@ -1,0 +1,50 @@
+# Package / build outputs
+.pnpm-store/
+dist/
+node_modules/
+src-tauri/target/
+target/
+
+# Tauri generated schemas / capability files
+src-tauri/gen/
+
+# Logs
+*.log
+*.err.log
+nul
+
+# TypeScript incremental build cache
+*.tsbuildinfo
+
+# Environment / secrets
+.env
+.env.local
+.env.*.local
+!.env.example
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Website
+Website/
+
+# Editors / IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+*.iml
+
+# Local development artifacts
+.codex/
+.claude/
+.commandcode/
+*.lines.txt
+*.cjs
+ts_output.txt
+all_lines.txt
+print_lines.cjs
+show_line.cjs

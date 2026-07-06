@@ -1,0 +1,257 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link rel="preload" href="/splash-icon.png" as="image" fetchpriority="high" />
+    <style>
+      html, body, #root {
+        height: 100%;
+        margin: 0;
+        background: #000000;
+        color: #f5f5f5;
+        overflow: hidden;
+      }
+      .initial-loader-wrapper {
+        position: fixed;
+        top: 0;
+        left: 0;
+        width: 100vw;
+        height: 100vh;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        background: #000000;
+        color: #f5f5f5;
+        font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+        user-select: none;
+        -webkit-user-select: none;
+        z-index: 99999;
+        opacity: 0;
+        visibility: hidden;
+        pointer-events: none;
+        transition:
+          opacity 0.18s ease,
+          transform 0.5s cubic-bezier(0.25, 1, 0.5, 1),
+          visibility 0s linear 0.18s;
+      }
+      .initial-loader-wrapper.is-visible {
+        opacity: 1;
+        visibility: visible;
+        pointer-events: auto;
+        transition:
+          opacity 0.18s ease,
+          transform 0.5s cubic-bezier(0.25, 1, 0.5, 1),
+          visibility 0s;
+      }
+      .initial-loader-drag-region {
+        position: absolute;
+        top: 0;
+        left: 0;
+        width: 100%;
+        height: 56px;
+      }
+      .initial-loader-wrapper.fade-out {
+        opacity: 0;
+        transform: scale(1.04);
+        pointer-events: none;
+      }
+      .initial-loader-icon {
+        position: relative;
+        display: grid;
+        place-items: center;
+        width: 128px;
+        height: 128px;
+        margin-bottom: 32px;
+      }
+      .initial-loader-icon img {
+        display: block;
+        width: 128px;
+        height: 128px;
+      }
+      .initial-loader-spinner {
+        width: 28px;
+        height: 28px;
+        border: 2px solid rgba(255, 255, 255, 0.08);
+        border-radius: 50%;
+        border-top-color: #ffffff;
+        animation: initial-spin 0.8s linear infinite;
+      }
+      .initial-loader-caption {
+        margin-top: 18px;
+        min-height: 1.25rem;
+        font-size: 0.9rem;
+        color: rgba(245, 245, 245, 0.58);
+        letter-spacing: 0.01em;
+        opacity: 0;
+        transition: opacity 0.2s ease;
+      }
+      .initial-loader-caption.is-visible {
+        opacity: 1;
+      }
+      @keyframes initial-spin {
+        to { transform: rotate(360deg); }
+      }
+
+    </style>
+    <script>
+      const velocitySplashTips = [
+        "Press Space to play or pause.",
+        "Use ← and → to jump back or ahead 5 seconds.",
+        "Use ↑ and ↓ to change volume.",
+        "Press S to toggle shuffle.",
+        "Press L to change repeat mode.",
+        "Press Ctrl/Cmd + B to hide or show the sidebar.",
+        "Search can stay active while you browse results.",
+        "Search filters help narrow large result sets fast.",
+        "Imported tracks appear in your collection automatically.",
+        "Search is faster when you keep queries short and specific.",
+        "Use the back button to return to where you were in the app.",
+        "Search results can be opened without leaving your current flow.",
+        "If search feels slow, try narrowing the query first.",
+        "Filters are worth using for broad artist or song names.",
+        "Your sidebar can help you move between major sections quickly.",
+        "The player bar stays available while you browse other pages.",
+        "Imported tracks can show missing duration at first and fill it in later.",
+        "The app remembers your scroll position when you come back.",
+        "Use artist pages to discover related releases more naturally.",
+        "Use album pages when you want the intended track order.",
+        "If the sidebar gets in the way, hide it and reclaim space.",
+        "Volume keys are faster than reaching for the slider.",
+        "Short keyboard habits save the most time in daily use.",
+        "Try the sidebar first when you want a bigger navigation jump.",
+        "Album and artist pages are better than search for deeper listening sessions.",
+        "Small keyboard moves add up more than any one big gesture.",
+        "Velocity is the only music app that wont thank you for using it.",
+        "Velocity; we have the meats.",
+        "I don't get paid enough for this.",
+        "I wonder who wrote these tips...",
+        "Be sure to kiss the chef.",
+        "Does anyone read these?",
+        "Nooo don't turn me into a splash screen tip",
+        "I see you.",
+      ];
+
+      const velocitySplashTipState = {
+        order: [],
+        index: 0,
+        timer: null,
+      };
+
+      function velocityShuffleTips() {
+        const pool = velocitySplashTips.slice();
+        const order = [];
+        while (pool.length > 0) {
+          const nextIndex = Math.floor(Math.random() * pool.length);
+          order.push(pool.splice(nextIndex, 1)[0]);
+        }
+        return order;
+      }
+
+      function velocityShowNextSplashTip() {
+        const caption = document.getElementById("initial-loader-caption");
+        const loader = document.getElementById("initial-loader");
+        if (!caption || !loader || loader.dataset.hidden === "true") return;
+
+        if (velocitySplashTipState.order.length === 0) {
+          velocitySplashTipState.order = velocityShuffleTips();
+          velocitySplashTipState.index = 0;
+        }
+
+        if (velocitySplashTipState.index >= velocitySplashTipState.order.length) {
+          velocitySplashTipState.order = velocityShuffleTips();
+          velocitySplashTipState.index = 0;
+        }
+
+        caption.textContent = velocitySplashTipState.order[velocitySplashTipState.index];
+        caption.classList.add("is-visible");
+        velocitySplashTipState.index += 1;
+
+        window.clearTimeout(velocitySplashTipState.timer);
+        velocitySplashTipState.timer = window.setTimeout(velocityShowNextSplashTip, 5000);
+      }
+
+      window.__velocityShowSplashTimer = window.setTimeout(() => {
+        const loader = document.getElementById("initial-loader");
+        if (!loader || loader.dataset.hidden === "true") return;
+        loader.classList.add("is-visible");
+        velocityShowNextSplashTip();
+      }, 750);
+
+      window.__velocityHideSplash = () => {
+        const loader = document.getElementById("initial-loader");
+        if (!loader || loader.dataset.hidden === "true") return;
+        loader.dataset.hidden = "true";
+        window.clearTimeout(window.__velocityShowSplashTimer);
+        window.clearTimeout(velocitySplashTipState.timer);
+        loader.classList.add("fade-out");
+        window.clearTimeout(window.__velocitySplashRemoveTimer);
+        window.clearTimeout(window.__velocitySplashStatusTimer);
+        if (!loader.classList.contains("is-visible")) {
+          loader.remove();
+          return;
+        }
+        window.__velocitySplashRemoveTimer = window.setTimeout(() => {
+          loader.remove();
+        }, 500);
+      };
+
+      window.addEventListener("error", (event) => {
+        const div = document.createElement("div");
+        div.style.position = "fixed";
+        div.style.top = "0";
+        div.style.left = "0";
+        div.style.width = "100%";
+        div.style.height = "100%";
+        div.style.background = "red";
+        div.style.color = "white";
+        div.style.zIndex = "999999";
+        div.style.padding = "20px";
+        div.style.overflow = "auto";
+        div.style.fontFamily = "monospace";
+        div.innerText = `Runtime Error:\n${event.message}\nAt: ${event.filename}:${event.lineno}:${event.colno}\n\nStack:\n${event.error?.stack || "No stack trace"}`;
+        (document.body || document.documentElement).appendChild(div);
+      });
+
+      window.addEventListener("unhandledrejection", (event) => {
+        const div = document.createElement("div");
+        div.style.position = "fixed";
+        div.style.top = "0";
+        div.style.left = "0";
+        div.style.width = "100%";
+        div.style.height = "100%";
+        div.style.background = "darkred";
+        div.style.color = "white";
+        div.style.zIndex = "999999";
+        div.style.padding = "20px";
+        div.style.overflow = "auto";
+        div.style.fontFamily = "monospace";
+        div.innerText = `Unhandled Rejection:\n${event.reason}\n\nStack:\n${event.reason?.stack || "No stack trace"}`;
+        (document.body || document.documentElement).appendChild(div);
+      });
+    </script>
+    <title>Velocity</title>
+  </head>
+  <body>
+    <div id="root">
+    </div>
+      <div class="initial-loader-wrapper" id="initial-loader">
+      <div class="initial-loader-drag-region" data-tauri-drag-region></div>
+      <div class="initial-loader-icon" aria-label="Velocity">
+        <img
+          src="/splash-icon.png"
+          alt="Velocity"
+          width="128"
+          height="128"
+          draggable="false"
+          decoding="sync"
+          fetchpriority="high"
+        />
+      </div>
+      <div class="initial-loader-spinner"></div>
+      <div class="initial-loader-caption" id="initial-loader-caption" aria-live="polite"></div>
+    </div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

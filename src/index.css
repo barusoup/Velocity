@@ -1,0 +1,1342 @@
+@import "tailwindcss";
+
+html, body, #root {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+}
+
+html {
+  font-size: clamp(14px, calc(13.6px + 0.1875vw), 17px);
+  --app-height: 100dvh;
+}
+
+body {
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-feature-settings: "ss01", "cv02", "cv03";
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  background: #000000;
+  color: #f5f5f5;
+  overflow: hidden;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+#root {
+  --ui-sidebar-open: clamp(12.5rem, 17.5vw, 15rem);
+  --ui-sidebar-closed: clamp(3.25rem, 4.375vw, 4rem);
+  --ui-sidebar-rail: var(--ui-sidebar-closed);
+  --ui-topbar-height: clamp(3.25rem, 4.375vw, 4.25rem);
+  --ui-page-pad: clamp(1rem, 3.125vw, 2.75rem);
+  --ui-content-max: clamp(64rem, 93.75vw, 82rem);
+  --ui-player-max: clamp(56rem, 95vw, 90rem);
+  --ui-player-side: clamp(11rem, 17.1875vw, 15rem);
+  --ui-control: clamp(2.4rem, 3.4375vw, 3rem);
+  --ui-control-sm: clamp(2.2rem, 3.125vw, 2.75rem);
+  --ui-art-sm: clamp(3.2rem, 4.6875vw, 4rem);
+  --ui-art-row: clamp(3.25rem, 4.375vw, 4rem);
+  --ui-art-feature: clamp(5rem, 7.5vw, 6.5rem);
+  --ui-art-lg: clamp(10rem, 16.25vw, 14rem);
+  --ui-radius-panel: clamp(1rem, 2.1875vw, 1.75rem);
+  --ui-artist-hero: clamp(26.875rem, 36.71875vw, 34rem);
+  --ui-player-bottom: clamp(0.75rem, 1.5625vw, 1.5rem);
+  --ui-player-height: clamp(4.1rem, 5.9375vw, 5.4rem);
+}
+
+@media (max-width: 760px) {
+  #root {
+    --ui-sidebar-open: min(82vw, 17rem);
+    --ui-sidebar-closed: 0rem;
+    --ui-sidebar-rail: 3.5rem;
+    --ui-player-side: 0rem;
+    --ui-player-bottom: 0.5rem;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+*:focus-visible {
+  outline: none;
+}
+
+button {
+  font-family: inherit;
+}
+
+input {
+  font-family: inherit;
+  user-select: text;
+  -webkit-user-select: text;
+}
+
+textarea,
+[contenteditable="true"] {
+  user-select: text;
+  -webkit-user-select: text;
+}
+
+.nice-scroll::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+.nice-scroll::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.nice-scroll::-webkit-scrollbar-thumb {
+  background: #2a2a2a;
+  border-radius: 8px;
+  border: 2px solid #000000;
+}
+
+.nice-scroll::-webkit-scrollbar-thumb:hover {
+  background: #3a3a3a;
+}
+
+/* Webkit scrollbars draw tiny arrow buttons at the ENDS of the thumb
+   by default. They render as small light squares on the dark sidebar
+   palette and are unrelated to the rest of our custom thumb styling,
+   so suppress them everywhere `nice-scroll` is used. The corner
+   piece that fills the L-shaped gap between an X and Y scrollbar (in
+   places like Collection's tab strip) gets the same treatment so it
+   never reads as a stray swatch. */
+.nice-scroll::-webkit-scrollbar-button,
+.nice-scroll::-webkit-scrollbar-corner {
+  display: none;
+  width: 0;
+  height: 0;
+  background: transparent;
+}
+
+/* Playlist description textarea — same arrow-button suppression so the
+   auto-growing textarea never shows native scrollbar arrows, which would
+   look like stray raw-HTML buttons next to the description text. */
+.user-playlist-description-input::-webkit-scrollbar-button,
+.user-playlist-description-input::-webkit-scrollbar-corner {
+  display: none;
+  width: 0;
+  height: 0;
+  background: transparent;
+}
+
+/*
+ * Hidden scrollbar for the sidebar playlists section.
+ *
+ * The slim themed scrollbar from `.nice-scroll` reads as an unnecessary
+ * rail on this particular column — its dark thumb sits against an
+ * already-black sidebar background, so the visible state is just a
+ * gray line floating in a black panel. The list still scrolls (mouse
+ * wheel, touch, keyboard) but no thumb is ever rendered. Scoped to a
+ * dedicated class so the other 5+ uses of `.nice-scroll` (App.tsx main
+ * scrollport, QueuePanel, LyricsPage, CollectionPage, ArtistPage
+ * scrollport ancestor) keep their themed scrollbar.
+ *
+ * Firefox uses `scrollbar-width: none`; legacy Edge/IE uses
+ * `-ms-overflow-style: none`; WebKit/Blink uses `::-webkit-scrollbar
+ * { display: none }` — `width: 0` alone can leave a small visible
+ * sliver on some Chromium builds so `display: none` is the actually-
+ * effective way to suppress the scrollbar there.
+ */
+.sidebar-playlists-scroll {
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+
+.sidebar-playlists-scroll::-webkit-scrollbar {
+  display: none;
+}
+
+input[type="range"].slider {
+  -webkit-appearance: none;
+  appearance: none;
+  background: transparent;
+  cursor: pointer;
+}
+
+input[type="range"].slider::-webkit-slider-runnable-track {
+  height: 3px;
+  background: #333;
+  border-radius: 3px;
+}
+
+input[type="range"].slider::-moz-range-track {
+  height: 3px;
+  background: #333;
+  border-radius: 3px;
+}
+
+input[type="range"].slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 12px;
+  height: 12px;
+  background: #fff;
+  border-radius: 50%;
+  margin-top: -4.5px;
+  opacity: 0;
+  transition: opacity 0.15s ease;
+}
+
+input[type="range"].slider:hover::-webkit-slider-thumb {
+  opacity: 1;
+}
+
+input[type="range"].slider::-moz-range-thumb {
+  width: 12px;
+  height: 12px;
+  background: #fff;
+  border-radius: 50%;
+  border: none;
+  opacity: 0;
+  transition: opacity 0.15s ease;
+}
+
+input[type="range"].slider:hover::-moz-range-thumb {
+  opacity: 1;
+}
+
+input[type="range"].slider-volume {
+  -webkit-appearance: none;
+  appearance: none;
+  background: transparent;
+  cursor: pointer;
+  height: 6px;
+}
+
+input[type="range"].slider-volume::-webkit-slider-runnable-track {
+  height: 3px;
+  background: #333;
+  border-radius: 3px;
+}
+
+input[type="range"].slider-volume::-moz-range-track {
+  height: 3px;
+  background: #333;
+  border-radius: 3px;
+}
+
+input[type="range"].slider-volume::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 14px;
+  height: 14px;
+  background: #fff;
+  border-radius: 50%;
+  margin-top: -5.5px;
+  opacity: 1;
+  transition: none;
+}
+
+input[type="range"].slider-volume::-moz-range-thumb {
+  width: 14px;
+  height: 14px;
+  background: #fff;
+  border-radius: 50%;
+  border: none;
+  opacity: 1;
+  transition: none;
+}
+
+input[type="range"].slider-filled {
+  background: transparent;
+}
+
+/* Equalizer vertical band sliders */
+input[type="range"].slider-eq {
+  -webkit-appearance: none;
+  appearance: none;
+  background: transparent;
+  cursor: pointer;
+}
+
+input[type="range"].slider-eq::-webkit-slider-runnable-track {
+  width: 3px;
+  background: #333;
+  border-radius: 3px;
+}
+
+input[type="range"].slider-eq::-moz-range-track {
+  width: 3px;
+  background: #333;
+  border-radius: 3px;
+}
+
+input[type="range"].slider-eq::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 14px;
+  height: 14px;
+  background: #fff;
+  border-radius: 50%;
+  margin-left: -5.5px;
+}
+
+input[type="range"].slider-eq::-moz-range-thumb {
+  width: 14px;
+  height: 14px;
+  background: #fff;
+  border-radius: 50%;
+  border: none;
+}
+
+input[type="number"]::-webkit-outer-spin-button,
+input[type="number"]::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+
+.clamp-1 {
+  display: -webkit-box;
+  -webkit-line-clamp: 1;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.clamp-2 {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.search-session-pop {
+  animation: search-session-pop 620ms cubic-bezier(0.24, 0.9, 0.28, 1.12);
+}
+
+.sidebar-brand-button,
+.sidebar-brand-logo,
+.sidebar-brand-glyph {
+  will-change: opacity, transform, filter;
+}
+
+.sidebar-brand-button:not(.cursor-default):hover .sidebar-brand-logo,
+.sidebar-brand-button:not(.cursor-default):focus-visible .sidebar-brand-logo {
+  opacity: 0;
+  transform: scale(0.78) rotate(-3deg);
+  filter: blur(3px);
+}
+
+.sidebar-brand-button:not(.cursor-default):hover .sidebar-brand-glyph,
+.sidebar-brand-button:not(.cursor-default):focus-visible .sidebar-brand-glyph {
+  opacity: 1;
+  transform: scale(1) translateX(0);
+  filter: blur(0);
+}
+
+.sidebar-brand-glyph {
+  transform: scale(0.82) translateX(-3px);
+  filter: blur(3px);
+}
+
+@keyframes search-session-pop {
+  0% {
+    opacity: 0;
+    transform: translateY(8px) scale(0.88);
+  }
+  55% {
+    opacity: 1;
+    transform: translateY(0) scale(1.045);
+  }
+  78% {
+    transform: translateY(0) scale(0.985);
+  }
+  100% {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+.queue-panel {
+  transform-origin: bottom right;
+  will-change: transform, opacity;
+}
+
+.queue-track-row {
+  will-change: transform;
+}
+
+.queue-drag-overlay {
+  will-change: top, transform;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .queue-panel {
+    transition: none;
+  }
+
+  .queue-drag-overlay {
+    transition: none;
+  }
+
+  .player-bar-shell.player-bar-lyrics-hidden {
+    transition: none;
+  }
+}
+
+.player-bar-shell {
+  animation: player-bar-enter 380ms cubic-bezier(0.4, 0, 0.2, 1);
+  transform-origin: bottom center;
+  will-change: opacity, transform, filter;
+  transform: translate3d(0, 0, 0) scale(1);
+}
+
+/*
+ * Player bar hide/show on the lyrics page.
+ *
+ * Mirrors the search bar hide/show pattern: the transition is declared
+ * inline on the element (so it composes with the existing width
+ * transition), and the hidden state only overrides the endpoint
+ * transform/opacity. The player bar lives at the bottom of the viewport
+ * so it slides DOWN when hiding (opposite of the search bar which
+ * slides up).
+ *
+ * Visible-state transform is an explicit identity matrix (translate3d
+ * + scale) so Chromium interpolates smoothly against the hidden state's
+ * matching function list — see note 1 in the search bar comment block.
+ */
+.player-bar-shell.player-bar-lyrics-hidden {
+  opacity: 0;
+  transform: translate3d(0, 12px, 0) scale(0.97);
+  pointer-events: none;
+}
+
+/*
+ * Volume slider motion.
+ *
+ * Arrow keys (and any other non-drag volume change) update `player.volume`
+ * in one step, which previously caused the fill bar / thumb to snap to the
+ * new position. These classes turn on a short ease-out transition for
+ * both the fill `width` and the thumb `left` so a press of Up/Down reads
+ * as a quick, smooth nudge instead of two distinct positions.
+ *
+ * The class is only applied when the user is NOT actively dragging
+ * (dragVolume === null). During a drag, `applyLiveDrag` writes a fresh
+ * width/left on every mousemove and a CSS transition would let the
+ * slider lag the cursor by ~one transition-duration. Snapping during
+ * drag is the right behavior.
+ *
+ * The slider is hidden by default (volumeHover gates visibility), so
+ * the animation is only ever observed while hovering — matching the
+ * "if the slider is visible" condition from the request.
+ */
+.volume-fill-animating {
+  transition: width 200ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.volume-thumb-animating {
+  /* Use longhand so this rule's per-property values coexist with the
+     thumb's existing Tailwind `transition-opacity duration-150`
+     utilities — a `transition` shorthand here would reset
+     transition-property/duration/timing-function and the thumb's
+     hover‑in/out fade would snap instead of fade. */
+  transition-property: left, opacity;
+  transition-duration: 200ms, 150ms;
+  transition-timing-function: cubic-bezier(0.22, 1, 0.36, 1), ease;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .volume-fill-animating,
+  .volume-thumb-animating {
+    transition: none;
+  }
+}
+
+.lyrics-dialog {
+  animation: lyrics-dialog-enter 360ms cubic-bezier(0.2, 0.9, 0.28, 1.08);
+  transform-origin: center;
+  will-change: opacity, transform, filter;
+}
+
+/* Lyrics page styles */
+
+.lyrics-scroll-area {
+  scrollbar-width: thin;
+}
+
+/*
+ * `.lyrics-line` intentionally carries no `will-change` hint. The
+ * previous `will-change: transform, background-color` pushed the
+ * lyrics-line button onto its own GPU compositor layer even though
+ * neither property ever changed, which caused Chrome to fall back to
+ * grayscale font anti-aliasing in the layer and produced visible
+ * antialiasing seams between adjacent inline spans (some of the seams
+ * showed up as the "~translucent" effect users described, particularly
+ * at sub-pixel boundaries). Letting text render with the default
+ * composite path keeps sub-pixel AA on.
+ */
+
+.lyrics-line-active {
+  /* Removed box-shadow effect */
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .lyrics-line {
+    transition: none;
+  }
+
+  .lyrics-line-active {
+    transform: none;
+  }
+}
+
+@keyframes player-bar-enter {
+  0% {
+    opacity: 0;
+    transform: translateY(16px) scale(0.98);
+    filter: blur(6px);
+  }
+  100% {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+    filter: blur(0);
+  }
+}
+
+@keyframes lyrics-dialog-enter {
+  0% {
+    opacity: 0;
+    transform: translateY(18px) scale(0.985);
+    filter: blur(18px);
+  }
+  58% {
+    opacity: 1;
+    transform: translateY(-2px) scale(1.004);
+    filter: blur(0);
+  }
+  100% {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+    filter: blur(0);
+  }
+}
+
+/* Import dialog — the "Review N tracks" modal that finalizes local file
+   imports. Same family as `lyrics-dialog`: a soft ease-out that drops
+   the panel into place with a tiny translate + scale, with the
+   backdrop fading in independently. Both animations are tuned to be
+   barely perceptible — enough to feel smooth without drawing attention
+   away from the rows the user is about to edit. */
+.import-backdrop {
+  animation: import-backdrop-enter 200ms ease-out;
+}
+
+.import-dialog {
+  animation: import-dialog-enter 280ms cubic-bezier(0.16, 1, 0.3, 1);
+  transform-origin: center;
+  will-change: opacity, transform;
+}
+
+@keyframes import-backdrop-enter {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@keyframes import-dialog-enter {
+  0% {
+    opacity: 0;
+    transform: translateY(8px) scale(0.99);
+  }
+  100% {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+.page-content {
+  /*
+   * No `background` color here. Each page renders its own (opaque or
+   * semi-transparent) bg on the nearest container; pages that need a
+   * solid black backdrop rely on body's #000000 showing through.
+   *
+   * `isolation: isolate` creates a stacking context per page so any
+   * in-page overlays (e.g. z-indexed tint layers) don't leak across
+   * views.
+   *
+   * No `contain: paint`: `.page-content` was the actual "containing
+   * block" trap behind every failure of the LyricsPage audio visualizer.
+   * With `contain: paint` set, `.page-content` establishes itself as a
+   * containing block for absolutely- AND fixed-positioned descendants
+   * AND as a scrollport for sticky-positioned descendants (Chromium
+   * treats `contain: paint` like `overflow != visible` for sticky
+   * purposes). That meant:
+   *   - body-portal canvas at z-Index -1 → vanished ("tucked behind
+   *     the opaque backdrop", per user diagnosis);
+   *   - body-portal canvas at z=Index +1 → bleed-through text;
+   *   - inlined canvas with `position: sticky top-0 h-[100dvh]` →
+   *     would have stuck relative to `.page-content`'s box, drifting
+   *     out of view as the user scrolled.
+   * Removing the rule resets all three failure modes. `isolation:
+   * isolate` is preserved (stacking context, no leak) — only the
+   * containing-block / scrollport trap is gone. The visualizer is now
+   * inlined inside `.lyrics-page` and uses `position: sticky` to follow
+   * the App.tsx scrollport viewport directly. Perf cost: marginal —
+   * `contain: paint` was an opt-in hint, not a correctness requirement.
+   */
+  isolation: isolate;
+  animation: page-enter 180ms cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+/*
+ * Why `page-enter` only animates `opacity` and NOT `transform`:
+ *
+ * Earlier revisions animated a `translate3d(0, 10px, 0)` slide-in alongside
+ * the opacity fade. That `transform` keyframe is what trapped the
+ * LyricsPage audio visualizer's `position: fixed` canvas inside
+ * `.page-content`'s box instead of the viewport. The CSS containing-block
+ * spec establishes any element with a non-`none` `transform` (incl. an
+ * animation that produces a non-`none` interpolated value during its
+ * active phase, and `animation-fill-mode: both` keeps the element
+ * "transformed" through the post-animation hold) as a containing block
+ * for `position: fixed` descendants. With `.page-content` acting as that
+ * containing block, the canvas's `top: 50%` centered against
+ * `.page-content`'s full content height (rather than the viewport),
+ * the visualizer scrolled past as the user advanced through long tracks,
+ * and it never painted under the sidebar's column on the left — so the
+ * sidebar's translucent `bg-black/55` evaluated to opaque black against
+ * the body's `#000`. Animating `opacity` alone preserves the entrance
+ * fade without establishing the containing-block trap.
+ */
+@keyframes page-enter {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+.artist-page-slider {
+  display: flex;
+  width: 200%;
+  transform: translate3d(0, 0, 0);
+  transition: transform 260ms cubic-bezier(0.16, 1, 0.3, 1);
+  will-change: transform;
+}
+
+.artist-page-slider.is-open {
+  transform: translate3d(-50%, 0, 0);
+}
+
+/*
+ * Filter pill indicator: a sliding highlight behind the active filter button.
+ * The JS sets `width` and `left` inline; the carousel transition is applied
+ * via Tailwind classes in the component.
+ */
+.artist-filter-pill-indicator {
+  will-change: left, width;
+}
+
+.artist-pane {
+  opacity: 1;
+}
+
+.artist-page-slider.is-open .artist-pane:first-child,
+.artist-page-slider:not(.is-open) .artist-pane:last-child {
+  opacity: 0;
+  pointer-events: none;
+  overflow: clip;
+  height: 0;
+  min-height: 0;
+}
+
+/*
+ * Top Tracks expand/collapse:
+ * - The list reserves 5 explicit rows; auto-rows drive the extras' height.
+ * - `is-expanded` plays the *enter* animation on each extra row (top-down).
+ * - Collapse is deliberately different: rows keep their shape while they
+ *   dissolve, then the list closes as one clipped panel. This avoids the
+ *   compressed-text/artwork effect caused by shrinking every grid row.
+ */
+.artist-popular-list {
+  --popular-row-duration: 360ms;
+  --popular-row-stagger: 44ms;
+  display: grid;
+  grid-template-rows: repeat(5, minmax(56px, auto));
+  grid-auto-rows: 0;
+  overflow: hidden;
+  transition: grid-auto-rows var(--popular-row-duration)
+    cubic-bezier(0.32, 0.72, 0, 1);
+}
+
+.artist-popular-list.is-expanded {
+  grid-auto-rows: minmax(56px, auto);
+}
+
+.artist-popular-list.is-collapsing {
+  /* Freeze the exact rendered track sizes before closing. Switching to
+     intrinsic sizing here causes a one-frame outward bump on some artists. */
+  grid-template-rows: var(--popular-collapse-rows);
+  grid-auto-rows: 0;
+  animation: artist-popular-list-close 250ms cubic-bezier(0.4, 0, 0.2, 1)
+    both;
+  will-change: height;
+}
+
+.popular-track-row.is-extra {
+  opacity: 0;
+  pointer-events: none;
+}
+
+/* Entrance: each extra row eases up into place from below, top-down cascade. */
+.artist-popular-list.is-expanded .popular-track-row.is-extra {
+  pointer-events: auto;
+  animation: artist-popular-row-enter var(--popular-row-duration)
+    cubic-bezier(0.32, 0.72, 0, 1) both;
+  animation-delay: calc(var(--domino-index, 0) * var(--popular-row-stagger));
+}
+
+/* Exit follows the closing edge from bottom to top. The stagger is short
+   enough to read as one fluid motion rather than five separate animations. */
+.artist-popular-list.is-collapsing .popular-track-row.is-extra {
+  animation: artist-popular-row-dissolve 150ms cubic-bezier(0.4, 0, 1, 1)
+    both;
+  animation-delay: calc((4 - var(--domino-index, 0)) * 12ms);
+  pointer-events: none;
+}
+
+@keyframes artist-popular-row-enter {
+  0% {
+    opacity: 0;
+    transform: translate3d(0, 14px, 0);
+  }
+  60% {
+    opacity: 1;
+  }
+  100% {
+    opacity: 1;
+    transform: translate3d(0, 0, 0);
+  }
+}
+
+@keyframes artist-popular-list-close {
+  from {
+    height: var(--popular-expanded-height);
+  }
+  to {
+    height: var(--popular-collapsed-height);
+  }
+}
+
+@keyframes artist-popular-row-dissolve {
+  from {
+    opacity: 1;
+    transform: translate3d(0, 0, 0);
+  }
+  to {
+    opacity: 0;
+    transform: translate3d(0, -2px, 0);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .artist-popular-list.is-collapsing,
+  .artist-popular-list.is-collapsing .popular-track-row.is-extra {
+    animation-duration: 1ms;
+    animation-delay: 0ms;
+  }
+}
+
+.artist-menu-pop {
+  animation: artist-menu-pop 170ms cubic-bezier(0.16, 1, 0.3, 1);
+  transform-origin: top right;
+}
+
+.artist-discography-sticky {
+  opacity: 0;
+  transform: none;
+  transition: background-color 260ms cubic-bezier(0.22, 1, 0.36, 1);
+  will-change: auto;
+}
+
+.artist-discography-sticky.is-visible {
+  opacity: 1;
+  transform: none;
+}
+
+
+/*
+ * Search bar hide/show.
+ *
+ * `.topbar-search-group` is a pure layout container. It owns *no*
+ * animation properties — no `transform`, no `opacity`, no `filter`,
+ * no `translate`, no `will-change`. Only its class flips between
+ * `topbar-is-visible` and `topbar-is-hidden`.
+ *
+ * The actual show/hide animation lives on the three backdrop-blurred
+ * children themselves: the input, the filter button, and the history
+ * pill (`.topbar-history-controls`). They all consume the same
+ * `--topbar-sidebar-shift` custom property so the bar visibly shifts
+ * as one unit when the sidebar expands or collapses.
+ *
+ * Why animate the children and not the parent:
+ *
+ *     In Chromium and WebKit, ANY non-`none` value of `transform`,
+ *     `opacity`, `filter`, or non-`0` `translate` on an ancestor of an
+ *     element with `backdrop-filter` creates an isolated backing
+ *     surface for that branch of the tree. Descendants' `backdrop-filter`
+ *     then samples from inside that surface (their own painted pixels
+ *     plus the rest of the surface) rather than from the page behind.
+ *     That is what killed the buttons' frost through every earlier
+ *     attempt — we kept animating the parent `.topbar-search-group`
+ *     and the parent's interpolation values trapped the inner
+ *     `backdrop-blur-md` for the entire transition window. The same
+ *     trap fires for `translate: 0.5rem 0` whenever the sidebar opens,
+ *     even at rest.
+ *
+ *     An element does NOT trap its OWN backdrop-filter. The browser
+ *     snapshots the page backdrop, applies backdrop-blur to that
+ *     element, and only then applies the element's own
+ *     transform/opacity/translate. So animating the backdrop-blurred
+ *     element itself keeps the frost rendered correctly throughout
+ *     the animation, and the frost's apparent intensity tracks the
+ *     bar's transparency at every frame.
+ *
+ * Notes:
+ *
+* 1. `transform: translate3d(0, 0, 0) scale(1)` on the visible state is
+*    an explicit identity matrix, not `transform: none`. This is so
+*    Chromium's transform interpolation sees matching function lists
+*    in the visible and hidden states (both have `translate3d` and
+*    `scale`) and animates smoothly. Without the identity matrix the
+*    visible state would compute as `none` and the transition would
+*    snap instead of tween.
+*
+* 2. `translate: var(--topbar-sidebar-shift, 0px) 0` (or … `0) -50%`
+*    for the vertically-centered history pill) carries the sidebar
+*    shift via the L2 separator property. Geometric zeros are
+*    optimisable and don't trap backdrop-filter; only non-zero shifts
+*    would, but those are momentarily active (during transition).
+*
+* 3. Such momentary sidebar-shift traps are acceptable because the
+*    only backdrop-blurred elements affected are the input, filter
+*    button, and history pill — which each carry their OWN
+*    `translate` and so do not trap themselves. The parent group
+*    never has any animation property.
+*
+* 4. `.topbar-search-group.topbar-is-hidden * { pointer-events: none }`
+*    cascades the hit-disabling to all descendants (including the
+*    animated children) so invisible controls can't be clicked.
+*    `pointer-events` doesn't inherit per CSS spec.
+*
+* 5. The base `transform` rule below does NOT declare `opacity: 1`.
+*    In Tailwind v4 utilities live in the `utilities` layer whereas
+*    these custom rules are unlayered, so an explicit `opacity: 1`
+*    here would beat any `opacity-0` Tailwind utility — e.g. the
+*    `opacity-0` the JSX adds to `.topbar-history-controls` when
+*    `canBack && !canForward` — and the collapsed history pill
+*    would stay fully opaque at 0 width, showing as a thin frosted
+*    divider to the left of the input. Letting the browser fall
+*    through to the inherited initial value (`1`) keeps Tailwind
+*    utilities in charge of opacity.
+ */
+.topbar-search-group {
+  --topbar-search-height: 2.75rem;
+  width: min(22rem, calc(100% - 15rem));
+  height: var(--topbar-search-height);
+  min-height: var(--topbar-search-height);
+  max-height: var(--topbar-search-height);
+}
+
+/* Container query context for the search input wrapper. The icon's
+ * `transform-origin` uses `cqw` units to align with the input's
+ * center so both scale from the same point during the show/hide
+ * animation. */
+.topbar-search-input-wrapper {
+  container-type: inline-size;
+}
+
+/* Per-child rest state. The visible-state transform is an explicit
+ * identity matrix (see note 1 in the comment block). `opacity` is
+ * intentionally NOT declared here — see note 5. */
+.topbar-history-controls,
+.topbar-search-element {
+  transform-origin: center;
+  transform: translate3d(0, 0, 0) scale(1);
+}
+
+/* Search icon: positioned at `left-4` (1rem) inside the input
+ * wrapper. Its transform-origin is set to the input's horizontal
+ * center via container query units (`50cqw` = half the wrapper
+ * width, minus the icon's 1rem left offset) so the icon scales
+ * from the same point as the input during the show/hide animation. */
+.topbar-search-icon {
+  transform-origin: calc(50cqw - 1rem) center;
+  transform: translate3d(0, 0, 0) scale(1);
+}
+
+/* History pill: vertical centering via the L2 `translate` property
+ * (replaces the old `transform: translateY(-50%)`). Carries the
+ * sidebar-shift plus the show/hide animation. Also keeps the
+ * existing max-width / border-color transitions so the canBack /
+ * canForward toggling animation in JS still fades smoothly. */
+.topbar-history-controls {
+  translate: var(--topbar-sidebar-shift, 0) -50%;
+  transform-origin: right center;
+  transition-property: translate, opacity, transform, max-width, border-color;
+  transition-duration: 320ms, 320ms, 360ms, 100ms, 100ms;
+  transition-timing-function:
+    cubic-bezier(0.22, 1, 0.36, 1),
+    cubic-bezier(0.32, 0.72, 0, 1),
+    cubic-bezier(0.32, 0.72, 0, 1),
+    ease-out,
+    ease-out;
+}
+
+/* Search input + filter button (anything tagged with the
+ * `topbar-search-element` class). The transition-property list also
+ * encodes `color` / `background-color` / `border-color` so that
+ * Tailwind's existing `transition-colors` hover/focus utility on the
+ * input keeps working alongside our explicit translate / opacity /
+ * transform transitions. */
+.topbar-search-element {
+  translate: var(--topbar-sidebar-shift, 0) 0;
+  transition-property: translate, opacity, transform, color, background-color, border-color;
+  transition-duration: 320ms, 320ms, 360ms, 150ms, 150ms, 150ms;
+  transition-timing-function:
+    cubic-bezier(0.22, 1, 0.36, 1),
+    cubic-bezier(0.32, 0.72, 0, 1),
+    cubic-bezier(0.32, 0.72, 0, 1),
+    ease,
+    ease,
+    ease;
+}
+
+/* Search icon: carries the same translate (sidebar shift) as the
+ * input but drops color/bg/border transitions it doesn't use.
+ * Timing matches `.topbar-search-element` exactly. */
+.topbar-search-icon {
+  translate: var(--topbar-sidebar-shift, 0) 0;
+  transition-property: translate, opacity, transform;
+  transition-duration: 320ms, 320ms, 360ms;
+  transition-timing-function:
+    cubic-bezier(0.22, 1, 0.36, 1),
+    cubic-bezier(0.32, 0.72, 0, 1),
+    cubic-bezier(0.32, 0.72, 0, 1);
+}
+
+/* Show/hide the bar by animating its frosted children. Note this is
+ * NOT scoped to the parent — earlier attempts did exactly that and
+ * trapped the backdrop-blur, defeating the buttons' frost. */
+.topbar-search-group.topbar-is-hidden .topbar-history-controls,
+.topbar-search-group.topbar-is-hidden .topbar-search-element,
+.topbar-search-group.topbar-is-hidden .topbar-search-icon {
+  opacity: 0;
+  transform: translate3d(0, -6px, 0) scale(0.97);
+}
+
+/* `pointer-events` is not inherited per CSS spec, so propagate `none`
+ * to all descendants of the hidden group. Otherwise the invisible
+ * input / history pill / filter button could still receive clicks. */
+.topbar-search-group.topbar-is-hidden * {
+  pointer-events: none;
+}
+
+.topbar-search-natural-probe-frame {
+  position: absolute;
+  inset-inline: clamp(0.75rem, 1.8vw, 1.5rem);
+  top: 0;
+  height: 0;
+  visibility: hidden;
+  pointer-events: none;
+}
+
+.topbar-search-natural-probe {
+  width: min(22rem, calc(100% - 15rem));
+  height: 0;
+  overflow: hidden;
+}
+
+@media (min-width: 640px) {
+  .topbar-search-group,
+  .topbar-search-natural-probe {
+    width: min(clamp(28rem, 40.625vw, 34rem), calc(100% - 14rem));
+  }
+}
+
+.topbar-search-group input {
+  box-sizing: border-box;
+  height: var(--topbar-search-height);
+  min-height: var(--topbar-search-height);
+  max-height: var(--topbar-search-height);
+}
+
+[data-discography-layout-initializing] .topbar-search-group {
+  transition: none !important;
+}
+
+[data-discography-layout-initializing] .topbar-history-controls {
+  visibility: hidden;
+  pointer-events: none;
+  transition: none !important;
+}
+
+/* Hide the search bar (input + filter button) and the top-bar history nav
+   when the discography sticky header is active. The sticky header renders its
+   own history buttons in the right slot. */
+[data-discography-sticky] .topbar-search-group,
+[data-discography-sticky] .topbar-history-controls {
+  visibility: hidden;
+  pointer-events: none;
+  transition: none !important;
+}
+
+/* Let the sticky discography header receive clicks in the topbar zone. The
+   real window controls stay clickable because they have their own pointer
+   events and sit outside the reserved sticky-header nav slot. */
+[data-discography-sticky] .topbar-drag-region,
+[data-discography-layout-initializing] .topbar-drag-region {
+  pointer-events: none;
+}
+
+/* Constrain the release title width to force marquee overflow when the
+   album name is too long to fit between the play button and the nav. */
+[data-discography-title-width] .artist-discography-release-title {
+  width: var(--discography-title-width);
+  max-width: var(--discography-title-width);
+}
+
+.artist-discography-release {
+  animation: artist-domino-enter 460ms cubic-bezier(0.16, 1, 0.3, 1) both;
+  animation-delay: calc(var(--domino-index, 0) * 54ms);
+}
+
+.artist-discography-card {
+  animation: artist-domino-enter 430ms cubic-bezier(0.16, 1, 0.3, 1) both;
+  animation-delay: calc(var(--domino-index, 0) * 38ms);
+}
+
+.artist-discography-track {
+  animation: artist-track-domino-enter 340ms cubic-bezier(0.16, 1, 0.3, 1) both;
+  animation-delay: calc(120ms + (var(--domino-index, 0) * 28ms));
+}
+
+.playlist-card {
+  animation: playlist-card-enter 400ms cubic-bezier(0.16, 1, 0.3, 1) both;
+  animation-delay: calc(var(--domino-index, 0) * 42ms);
+}
+
+@keyframes playlist-card-enter {
+  from {
+    opacity: 0;
+    transform: translate3d(0, 16px, 0) scale(0.985);
+  }
+  to {
+    opacity: 1;
+    transform: translate3d(0, 0, 0) scale(1);
+  }
+}
+
+@keyframes artist-menu-pop {
+  from {
+    opacity: 0;
+    transform: translateY(-8px) scale(0.96);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+@keyframes artist-domino-enter {
+  from {
+    opacity: 0;
+    transform: translate3d(0, 18px, 0) scale(0.985);
+  }
+  to {
+    opacity: 1;
+    transform: translate3d(0, 0, 0) scale(1);
+  }
+}
+
+@keyframes artist-track-domino-enter {
+  from {
+    opacity: 0;
+    transform: translate3d(18px, 0, 0);
+  }
+  to {
+    opacity: 1;
+    transform: translate3d(0, 0, 0);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .page-content {
+    animation: none;
+    transform: none;
+  }
+
+  .artist-page-slider,
+  .artist-pane,
+  .artist-popular-list,
+  .artist-filter-pill-indicator {
+    transition: none;
+  }
+
+  .popular-track-row.is-extra {
+    opacity: 1 !important;
+    transform: none !important;
+    animation: none !important;
+  }
+
+  .artist-menu-pop,
+  .artist-discography-release,
+  .artist-discography-card,
+  .artist-discography-track,
+  .playlist-card {
+    animation: none;
+  }
+
+  .import-backdrop,
+  .import-dialog {
+    animation: none;
+  }
+
+  .artist-discography-sticky {
+    transition: none;
+    transform: none;
+  }
+
+.topbar-search-group,
+.topbar-search-element,
+.topbar-search-icon,
+.topbar-history-controls {
+  transition: none;
+}
+}
+
+/*
+ * Back-and-forth marquee for overflowing single-line text.
+ *
+ * The translate + edge-fade @keyframes are generated per instance from
+ * Marquee.tsx so that the actual per-side pause time stays constant
+ * even after the cycle stretches to fit a slower scroll. The static
+ * classes below only carry the animation properties shared by every
+ * instance (duration from --marquee-duration, timing, iteration) plus
+ * the gradient mask used by the edge fade.
+ *
+ * The translate keeps `will-change: transform` so the browser can hoist
+ * to a compositor layer for smoother scrolls; the mask relies on the
+ * --fade-strength custom property (registered below) being interpolable,
+ * which is a no-op fallback in browsers without @property support.
+ */
+@property --fade-left {
+  syntax: "<number>";
+  initial-value: 0;
+  inherits: false;
+}
+
+@property --fade-right {
+  syntax: "<number>";
+  initial-value: 0;
+  inherits: false;
+}
+
+/*
+ * Save button saved-state motion. The visible green disc stays the same
+ * pixel size as the unsaved plus-circle, then pops in with a compact black
+ * check and a small Spotify-like sparkle burst. The pop only plays when
+ * the JS toggles `.is-flashing` on the animated descendants (see the
+ * modifier rules below) so initial mounts of an already-saved item,
+ * unrelated parent re-renders, and external state syncs that flip
+ * isSaved false → true all keep the saved glyph static.
+ */
+
+.collection-save-disc {
+  --save-burst-scale: 1;
+  overflow: visible;
+  position: relative;
+  transform-origin: center;
+}
+
+.collection-save-disc[data-size="sm"] {
+  --save-burst-scale: 0.62;
+}
+
+.collection-save-check {
+  transform-origin: center;
+  /* Anchor the post-pop state at rest so the saved glyph stays exactly
+     where the keyframes leave it after `.is-flashing` is removed. */
+  opacity: 1;
+  transform: scale(1) rotate(0deg);
+}
+
+.collection-save-burst {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 3px;
+  height: 3px;
+  border-radius: 9999px;
+  pointer-events: none;
+  transform: translate(-50%, -50%) scale(calc(0.25 * var(--save-burst-scale)));
+  /* The burst keyframes are 0% and 100% opacity 0, so the resting state
+     should match — otherwise the sparkle dot would peek through whenever
+     the saved glyph is rendered without a recent click. */
+  opacity: 0;
+  box-shadow:
+    0 -18px 0 rgba(29, 215, 96, 0.95),
+    13px -13px 0 rgba(29, 215, 96, 0.75),
+    18px 0 0 rgba(29, 215, 96, 0.9),
+    13px 13px 0 rgba(29, 215, 96, 0.65),
+    0 18px 0 rgba(29, 215, 96, 0.85),
+    -13px 13px 0 rgba(29, 215, 96, 0.7),
+    -18px 0 0 rgba(29, 215, 96, 0.9),
+    -13px -13px 0 rgba(29, 215, 96, 0.65);
+}
+
+@keyframes collection-save-disc-pop {
+  0% {
+    opacity: 0.45;
+    transform: scale(0.64);
+  }
+  48% {
+    opacity: 1;
+    transform: scale(1.16);
+  }
+  72% {
+    transform: scale(0.96);
+  }
+  100% {
+    transform: scale(1);
+  }
+}
+
+@keyframes collection-save-check-pop {
+  0% {
+    opacity: 0;
+    transform: scale(0.35) rotate(-16deg);
+  }
+  42% {
+    opacity: 0;
+    transform: scale(0.35) rotate(-16deg);
+  }
+  72% {
+    opacity: 1;
+    transform: scale(1.14) rotate(0deg);
+  }
+  100% {
+    opacity: 1;
+    transform: scale(1) rotate(0deg);
+  }
+}
+
+@keyframes collection-save-burst {
+  0% {
+    opacity: 0;
+    transform: translate(-50%, -50%) scale(calc(0.2 * var(--save-burst-scale)));
+  }
+  18% {
+    opacity: 0.95;
+  }
+  100% {
+    opacity: 0;
+    transform: translate(-50%, -50%) scale(calc(1.05 * var(--save-burst-scale)));
+  }
+}
+
+/*
+ * Entrance pop is gated on a JS-applied `.is-flashing` modifier so it only
+ * plays when the user just clicked to save. The component sets this on
+ * unsaved → saved clicks and clears it ~460ms later (longest sub-animation
+ * is the 460ms burst); see src/components/SaveButton.tsx. Without the
+ * gate, every fresh mount of the saved subtree would replay the pop.
+ */
+
+.collection-save-disc.is-flashing {
+  animation: collection-save-disc-pop 360ms cubic-bezier(0.2, 0.9, 0.2, 1) both;
+}
+
+.collection-save-check.is-flashing {
+  animation: collection-save-check-pop 360ms cubic-bezier(0.18, 0.9, 0.25, 1.25) both;
+}
+
+.collection-save-burst.is-flashing {
+  animation: collection-save-burst 460ms ease-out both;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .collection-save-disc.is-flashing,
+  .collection-save-check.is-flashing,
+  .collection-save-burst.is-flashing {
+    animation: none;
+  }
+
+  .collection-save-burst {
+    display: none;
+  }
+}
+
+.marquee-translate {
+  animation-duration: var(--marquee-duration, 8s);
+  animation-timing-function: linear;
+  animation-iteration-count: infinite;
+  will-change: transform;
+}
+
+.marquee-mask {
+  --fade-left: 0;
+  --fade-right: 0;
+  mask-image: linear-gradient(
+    to right,
+    rgba(0, 0, 0, calc(1 - 0.45 * var(--fade-left))) 0,
+    rgba(0, 0, 0, 1) 12px,
+    rgba(0, 0, 0, 1) calc(100% - 12px),
+    rgba(0, 0, 0, calc(1 - 0.45 * var(--fade-right))) 100%
+  );
+  -webkit-mask-image: linear-gradient(
+    to right,
+    rgba(0, 0, 0, calc(1 - 0.45 * var(--fade-left))) 0,
+    rgba(0, 0, 0, 1) 12px,
+    rgba(0, 0, 0, 1) calc(100% - 12px),
+    rgba(0, 0, 0, calc(1 - 0.45 * var(--fade-right))) 100%
+  );
+  animation-duration: var(--marquee-duration, 8s);
+  animation-timing-function: linear;
+  animation-iteration-count: infinite;
+}
+
+.sidebar-item-enter {
+  animation: sidebar-item-enter 220ms cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+@keyframes sidebar-item-enter {
+  from {
+    opacity: 0;
+    transform: translateX(-6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .sidebar-item-enter {
+    animation: none;
+  }
+
+  /* The translate fades out via the Tailwind motion-reduce:animate-none
+     utility on the inner span; the mask has no such utility, so opt it
+     out explicitly here. */
+  .marquee-mask {
+    animation: none !important;
+    /* No fade at all when reduced motion is preferred. */
+    --fade-left: 0;
+    --fade-right: 0;
+  }
+}
+
+/* Collection tab carousel — snap indicator to final position when
+   reduced motion is preferred instead of sliding. */
+@media (prefers-reduced-motion: reduce) {
+  .collection-page [aria-pressed] {
+    transition: none;
+  }
+  .collection-page .absolute {
+    transition: none;
+  }
+}
