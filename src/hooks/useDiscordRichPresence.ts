@@ -22,7 +22,8 @@ import {
   isSupersededQueuedSync,
   type QueuedPresenceSync,
 } from "../discord-presence/sync-queue";
-import { usePlayer } from "../player";
+import { getPlayerProgress } from "../store/playerUiStore";
+import { usePlayerState } from "../player";
 import { useSetting } from "../settings";
 import {
   needsYtmCoverFallback,
@@ -66,7 +67,7 @@ function applyPresenceEffects(
  */
 export function useDiscordRichPresence(): void {
   const enabled = useSetting("discordRichPresence");
-  const player = usePlayer();
+  const player = usePlayerState();
   const engineStateRef = useRef(createPresenceEngineState());
   const retryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const confirmBurstTimersRef = useRef<ReturnType<typeof setTimeout>[]>([]);
@@ -97,7 +98,7 @@ export function useDiscordRichPresence(): void {
     track: player.currentTrack,
     isPlaying: player.isPlaying,
     isBuffering: player.isBuffering,
-    progress: player.progress,
+    progress: getPlayerProgress(),
     duration: player.duration,
     seekRevision: player.seekRevision,
     uploadCoverCache: uploadCoverCacheRef.current,
@@ -323,10 +324,19 @@ export function useDiscordRichPresence(): void {
     player.currentTrack,
     player.isPlaying,
     player.isBuffering,
-    player.progress,
     player.seekRevision,
     player.duration,
   ]);
+
+  // Sample progress on a coarse interval while playing — avoids ~60 Hz
+  // context/store subscriptions for a feature that only needs ~1–5 s accuracy.
+  useEffect(() => {
+    if (!enabled || !player.isPlaying) return;
+    const timer = window.setInterval(() => {
+      dispatch(reducePresencePlayerUpdate);
+    }, 5000);
+    return () => window.clearInterval(timer);
+  }, [enabled, player.isPlaying, player.currentTrack?.id]);
 
   useEffect(() => () => {
     cancelConfirmBurst();

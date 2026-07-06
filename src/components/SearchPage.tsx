@@ -1,10 +1,21 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { LoaderCircle, Pause, Play, Search as SearchIcon } from "lucide-react";
 import { searchMusic, peekSearchMusic, getSyncedLyrics } from "../api";
-import { usePlayer } from "../player";
-import { useCollection, type SavedAlbum, type SavedArtist } from "../collection";
+import { usePlayerActions } from "../player";
+import { useContextTrackTarget } from "../hooks/useContextTrackTarget";
+import { useSearchItemPlaybackState } from "../hooks/usePlayerSelectors";
+import { VirtualList } from "./VirtualList";
+import { type SavedAlbum, type SavedArtist } from "../collection";
+import {
+  useIsAlbumSaved,
+  useIsArtistSaved,
+  useIsSongSaved,
+  useToggleAlbumSave,
+  useToggleArtistSave,
+  useToggleTrackSave,
+} from "../hooks/useCollectionSelectors";
 import type { MediaTrack, SearchItem, SearchResponse } from "../types";
-import { ArtworkImage, encodeTrackForContextMenu, getArtworkRoundedClass } from "./Shared";
+import { ArtworkImage, getArtworkRoundedClass } from "./Shared";
 import { SaveButton } from "./SaveButton";
 import type { View } from "./Sidebar";
 import { DEFAULT_SEARCH_FILTERS, type SearchFilters, type SearchSort } from "./SearchFilters";
@@ -12,7 +23,6 @@ import {
   ErrorPanel,
   getPlayHandler,
   getSearchItemTitleView,
-  isItemPlaying,
   LoadingPanel,
   SearchItemMeta,
   toTrack,
@@ -199,10 +209,13 @@ export function SearchPage({
 
       {filteredResults.length > 0 && (
         <section className="mb-[clamp(2rem,3.125vw,3.25rem)]">
-          <div className="space-y-1">
-            {filteredResults.map((item) => (
+          <VirtualList
+            items={filteredResults}
+            estimateSize={64}
+            getItemKey={(item) => item.id}
+            className="space-y-1"
+            renderItem={(item) => (
               <SearchResultRow
-                key={item.id}
                 item={item}
                 onOpen={() => onOpenItem(item)}
                 onNavigate={onNavigate}
@@ -212,8 +225,8 @@ export function SearchPage({
                     : getPlayHandler(item, onPlayTrack, onPlayMany)
                 }
               />
-            ))}
-          </div>
+            )}
+          />
         </section>
       )}
 
@@ -274,19 +287,20 @@ function TopResultBlock({
 }) {
   const rounded = getArtworkRoundedClass(item.kind === "artist" ? "circle" : "square");
   const titleView = getSearchItemTitleView(item);
-  const collection = useCollection();
-
-  const { currentTrack, isPlaying, isBuffering, togglePlay, queueOrigin } = usePlayer();
-  const active = isItemPlaying(item, currentTrack, isPlaying, queueOrigin);
-  const currentlyPlaying = active && isPlaying;
-  const bufferingActive = active && isBuffering;
-
-  const contextTrack = useMemo(() => {
-    if (item.kind !== "song") return null;
-    const track = toTrack(item);
-    if (!track) return null;
-    return encodeTrackForContextMenu(track);
-  }, [item]);
+  const { togglePlay } = usePlayerActions();
+  const { active, playingActive: currentlyPlaying, bufferingActive } =
+    useSearchItemPlaybackState(item);
+  const contextTrack = useMemo(() => (item.kind === "song" ? toTrack(item) : null), [item]);
+  const contextTarget = useContextTrackTarget(
+    contextTrack ?? {
+      id: item.id,
+      title: item.title,
+      artist: item.artist ?? "",
+      album: item.subtitle ?? null,
+      source: "stream",
+    },
+    Boolean(contextTrack),
+  );
 
   const contextAlbum = useMemo(() => {
     if (item.kind !== "album") return null;
@@ -308,12 +322,7 @@ function TopResultBlock({
   return (
     <div
       className="rounded-2xl bg-neutral-900/70 p-[clamp(1rem,1.5625vw,1.25rem)]"
-      {...(contextTrack
-        ? {
-            "data-song-context-target": "true",
-            "data-track": contextTrack,
-          }
-        : contextAlbum
+      {...(contextTrack ? contextTarget : contextAlbum
         ? {
             "data-album-context-target": "true",
             "data-album": contextAlbum,
@@ -364,7 +373,6 @@ function TopResultBlock({
               )}
             </div>
             <SearchItemSaveButtons
-              collection={collection}
               saveTrack={saveTrack}
               savedAlbum={savedAlbum}
               savedArtist={savedArtist}
@@ -413,19 +421,20 @@ function SearchResultRow({
 }) {
   const rounded = getArtworkRoundedClass(item.kind === "artist" ? "circle" : "square");
   const titleView = getSearchItemTitleView(item);
-  const collection = useCollection();
-
-  const { currentTrack, isPlaying, isBuffering, togglePlay, queueOrigin } = usePlayer();
-  const active = isItemPlaying(item, currentTrack, isPlaying, queueOrigin);
-  const currentlyPlaying = active && isPlaying;
-  const bufferingActive = active && isBuffering;
-
-  const contextTrack = useMemo(() => {
-    if (item.kind !== "song") return null;
-    const track = toTrack(item);
-    if (!track) return null;
-    return encodeTrackForContextMenu(track);
-  }, [item]);
+  const { togglePlay } = usePlayerActions();
+  const { active, playingActive: currentlyPlaying, bufferingActive } =
+    useSearchItemPlaybackState(item);
+  const contextTrack = useMemo(() => (item.kind === "song" ? toTrack(item) : null), [item]);
+  const contextTarget = useContextTrackTarget(
+    contextTrack ?? {
+      id: item.id,
+      title: item.title,
+      artist: item.artist ?? "",
+      album: item.subtitle ?? null,
+      source: "stream",
+    },
+    Boolean(contextTrack),
+  );
 
   const contextAlbum = useMemo(() => {
     if (item.kind !== "album") return null;
@@ -456,12 +465,7 @@ function SearchResultRow({
           onOpen();
         }
       }}
-      {...(contextTrack
-        ? {
-            "data-song-context-target": "true",
-            "data-track": contextTrack,
-          }
-        : contextAlbum
+      {...(contextTrack ? contextTarget : contextAlbum
         ? {
             "data-album-context-target": "true",
             "data-album": contextAlbum,
@@ -502,7 +506,6 @@ function SearchResultRow({
       </div>
 
       <SearchItemSaveButtons
-        collection={collection}
         saveTrack={saveTrack}
         savedAlbum={savedAlbum}
         savedArtist={savedArtist}
@@ -535,14 +538,12 @@ function SearchResultRow({
 }
 
 function SearchItemSaveButtons({
-  collection,
   saveTrack,
   savedAlbum,
   savedArtist,
   hoverReveal = false,
   titleInline = false,
 }: {
-  collection: ReturnType<typeof useCollection>;
   saveTrack: MediaTrack | null;
   savedAlbum: SavedAlbum | null;
   savedArtist: SavedArtist | null;
@@ -550,6 +551,27 @@ function SearchItemSaveButtons({
   /** Top-result title row: keep the icon vertically centered on the name line. */
   titleInline?: boolean;
 }) {
+  const trackSaved = useIsSongSaved(
+    saveTrack?.id ?? "",
+    saveTrack?.videoId,
+  );
+  const toggleTrackSave = useToggleTrackSave(
+    saveTrack ?? {
+      id: "",
+      title: "",
+      artist: "",
+      source: "stream",
+    },
+  );
+  const albumSaved = useIsAlbumSaved(savedAlbum?.browseId);
+  const toggleAlbumSave = useToggleAlbumSave(
+    savedAlbum ?? { browseId: "", title: "", subtitle: "" },
+  );
+  const artistSaved = useIsArtistSaved(savedArtist?.browseId);
+  const toggleArtistSave = useToggleArtistSave(
+    savedArtist ?? { browseId: "", title: "" },
+  );
+
   const revealClass = hoverReveal
     ? "shrink-0 invisible group-hover:visible opacity-0 group-hover:opacity-100 transition-all"
     : titleInline
@@ -562,14 +584,10 @@ function SearchItemSaveButtons({
       {saveTrack && saveTrack.source !== "upload" && (
         <div className={revealClass} onClick={(event) => event.stopPropagation()}>
           <SaveButton
-            isSaved={collection.isSongSaved(saveTrack.id, saveTrack.videoId)}
+            isSaved={trackSaved}
             size={buttonSize}
-            onToggle={() => collection.toggleSong(saveTrack)}
-            ariaLabel={
-              collection.isSongSaved(saveTrack.id, saveTrack.videoId)
-                ? "Remove from collection"
-                : "Save to collection"
-            }
+            onToggle={toggleTrackSave}
+            ariaLabel={trackSaved ? "Remove from collection" : "Save to collection"}
           />
         </div>
       )}
@@ -577,14 +595,10 @@ function SearchItemSaveButtons({
       {savedAlbum && (
         <div className={revealClass} onClick={(event) => event.stopPropagation()}>
           <SaveButton
-            isSaved={collection.isAlbumSaved(savedAlbum.browseId)}
+            isSaved={albumSaved}
             size={buttonSize}
-            onToggle={() => collection.toggleAlbum(savedAlbum)}
-            ariaLabel={
-              collection.isAlbumSaved(savedAlbum.browseId)
-                ? "Remove from collection"
-                : "Save album to collection"
-            }
+            onToggle={toggleAlbumSave}
+            ariaLabel={albumSaved ? "Remove from collection" : "Save album to collection"}
           />
         </div>
       )}
@@ -592,14 +606,10 @@ function SearchItemSaveButtons({
       {savedArtist && (
         <div className={revealClass} onClick={(event) => event.stopPropagation()}>
           <SaveButton
-            isSaved={collection.isArtistSaved(savedArtist.browseId)}
+            isSaved={artistSaved}
             size={buttonSize}
-            onToggle={() => collection.toggleArtist(savedArtist)}
-            ariaLabel={
-              collection.isArtistSaved(savedArtist.browseId)
-                ? "Remove from collection"
-                : "Save artist to collection"
-            }
+            onToggle={toggleArtistSave}
+            ariaLabel={artistSaved ? "Remove from collection" : "Save artist to collection"}
           />
         </div>
       )}

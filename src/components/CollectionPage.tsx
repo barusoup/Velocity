@@ -28,14 +28,18 @@ import {
   Upload,
   X,
 } from "lucide-react";
-import { usePlayer } from "../player";
-import { useCollection } from "../collection";
+import { usePlayer, usePlayerActions } from "../player";
+import { useContextTrackTarget } from "../hooks/useContextTrackTarget";
+import { useTrackPlaybackState } from "../hooks/usePlayerSelectors";
+import { VirtualList } from "./VirtualList";
+import { useCollectionActions, useCollectionData } from "../collection";
+import { useIsTrackSaved, useToggleTrackSave } from "../hooks/useCollectionSelectors";
 import { getArtistDetail, getEntityDetail, importTracks, updateImportedTrackMetadata, extractFileMetadata } from "../api";
 import {
   resolveTrackAlbumMetadata,
   resolveTrackMetadata,
 } from "../utils/track-metadata-backfill";
-import { formatDuration, formatPlayCount, isSameSongTrack, trimExtension } from "../utils/media";
+import { formatDuration, formatPlayCount, trimExtension } from "../utils/media";
 import {
   displayAlbumName,
   enrichUploadMetadataFromYtm,
@@ -150,7 +154,7 @@ const AUDIO_ACCEPT = [
 let _lastCollectionTab: CollectionTab | null = null;
 
 export function CollectionPage(props: CollectionPageProps) {
-  const collection = useCollection();
+  const { savedSongs, savedAlbums, savedArtists } = useCollectionData();
   const [tab, setTab] = useState<CollectionTab>(
     props.initialTab ?? _lastCollectionTab ?? "albums",
   );
@@ -453,19 +457,19 @@ export function CollectionPage(props: CollectionPageProps) {
 
       {tab === "albums" && (
         <SavedAlbumsGrid
-          albums={collection.savedAlbums}
+          albums={savedAlbums}
           onNavigate={props.onNavigate}
         />
       )}
       {tab === "songs" && (
         <SavedSongsList
-          songs={collection.savedSongs}
+          songs={savedSongs}
           onNavigate={props.onNavigate}
         />
       )}
       {tab === "artists" && (
         <SavedArtistsGrid
-          artists={collection.savedArtists}
+          artists={savedArtists}
           onNavigate={props.onNavigate}
         />
       )}
@@ -817,7 +821,7 @@ function SavedSongsList({
   songs: MediaTrack[];
   onNavigate: (view: View) => void;
 }) {
-  const collection = useCollection();
+  const { updateSongMetadata } = useCollectionActions();
   const player = usePlayer();
   const viewMode = useSetting("viewModeCollectionSongs");
   const [viewMenuOpen, setViewMenuOpen] = useState(false);
@@ -890,7 +894,7 @@ function SavedSongsList({
             };
             if (Object.keys(merged).length === 0) continue;
 
-            collection.updateSongMetadata(track.id, merged);
+            updateSongMetadata(track.id, merged);
             anyFetched = true;
           } catch {
             // transient — retry
@@ -907,7 +911,7 @@ function SavedSongsList({
     void backfill();
 
     return () => controller.abort();
-  }, [songs, collection]);
+  }, [songs, updateSongMetadata]);
 
   if (songs.length === 0) {
     return (
@@ -976,21 +980,25 @@ function SavedSongsList({
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="8.5" /><path d="M12 8.3v4.2" /></svg>
         </div>
       </div>
-      {songs.map((track, index) => (
-        <CollectionSongRow
-          key={track.id}
-          track={track}
-          index={index}
-          compact={viewMode === "compact"}
-          onPlay={() => {
-            const playable = songs.map((song) =>
-              song.kind === "video" ? { ...song, kind: "song" as const } : song,
-            );
-            void player.playMany(playable, index);
-          }}
-          onNavigate={onNavigate}
-        />
-      ))}
+      <VirtualList
+        items={songs}
+        estimateSize={viewMode === "compact" ? 44 : 56}
+        getItemKey={(track) => track.id}
+        renderItem={(track, index) => (
+          <CollectionSongRow
+            track={track}
+            index={index}
+            compact={viewMode === "compact"}
+            onPlay={() => {
+              const playable = songs.map((song) =>
+                song.kind === "video" ? { ...song, kind: "song" as const } : song,
+              );
+              void player.playMany(playable, index);
+            }}
+            onNavigate={onNavigate}
+          />
+        )}
+      />
     </div>
   );
 }
@@ -1100,16 +1108,20 @@ function LocalUploadsList({
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="8.5" /><path d="M12 8.3v4.2" /></svg>
         </div>
       </div>
-      {tracks.map((track, index) => (
-        <LocalTrackRow
-          key={track.id}
-          track={track}
-          index={index}
-          compact={viewMode === "compact"}
-          onPlay={() => onPlayTrack(track)}
-          onNavigate={onNavigate}
-        />
-      ))}
+      <VirtualList
+        items={tracks}
+        estimateSize={viewMode === "compact" ? 44 : 56}
+        getItemKey={(track) => track.id}
+        renderItem={(track, index) => (
+          <LocalTrackRow
+            track={track}
+            index={index}
+            compact={viewMode === "compact"}
+            onPlay={() => onPlayTrack(track)}
+            onNavigate={onNavigate}
+          />
+        )}
+      />
     </div>
   );
 }
@@ -1133,10 +1145,9 @@ function CollectionRowShell({
   compact?: boolean;
   index?: number;
 }) {
-  const { currentTrack, isPlaying, isBuffering, togglePlay } = usePlayer();
-  const active = isSameSongTrack(currentTrack, track);
-  const playingActive = active && isPlaying;
-  const bufferingActive = active && isBuffering;
+  const { togglePlay } = usePlayerActions();
+  const { active, playingActive, bufferingActive } = useTrackPlaybackState(track);
+  const contextTarget = useContextTrackTarget(track, Boolean(withContextTarget));
 
   const directAlbumBrowseId = getDirectAlbumBrowseId(track);
   const albumLabel = displayAlbumName(track.album);
@@ -1190,9 +1201,7 @@ function CollectionRowShell({
 
   return (
     <div
-      data-song-context-target={withContextTarget ? "true" : undefined}
-      data-track={withContextTarget ? JSON.stringify(stripTrackForContextMenu(track)) : undefined}
-      data-track-source={withContextTarget ? (track.source ?? "stream") : undefined}
+      {...contextTarget}
       role="row"
       className={cn(
         "collection-row group grid cursor-pointer items-center gap-3 rounded-lg px-3 text-sm hover:bg-neutral-900",
@@ -1402,7 +1411,8 @@ function CollectionSongRow({
   compact?: boolean;
   index: number;
 }) {
-  const collection = useCollection();
+  const isSaved = useIsTrackSaved(track);
+  const toggleSave = useToggleTrackSave(track);
   return (
     <CollectionRowShell
       track={track}
@@ -1411,8 +1421,8 @@ function CollectionSongRow({
       withContextTarget
       compact={compact}
       index={index}
-      isSaved={collection.isTrackSaved(track)}
-      onToggleSave={() => collection.toggleSong(track)}
+      isSaved={isSaved}
+      onToggleSave={toggleSave}
     />
   );
 }
@@ -1430,7 +1440,7 @@ function LocalTrackRow({
   compact?: boolean;
   index?: number;
 }) {
-  const collection = useCollection();
+  const isSaved = useIsTrackSaved(track);
   return (
     <CollectionRowShell
       track={track}
@@ -1439,21 +1449,9 @@ function LocalTrackRow({
       withContextTarget
       compact={compact}
       index={index}
-      isSaved={collection.isTrackSaved(track)}
+      isSaved={isSaved}
     />
   );
-}
-
-// Strip large fields from a track before serializing into a data-attribute
-// for the right-click context menu. We never need audioSrc, filePath, or
-// _labelOrigin (internal queue metadata) in the menu itself. Cover is
-// kept so that "Add to queue" shows the correct artwork.
-function stripTrackForContextMenu(track: MediaTrack) {
-  const { filePath: _filePath, audioSrc: _audioSrc, _labelOrigin: _lo, ...rest } = track;
-  void _filePath;
-  void _audioSrc;
-  void _lo;
-  return rest;
 }
 
 function CollectionEmpty({

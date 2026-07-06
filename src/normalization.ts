@@ -13,6 +13,8 @@ const TRUE_PEAK_CEILING_DB = -1;
 const MAX_GAIN_DB = 12;
 const MIN_GAIN_DB = -24;
 const LOUDNESS_ANALYSIS_VERSION = 2;
+/** Cap in-memory + persisted loudness entries so long sessions don't grow without bound. */
+export const LOUDNESS_CACHE_MAX_ENTRIES = 1_000;
 const NORMALIZATION_DEADBAND_DB = 1;
 const SOFT_ATTENUATION_RATIO = 0.75;
 
@@ -43,9 +45,16 @@ function loadCache(): Record<string, LoudnessData> {
   return cache;
 }
 
+function trimLoudnessCache(cache: Record<string, LoudnessData>): Record<string, LoudnessData> {
+  const entries = Object.entries(cache);
+  if (entries.length <= LOUDNESS_CACHE_MAX_ENTRIES) return cache;
+  return Object.fromEntries(entries.slice(-LOUDNESS_CACHE_MAX_ENTRIES));
+}
+
 function saveCache(cache: Record<string, LoudnessData>): void {
-  _loudnessCache = cache;
-  setItem(LOUDNESS_CACHE_KEY, JSON.stringify(cache));
+  const trimmed = trimLoudnessCache(cache);
+  _loudnessCache = trimmed;
+  setItem(LOUDNESS_CACHE_KEY, JSON.stringify(trimmed));
 }
 
 export function getCachedLoudness(trackId: string): LoudnessData | null {

@@ -467,61 +467,65 @@ export function useArtistCover(artistBrowseId: string | null) {
 }
 
 export function useTrackAccents(tracks: { cover?: string | null }[]) {
+  const tracksKey = tracks.map((track) => track.cover ?? "").join("\0");
   const [colors, setColors] = useState<(RgbColor | null)[]>(() =>
-    tracks.map((t) => peekArtworkAccent(t.cover ?? null)),
+    tracks.map((track) => peekArtworkAccent(track.cover ?? null)),
   );
 
   useEffect(() => {
     let cancelled = false;
+    const initial = tracks.map((track) => peekArtworkAccent(track.cover ?? null));
+    setColors(initial);
 
-    setColors(tracks.map((t) => peekArtworkAccent(t.cover ?? null)));
+    const pending = tracks
+      .map((track, index) => ({ track, index }))
+      .filter(({ track }) => {
+        const cover = track.cover;
+        return Boolean(cover && !peekArtworkAccent(cover));
+      });
 
-    tracks.map((t, i) => {
-      const cover = t.cover;
-      if (!cover || peekArtworkAccent(cover)) return null;
+    if (pending.length === 0) return () => {
+      cancelled = true;
+    };
 
-      const source = cover.startsWith("//") ? `https:${cover}` : cover;
+    void Promise.all(
+      pending.map(async ({ track, index }) => {
+        const cover = track.cover;
+        if (!cover) return { index, color: null as RgbColor | null };
 
-    if (
-      !source.startsWith("asset://") &&
-      !source.startsWith("blob:") &&
-      !source.startsWith("data:")
-    ) {
-        cacheArtwork(source)
-          .then((filePath) => {
-            if (!cancelled) {
-              return extractInterestingArtworkColor(convertFileSrc(filePath));
-            }
-          })
-          .then((color) => {
-            if (!cancelled && color) {
-              setColors((prev) => {
-                const next = [...prev];
-                next[i] = color;
-                return next;
-              });
-            }
-          })
-          .catch(() => {});
-      } else {
-        extractInterestingArtworkColor(source)
-          .then((color) => {
-            if (!cancelled) {
-              setColors((prev) => {
-                const next = [...prev];
-                next[i] = color;
-                return next;
-              });
-            }
-          })
-          .catch(() => {});
-      }
+        const source = cover.startsWith("//") ? `https:${cover}` : cover;
+        try {
+          if (
+            !source.startsWith("asset://") &&
+            !source.startsWith("blob:") &&
+            !source.startsWith("data:")
+          ) {
+            const filePath = await cacheArtwork(source);
+            if (cancelled) return { index, color: null };
+            const color = await extractInterestingArtworkColor(convertFileSrc(filePath));
+            return { index, color: color ?? null };
+          }
+          const color = await extractInterestingArtworkColor(source);
+          return { index, color: color ?? null };
+        } catch {
+          return { index, color: null };
+        }
+      }),
+    ).then((resolved) => {
+      if (cancelled) return;
+      setColors((prev) => {
+        const next = [...prev];
+        for (const { index, color } of resolved) {
+          if (color) next[index] = color;
+        }
+        return next;
+      });
     });
 
     return () => {
       cancelled = true;
     };
-  }, [tracks]);
+  }, [tracksKey]);
 
   return colors;
 }

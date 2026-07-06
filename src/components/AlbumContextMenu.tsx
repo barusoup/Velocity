@@ -10,8 +10,10 @@ import {
 } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
-import { useCollection, type SavedAlbum } from "../collection";
-import { usePlayer } from "../player";
+import { type SavedAlbum } from "../collection";
+import { useCollectionActions } from "../collection";
+import { usePlayerState } from "../player";
+import { useIsAlbumSaved, useIsSongSavedByVideo } from "../hooks/useCollectionSelectors";
 import { deviceExportVideoIds, getEntityDetail, saveAlbumToMp3 } from "../api";
 import { useDeviceExport } from "../hooks/useDeviceExport";
 import { exportStreamVideoId, filterQueueableTracks, sanitizeFilename } from "../utils/media";
@@ -89,18 +91,16 @@ export function AlbumContextMenu({
   currentAlbumBrowseId,
   currentUserPlaylistId,
 }: AlbumContextMenuProps) {
-  const collection = useCollection();
-  const player = usePlayer();
+  const { toggleSong, toggleAlbum } = useCollectionActions();
+  const player = usePlayerState();
   const [resolvedTracks, setResolvedTracks] = useState<MediaTrack[]>([]);
   const [tracksLoading, setTracksLoading] = useState(false);
   const isCurrentAlbum = currentAlbumBrowseId && album.browseId === currentAlbumBrowseId;
   const tracks = tracksProp ?? resolvedTracks;
   const isSingle = tracks.length === 1;
-  const isSaved = isSingle
-    ? (tracks[0]?.videoId
-        ? collection.isSongSavedByVideo(tracks[0].videoId)
-        : false)
-    : collection.isAlbumSaved(album.browseId);
+  const singleVideoSaved = useIsSongSavedByVideo(isSingle ? tracks[0]?.videoId : null);
+  const albumSaved = useIsAlbumSaved(isSingle ? null : album.browseId);
+  const isSaved = isSingle ? singleVideoSaved : albumSaved;
 
   useEffect(() => {
     if (tracksProp) return;
@@ -149,9 +149,9 @@ export function AlbumContextMenu({
 
   const handleToggleSave = () => {
     if (isSingle && tracks[0]) {
-      collection.toggleSong(tracks[0]);
+      toggleSong(tracks[0]);
     } else {
-      collection.toggleAlbum(album);
+      toggleAlbum(album);
     }
     onClose();
   };

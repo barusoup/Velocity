@@ -46,11 +46,21 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 const USER_AGENT: &str =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36";
-const YT_DLP_URL: &str = "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe";
+const YT_DLP_WIN_URL: &str =
+    "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe";
+const YT_DLP_MACOS_URL: &str =
+    "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_macos";
+const YT_DLP_UNIX_URL: &str = "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp";
 /// Static Windows ffmpeg/ffprobe pair used by yt-dlp's MP3 postprocessor.
 /// Playback only needs yt-dlp; exports also need this bundle.
 #[cfg(target_os = "windows")]
 const FFMPEG_WIN_ZIP_URL: &str = "https://github.com/yt-dlp/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip";
+/// macOS static Intel binaries (run natively on Apple Silicon via Rosetta).
+#[cfg(target_os = "macos")]
+const FFMPEG_MACOS_URL: &str = "https://evermeet.cx/ffmpeg/get/zip";
+#[cfg(target_os = "macos")]
+const FFPROBE_MACOS_URL: &str = "https://evermeet.cx/ffmpeg/get/ffprobe/zip";
+const FFMPEG_EXPORT_UNAVAILABLE: &str = "MP3 export isn't available right now. Try again later.";
 const CLIENT_CACHE_TTL: Duration = Duration::from_secs(60 * 60 * 6);
 const STREAM_CACHE_TTL: Duration = Duration::from_secs(60 * 45);
 /// Per-invocation bound for yt-dlp audio fetches (offline save + export).
@@ -2557,7 +2567,7 @@ async fn ensure_streaming_backend(app: AppHandle) -> Result<BackendStatus, Strin
     // MP3 exports need ffmpeg; warming it during backend setup avoids a
     // long "Saving…" stall on the user's first right-click export while
     // the portable bundle downloads.
-    let _ = ensure_ffmpeg(&app).await;
+    let _ = resolve_ffmpeg(&app).await;
     let version = yt_dlp_version(&path).await.ok();
     Ok(BackendStatus {
         yt_dlp_ready: true,
@@ -3779,7 +3789,9 @@ async fn convert_cached_audio_to_mp3(
         return Ok(temp_mp3);
     }
 
-    let ffmpeg = ensure_ffmpeg(app).await?;
+    let ffmpeg = resolve_ffmpeg(app)
+        .await
+        .ok_or_else(|| FFMPEG_EXPORT_UNAVAILABLE.to_string())?;
     let source_arg = source.to_string_lossy().to_string();
     let output_arg = temp_mp3.to_string_lossy().to_string();
     let mut command = Command::new(&ffmpeg);
@@ -3870,7 +3882,9 @@ async fn download_track_mp3(
     video_id: &str,
     target_path: &Path,
 ) -> Result<PathBuf, String> {
-    let ffmpeg = ensure_ffmpeg(app).await?;
+    let ffmpeg = resolve_ffmpeg(app)
+        .await
+        .ok_or_else(|| FFMPEG_EXPORT_UNAVAILABLE.to_string())?;
     let ffmpeg_dir = ffmpeg
         .parent()
         .ok_or_else(|| "Bundled ffmpeg has no parent directory.".to_string())?
@@ -3932,8 +3946,7 @@ async fn download_track_mp3(
         .find(|line| !line.is_empty())
         .filter(|line| Path::new(line).exists())
         .ok_or_else(|| {
-            "yt-dlp did not produce an MP3 file. Try again in a moment — Velocity may still be setting up ffmpeg."
-                .to_string()
+            "yt-dlp did not produce an MP3 file. Try again in a moment.".to_string()
         })?
         .to_string();
     Ok(PathBuf::from(produced))
@@ -5025,17 +5038,19 @@ async fn remove_imported_track(
 }
 
 #[tauri::command]
-async fn analyze_loudness(file_path: String) -> Result<LoudnessData, String> {
-    analyze_loudness_slice(file_path, None, None).await
+async fn analyze_loudness(app: AppHandle, file_path: String) -> Result<LoudnessData, String> {
+    analyze_loudness_slice(app, file_path, None, None).await
 }
 
 #[tauri::command]
 async fn analyze_loudness_chunk(
+    app: AppHandle,
     file_path: String,
     start_seconds: f64,
     duration_seconds: f64,
 ) -> Result<LoudnessData, String> {
     analyze_loudness_slice(
+        app,
         file_path,
         Some(start_seconds.max(0.0)),
         Some(duration_seconds.clamp(1.0, 45.0)),
@@ -5044,6 +5059,7 @@ async fn analyze_loudness_chunk(
 }
 
 async fn analyze_loudness_slice(
+    app: AppHandle,
     file_path: String,
     start_seconds: Option<f64>,
     duration_seconds: Option<f64>,
@@ -5071,24 +5087,8 @@ async fn analyze_loudness_slice(
             .filter(|value| value.is_finite())
     }
 
-    async fn check_ffmpeg() -> Option<PathBuf> {
-        let name = if cfg!(target_os = "windows") {
-            "ffmpeg.exe"
-        } else {
-            "ffmpeg"
-        };
-        let mut cmd = Command::new(name);
-        cmd.arg("-version");
-        #[cfg(target_os = "windows")]
-        cmd.creation_flags(CREATE_NO_WINDOW);
-        cmd.output().await.ok().filter(|o| o.status.success())?;
-        Some(PathBuf::from(name))
-    }
-
-    let ffmpeg = check_ffmpeg().await;
-    let ffmpeg = match ffmpeg {
-        Some(path) => path,
-        None => return Ok(empty_loudness_data()),
+    let Some(ffmpeg) = resolve_ffmpeg(&app).await else {
+        return Ok(empty_loudness_data());
     };
 
     let null_device = if cfg!(target_os = "windows") {
@@ -5121,10 +5121,10 @@ async fn analyze_loudness_slice(
     #[cfg(target_os = "windows")]
     command.creation_flags(CREATE_NO_WINDOW);
 
-    let output = command
-        .output()
-        .await
-        .map_err(|error| format!("Failed to run ffmpeg: {error}"))?;
+    let output = command.output().await.ok();
+    let Some(output) = output else {
+        return Ok(empty_loudness_data());
+    };
 
     if !output.status.success() {
         return Ok(empty_loudness_data());
@@ -5154,7 +5154,7 @@ async fn analyze_loudness_slice(
 }
 
 #[tauri::command]
-async fn detect_leading_silence(file_path: String) -> Result<LeadingSilenceData, String> {
+async fn detect_leading_silence(app: AppHandle, file_path: String) -> Result<LeadingSilenceData, String> {
     const LEADING_SILENCE_ANALYSIS_VERSION: u8 = 2;
     const ANALYSIS_MAX_SECONDS: f64 = 45.0;
     const SILENCE_NOISE_DB: f64 = -35.0;
@@ -5178,23 +5178,8 @@ async fn detect_leading_silence(file_path: String) -> Result<LeadingSilenceData,
         token.parse::<f64>().ok().filter(|value| value.is_finite())
     }
 
-    async fn check_ffmpeg() -> Option<PathBuf> {
-        let name = if cfg!(target_os = "windows") {
-            "ffmpeg.exe"
-        } else {
-            "ffmpeg"
-        };
-        let mut cmd = Command::new(name);
-        cmd.arg("-version");
-        #[cfg(target_os = "windows")]
-        cmd.creation_flags(CREATE_NO_WINDOW);
-        cmd.output().await.ok().filter(|o| o.status.success())?;
-        Some(PathBuf::from(name))
-    }
-
-    let ffmpeg = match check_ffmpeg().await {
-        Some(path) => path,
-        None => return Ok(empty_leading_silence_data()),
+    let Some(ffmpeg) = resolve_ffmpeg(&app).await else {
+        return Ok(empty_leading_silence_data());
     };
 
     let null_device = if cfg!(target_os = "windows") {
@@ -5227,10 +5212,10 @@ async fn detect_leading_silence(file_path: String) -> Result<LeadingSilenceData,
     #[cfg(target_os = "windows")]
     command.creation_flags(CREATE_NO_WINDOW);
 
-    let output = command
-        .output()
-        .await
-        .map_err(|error| format!("Failed to run ffmpeg: {error}"))?;
+    let output = match command.output().await {
+        Ok(output) => output,
+        Err(_) => return Ok(empty_leading_silence_data()),
+    };
 
     if !output.status.success() {
         return Ok(empty_leading_silence_data());
@@ -5292,6 +5277,8 @@ async fn backend_status(app: &AppHandle) -> Result<BackendStatus, String> {
 async fn ensure_yt_dlp(app: &AppHandle) -> Result<PathBuf, String> {
     let path = yt_dlp_path(app)?;
     if path.exists() {
+        #[cfg(unix)]
+        prepare_downloaded_binary(&path).await?;
         return Ok(path);
     }
 
@@ -5303,7 +5290,7 @@ async fn ensure_yt_dlp(app: &AppHandle) -> Result<PathBuf, String> {
         .map_err(|error| error.to_string())?;
 
     let response = HTTP
-        .get(YT_DLP_URL)
+        .get(yt_dlp_download_url())
         .send()
         .await
         .map_err(|error| format!("Failed to download yt-dlp: {error}"))?;
@@ -5324,6 +5311,8 @@ async fn ensure_yt_dlp(app: &AppHandle) -> Result<PathBuf, String> {
         .await
         .map_err(|error| format!("Failed to save yt-dlp: {error}"))?;
 
+    prepare_downloaded_binary(&path).await?;
+
     Ok(path)
 }
 
@@ -5335,8 +5324,64 @@ fn app_bin_dir(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(root.join("bin"))
 }
 
+fn yt_dlp_executable_name() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "yt-dlp.exe"
+    } else {
+        "yt-dlp"
+    }
+}
+
+fn yt_dlp_download_url() -> &'static str {
+    if cfg!(target_os = "windows") {
+        YT_DLP_WIN_URL
+    } else if cfg!(target_os = "macos") {
+        YT_DLP_MACOS_URL
+    } else {
+        YT_DLP_UNIX_URL
+    }
+}
+
 fn yt_dlp_path(app: &AppHandle) -> Result<PathBuf, String> {
-    Ok(app_bin_dir(app)?.join("yt-dlp.exe"))
+    Ok(app_bin_dir(app)?.join(yt_dlp_executable_name()))
+}
+
+#[cfg(unix)]
+async fn prepare_downloaded_binary(path: &Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let metadata = tokio::fs::metadata(path)
+        .await
+        .map_err(|error| format!("Failed to inspect yt-dlp permissions: {error}"))?;
+    let mut perms = metadata.permissions();
+    perms.set_mode(0o755);
+    tokio::fs::set_permissions(path, perms)
+        .await
+        .map_err(|error| format!("Failed to mark yt-dlp executable: {error}"))?;
+
+    #[cfg(target_os = "macos")]
+    {
+        let Some(path_str) = path.to_str() else {
+            return Ok(());
+        };
+        // Gatekeeper quarantines HTTP downloads; strip it and ad-hoc sign so
+        // the first playback attempt doesn't fail with "cannot be opened".
+        let _ = Command::new("xattr")
+            .args(["-d", "com.apple.quarantine", path_str])
+            .output()
+            .await;
+        let _ = Command::new("codesign")
+            .args(["-s", "-", "--force", path_str])
+            .output()
+            .await;
+    }
+
+    Ok(())
+}
+
+#[cfg(windows)]
+async fn prepare_downloaded_binary(_path: &Path) -> Result<(), String> {
+    Ok(())
 }
 
 fn ffmpeg_executable_name() -> &'static str {
@@ -5374,8 +5419,16 @@ async fn ffmpeg_on_path() -> Option<PathBuf> {
     Some(PathBuf::from(name))
 }
 
-#[cfg(target_os = "windows")]
-async fn extract_ffmpeg_zip(bytes: &[u8], bin_dir: &Path) -> Result<(), String> {
+async fn download_bytes_quiet(url: &str) -> Option<Vec<u8>> {
+    let response = HTTP.get(url).send().await.ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    let bytes = response.bytes().await.ok()?;
+    Some(bytes.to_vec())
+}
+
+fn extract_binary_from_zip(bytes: &[u8], out_path: &Path, binary_name: &str) -> Result<(), String> {
     let cursor = Cursor::new(bytes);
     let mut archive = zip::ZipArchive::new(cursor)
         .map_err(|error| format!("Downloaded ffmpeg archive was invalid: {error}"))?;
@@ -5390,73 +5443,87 @@ async fn extract_ffmpeg_zip(bytes: &[u8], bin_dir: &Path) -> Result<(), String> 
             .file_name()
             .and_then(|value| value.to_str())
             .unwrap_or_default();
-        if file_name != ffmpeg_executable_name() && file_name != ffprobe_executable_name() {
+        if file_name != binary_name {
             continue;
         }
-        let out_path = bin_dir.join(file_name);
-        let mut out_file = std::fs::File::create(&out_path)
+        if let Some(parent) = out_path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|error| format!("Failed to create {}: {error}", parent.display()))?;
+        }
+        let mut out_file = std::fs::File::create(out_path)
             .map_err(|error| format!("Failed to create {}: {error}", out_path.display()))?;
         std::io::copy(&mut entry, &mut out_file)
             .map_err(|error| format!("Failed to extract {}: {error}", out_path.display()))?;
+        return Ok(());
+    }
+    Err(format!("ffmpeg archive did not contain {binary_name}."))
+}
+
+fn extract_ffmpeg_zip(bytes: &[u8], bin_dir: &Path) -> Result<(), String> {
+    for name in [ffmpeg_executable_name(), ffprobe_executable_name()] {
+        extract_binary_from_zip(bytes, &bin_dir.join(name), name)?;
     }
     Ok(())
 }
 
 #[cfg(target_os = "windows")]
-async fn download_bundled_ffmpeg(app: &AppHandle) -> Result<PathBuf, String> {
-    let bin_dir = app_bin_dir(app)?;
-    tokio::fs::create_dir_all(&bin_dir)
-        .await
-        .map_err(|error| format!("Failed to create bin folder: {error}"))?;
-
-    let response = HTTP
-        .get(FFMPEG_WIN_ZIP_URL)
-        .send()
-        .await
-        .map_err(|error| format!("Failed to download ffmpeg: {error}"))?;
-    if !response.status().is_success() {
-        return Err(format!(
-            "Failed to download ffmpeg: HTTP {}",
-            response.status()
-        ));
+async fn download_bundled_ffmpeg(app: &AppHandle) -> Option<PathBuf> {
+    let bin_dir = app_bin_dir(app).ok()?;
+    tokio::fs::create_dir_all(&bin_dir).await.ok()?;
+    let bytes = download_bytes_quiet(FFMPEG_WIN_ZIP_URL).await?;
+    extract_ffmpeg_zip(&bytes, &bin_dir).ok()?;
+    if ffmpeg_bundle_ready(&bin_dir).await {
+        Some(bin_dir.join(ffmpeg_executable_name()))
+    } else {
+        None
     }
-    let bytes = response
-        .bytes()
-        .await
-        .map_err(|error| format!("Failed to read ffmpeg download: {error}"))?;
-    extract_ffmpeg_zip(&bytes, &bin_dir).await?;
-
-    let ffmpeg = bin_dir.join(ffmpeg_executable_name());
-    if !ffmpeg_bundle_ready(&bin_dir).await {
-        return Err(
-            "ffmpeg download finished but ffmpeg/ffprobe were not found in the archive.".to_string(),
-        );
-    }
-    Ok(ffmpeg)
 }
 
-/// Resolve ffmpeg for MP3 export. Windows downloads a portable bundle
-/// beside yt-dlp on first use; other platforms fall back to PATH.
-async fn ensure_ffmpeg(app: &AppHandle) -> Result<PathBuf, String> {
-    let bin_dir = app_bin_dir(app)?;
+#[cfg(target_os = "macos")]
+async fn download_macos_ffmpeg_bundle(app: &AppHandle) -> Option<PathBuf> {
+    let bin_dir = app_bin_dir(app).ok()?;
+    tokio::fs::create_dir_all(&bin_dir).await.ok()?;
+
+    let pairs = [
+        (FFMPEG_MACOS_URL, ffmpeg_executable_name()),
+        (FFPROBE_MACOS_URL, ffprobe_executable_name()),
+    ];
+    for (url, name) in pairs {
+        let bytes = download_bytes_quiet(url).await?;
+        let out_path = bin_dir.join(name);
+        extract_binary_from_zip(&bytes, &out_path, name).ok()?;
+        prepare_downloaded_binary(&out_path).await.ok()?;
+    }
+
     if ffmpeg_bundle_ready(&bin_dir).await {
-        return Ok(bin_dir.join(ffmpeg_executable_name()));
+        Some(bin_dir.join(ffmpeg_executable_name()))
+    } else {
+        None
+    }
+}
+
+/// Resolve ffmpeg for export/analysis. Uses a bundled copy when present,
+/// then PATH, then a one-shot platform download. Any failure is silent.
+pub(crate) async fn resolve_ffmpeg(app: &AppHandle) -> Option<PathBuf> {
+    let bin_dir = app_bin_dir(app).ok()?;
+    if ffmpeg_bundle_ready(&bin_dir).await {
+        return Some(bin_dir.join(ffmpeg_executable_name()));
     }
     if let Some(path) = ffmpeg_on_path().await {
-        return Ok(path);
+        return Some(path);
     }
 
     #[cfg(target_os = "windows")]
     {
         return download_bundled_ffmpeg(app).await;
     }
-
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "macos")]
     {
-        Err(
-            "ffmpeg is required to export MP3 files. Install ffmpeg and make sure it is on PATH."
-                .to_string(),
-        )
+        return download_macos_ffmpeg_bundle(app).await;
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        None
     }
 }
 

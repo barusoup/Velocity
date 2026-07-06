@@ -15,6 +15,7 @@ import type {
   WatchPlaylistResponse,
 } from "./types";
 import { getItem, setItem, removeItem } from "./storage";
+import { touchBoundedSet, setBoundedMapValue } from "./utils/bounded-lru";
 import { exportStreamVideoId, streamIdentityVideoIds, withResolvedAudioSrc } from "./utils/media";
 
 
@@ -218,6 +219,9 @@ const syncedLyricsCache = new MemoCache<SyncedLyricsResponse | null>(200, 60 * 6
 // short-circuit to "no lyrics" instead of re-hitting the multi-provider
 // backend (and the LyricsPage / PlayerBar loading overlays).
 const LYRICS_EXHAUSTION_THRESHOLD = 3;
+// Session-scoped; without a cap this grows with every unique track the user
+// explores that lacks lyrics — unbounded in long listening sessions.
+const LYRICS_EXHAUSTION_MAX_KEYS = 500;
 const lyricsFailureCounts = new Map<string, number>();
 const lyricsExhaustedKeys = new Set<string>();
 
@@ -489,10 +493,10 @@ function recordLyricsFailureForTrack(track: LyricsPrefetchTrack): void {
   const nextCount = (lyricsFailureCounts.get(key) ?? 0) + 1;
   if (nextCount >= LYRICS_EXHAUSTION_THRESHOLD) {
     lyricsFailureCounts.delete(key);
-    lyricsExhaustedKeys.add(key);
+    touchBoundedSet(lyricsExhaustedKeys, key, LYRICS_EXHAUSTION_MAX_KEYS);
     return;
   }
-  lyricsFailureCounts.set(key, nextCount);
+  setBoundedMapValue(lyricsFailureCounts, key, nextCount, LYRICS_EXHAUSTION_MAX_KEYS);
 }
 
 function clearLyricsExhaustionForTrack(track: LyricsPrefetchTrack): void {
@@ -506,6 +510,17 @@ function clearLyricsExhaustionForTrack(track: LyricsPrefetchTrack): void {
 export function isLyricsExhaustedForTrack(track: LyricsPrefetchTrack): boolean {
   const key = lyricsTrackExhaustionKey(track);
   return key !== null && lyricsExhaustedKeys.has(key);
+}
+
+/** Stress-test helper: session lyrics-exhaustion registry sizes. */
+export function getLyricsExhaustionRegistrySizes(): {
+  failureCounts: number;
+  exhaustedKeys: number;
+} {
+  return {
+    failureCounts: lyricsFailureCounts.size,
+    exhaustedKeys: lyricsExhaustedKeys.size,
+  };
 }
 
 function syncedLyricsMetaCacheKey(fields: {
@@ -546,7 +561,7 @@ export async function getSyncedLyricsByMeta(
           title: fields.title,
           artist: fields.artist,
           album: fields.album,
-          durationSeconds: fields.durationSeconds,
+          durationSeconds: fields.durationSeconds != null ? Math.trunc(fields.durationSeconds) : null,
           videoId: fields.videoId ?? null,
         }),
       (r) => r !== null,
@@ -972,7 +987,7 @@ export async function updateImportedTrackMetadata(
     title: fields.title,
     artist: fields.artist,
     album: fields.album,
-    durationSeconds: fields.durationSeconds,
+    durationSeconds: fields.durationSeconds != null ? Math.trunc(fields.durationSeconds) : null,
     coverBytes: fields.coverBytes,
     findLyrics: fields.findLyrics,
   });

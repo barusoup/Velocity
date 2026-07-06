@@ -1,12 +1,14 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { Check, Ellipsis, LoaderCircle, Music2, Pause, Play } from "lucide-react";
 import { cacheArtwork } from "../api";
-import { useCollection } from "../collection";
-import { usePlayer } from "../player";
+import { usePlayerActions } from "../player";
+import { useContextTrackTarget } from "../hooks/useContextTrackTarget";
+import { useIsTrackSaved, useToggleTrackSave } from "../hooks/useCollectionSelectors";
+import { useTrackPlaybackState } from "../hooks/usePlayerSelectors";
 import type { MediaTrack } from "../types";
 import type { QueueOrigin } from "../player";
-import { formatOptionalDuration, isSameSongTrack } from "../utils/media";
+import { formatOptionalDuration } from "../utils/media";
 import { getDirectArtistBrowseId, resolveArtistBrowseId } from "../utils/navigation";
 import type { View } from "./Sidebar";
 import { ArtistCreditText } from "./PagesShared";
@@ -130,6 +132,40 @@ export function DefaultArtwork({ className = "h-full w-full" }: { className?: st
   );
 }
 
+function ArtworkImageLoaded({
+  src,
+  sources,
+  className,
+  draggable = false,
+  fallback,
+}: {
+  src?: string | null;
+  sources?: Array<string | null | undefined>;
+  className: string;
+  draggable?: boolean;
+  fallback?: ReactNode;
+}) {
+  const resolved = useResolvedArtworkSource(sources ?? [src]);
+  const activeSrc = resolved.src;
+  if (!activeSrc) {
+    return fallback ?? <DefaultArtwork className={className} />;
+  }
+
+  return (
+    <img
+      src={activeSrc}
+      alt=""
+      className={`block bg-transparent ${className}`}
+      draggable={draggable}
+      decoding="async"
+      loading="lazy"
+      onError={(event) => {
+        resolved.onError(event.currentTarget.currentSrc || event.currentTarget.src);
+      }}
+    />
+  );
+}
+
 export function ArtworkImage({
   src,
   sources,
@@ -145,28 +181,44 @@ export function ArtworkImage({
   fallback?: ReactNode;
   loading?: "lazy" | "eager";
 }) {
-  const resolved = useResolvedArtworkSource(sources ?? [src]);
-  const activeSrc = resolved.src;
-  if (!activeSrc) {
-    return fallback ?? <DefaultArtwork className={className} />;
-  }
+  const hostRef = useRef<HTMLSpanElement | null>(null);
+  const [visible, setVisible] = useState(loading === "eager");
+
+  useEffect(() => {
+    if (loading === "eager" || visible) return;
+    const host = hostRef.current;
+    if (!host) return;
+    const observer = new IntersectionObserver(
+      ([entry]) => {
+        if (entry?.isIntersecting) {
+          setVisible(true);
+          observer.disconnect();
+        }
+      },
+      { rootMargin: "240px" },
+    );
+    observer.observe(host);
+    return () => observer.disconnect();
+  }, [loading, visible]);
 
   return (
-    <img
-      src={activeSrc}
-      alt=""
-      className={`block bg-transparent ${className}`}
-      draggable={draggable}
-      decoding="async"
-      loading={loading}
-      onError={(event) => {
-        resolved.onError(event.currentTarget.currentSrc || event.currentTarget.src);
-      }}
-    />
+    <span ref={hostRef} className={`inline-flex ${className}`}>
+      {visible ? (
+        <ArtworkImageLoaded
+          src={src}
+          sources={sources}
+          className={className}
+          draggable={draggable}
+          fallback={fallback}
+        />
+      ) : (
+        fallback ?? <DefaultArtwork className={className} />
+      )}
+    </span>
   );
 }
 
-export function TrackRow({
+export const TrackRow = memo(function TrackRow({
   track,
   index,
   onPlay,
@@ -176,7 +228,7 @@ export function TrackRow({
   onNavigateToAlbum,
   onNavigateToArtist,
   onNavigate,
-  queueOrigin,
+  queueOrigin: _queueOrigin,
 }: {
   track: MediaTrack;
   index?: number;
@@ -189,12 +241,11 @@ export function TrackRow({
   onNavigate?: (view: View) => void;
   queueOrigin?: QueueOrigin | null;
 }) {
-  const { isPlaying, isBuffering, currentTrack, togglePlay } = usePlayer();
-  const collection = useCollection();
-  const active = isSameSongTrack(currentTrack, track);
-  const playingActive = active && isPlaying;
-  const bufferingActive = active && isBuffering;
-  const isSaved = collection.isTrackSaved(track);
+  const { togglePlay } = usePlayerActions();
+  const { active, playingActive, bufferingActive } = useTrackPlaybackState(track);
+  const contextTarget = useContextTrackTarget(track);
+  const isSaved = useIsTrackSaved(track);
+  const toggleSave = useToggleTrackSave(track);
   const directArtistBrowseId = onNavigate ? getDirectArtistBrowseId(track) : null;
   const handleResolveNavigate = useCallback(() => {
     if (!onNavigate) return;
@@ -217,8 +268,7 @@ export function TrackRow({
 
   return (
     <div
-      data-song-context-target="true"
-      data-track={encodeTrackForContextMenu(track)}
+      {...contextTarget}
       className={`group grid cursor-pointer grid-cols-[1.75rem_minmax(0,1fr)_minmax(7.5rem,10rem)_4.5rem] items-center gap-3 rounded-md px-3 py-2 text-sm hover:bg-neutral-900 sm:grid-cols-[1.75rem_minmax(0,1fr)_minmax(10rem,13rem)_5rem] ${
         active ? "bg-neutral-900/70" : ""
       }`}
@@ -316,7 +366,7 @@ export function TrackRow({
             <SaveButton
               isSaved={isSaved}
               size="sm"
-              onToggle={() => collection.toggleSong(track)}
+              onToggle={toggleSave}
               ariaLabel={isSaved ? "Remove from collection" : "Save to collection"}
             />
           </div>
@@ -332,7 +382,7 @@ export function TrackRow({
       </div>
     </div>
   );
-}
+});
 
 // JSON-encode the track for the right-click context menu's data-track
 // attribute. We strip filePath/audioSrc because they're large and

@@ -1,18 +1,12 @@
 import { useEffect } from "react";
 import type { SavedAlbum } from "../collection";
 import type { MediaTrack } from "../types";
+import { lookupContextTrack } from "../utils/track-context-registry";
 
 /**
- * Two near-identical `document.addEventListener("contextmenu", …)` handlers
- * used to live in `App.tsx`: one for songs, one for albums. Both walked up
- * the DOM looking for a `data-*-context-target` attribute, parsed a JSON
- * payload from a sibling `data-*-payload` attribute, and pushed the result
- * into React state.
- *
- * This hook folds both into a single capture-phase document listener so the
- * event-handling cost is paid once per right-click instead of twice. Song
- * targets take precedence over album targets when one is nested inside
- * the other (matching the original App.tsx policy).
+ * Global right-click handlers for song and album context menus. Song targets
+ * resolve tracks via `data-track-id` (registry lookup) with a JSON
+ * `data-track` fallback for rows not yet migrated.
  */
 export function useGlobalContextMenus({
   onSongContextMenu,
@@ -23,23 +17,26 @@ export function useGlobalContextMenus({
 }): void {
   useEffect(() => {
     const handler = (event: MouseEvent) => {
-      // Middle-click is irrelevant for menu semantics. Keyboard-driven
-      // contextmenu events arrive with `button === 0`; we still want to
-      // surface our menus to keyboard users so they aren't locked out of
-      // Go-to-Album / Save-to-collection on Shift+F10 or the Menu key.
       if (event.button === 1) return;
       const target = event.target;
       if (!(target instanceof Element)) return;
       const songTrigger = target.closest("[data-song-context-target]");
       if (songTrigger) {
         event.preventDefault();
+
+        const trackId = songTrigger.getAttribute("data-track-id");
+        if (trackId) {
+          const track = lookupContextTrack(trackId);
+          if (track) {
+            onSongContextMenu(track, { x: event.clientX, y: event.clientY });
+          }
+          return;
+        }
+
         const raw = songTrigger.getAttribute("data-track");
         if (!raw) return;
         try {
           const parsed = JSON.parse(raw) as MediaTrack;
-          // Preserve source if `data-track-source` was set (upload tracks
-          // vs stream tracks). Default to "stream" for backward compat with
-          // rows that only encode the payload.
           const sourceRaw = songTrigger.getAttribute("data-track-source");
           const source: MediaTrack["source"] =
             sourceRaw === "upload" || sourceRaw === "stream"
@@ -50,7 +47,7 @@ export function useGlobalContextMenus({
             { x: event.clientX, y: event.clientY },
           );
         } catch {
-          // Ignore unparseable rows — the menu only opens on valid payload.
+          // Ignore unparseable rows.
         }
         return;
       }

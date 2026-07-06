@@ -9,6 +9,8 @@ export const LISTEN_QUALIFY_RATIO = 0.75;
 export const PROFILE_STALE_DAYS = 14;
 export const REDISCOVERY_DORMANT_DAYS = 30;
 export const FIRST_DAILY_RECOMMENDATION_THRESHOLD = 5;
+/** Max qualified-play timestamps retained per entry (yearly window + headroom). */
+export const QUALIFIED_PLAYS_MAX = 400;
 
 export type TopSongsPeriod = "weekly" | "monthly" | "yearly" | "allTime";
 
@@ -64,6 +66,7 @@ const PERIOD_MS: Record<Exclude<TopSongsPeriod, "allTime">, number> = {
 };
 
 const DAY_MS = 24 * 60 * 60 * 1000;
+const QUALIFIED_PLAYS_RETAIN_MS = 366 * DAY_MS;
 
 type TasteProfileListener = () => void;
 const listeners = new Set<TasteProfileListener>();
@@ -148,6 +151,11 @@ function entryToTrack(entry: TasteProfileEntry): MediaTrack {
   };
 }
 
+function trimQualifiedPlays(plays: readonly number[], now: number): number[] {
+  const cutoff = now - QUALIFIED_PLAYS_RETAIN_MS;
+  return plays.filter((ts) => ts >= cutoff).slice(-QUALIFIED_PLAYS_MAX);
+}
+
 function entryScore(entry: TasteProfileEntry, now: number): number {
   const recentWindow = 30 * DAY_MS;
   const recentPlays = entry.qualifiedPlays.filter((ts) => now - ts <= recentWindow).length;
@@ -185,7 +193,7 @@ export function recordQualifiedListen(track: MediaTrack, now = Date.now()): Tast
 
   const state = loadTasteProfile();
   const existing = state.entries[videoId];
-  const qualifiedPlays = [...(existing?.qualifiedPlays ?? []), now];
+  const qualifiedPlays = trimQualifiedPlays([...(existing?.qualifiedPlays ?? []), now], now);
 
   const nextEntry: TasteProfileEntry = {
     videoId,

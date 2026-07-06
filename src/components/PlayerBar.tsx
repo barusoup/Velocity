@@ -1,4 +1,4 @@
-import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react";
 import { CircleArrowRight, ChevronUp, LoaderCircle, Pause, Play, RefreshCw, SkipBack, SkipForward, X } from "lucide-react";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import {
@@ -10,8 +10,11 @@ import {
   isLyricsExhaustedForTrack,
 } from "../api";
 import { fetchSyncedLyricsByMeta } from "../lyrics";
-import { useCollection } from "../collection";
-import { currentAudio, usePlayer } from "../player";
+import { currentAudio, usePlayer, usePlayerActions, usePlayerState } from "../player";
+import type { MediaTrack } from "../types";
+import { useIsTrackSaved, useToggleTrackSave } from "../hooks/useCollectionSelectors";
+import { useContextTrackTarget } from "../hooks/useContextTrackTarget";
+import { usePlayerUiStore } from "../store/playerUiStore";
 import { useSetting } from "../settings";
 import { formatDuration, readLiveMediaDuration } from "../utils/media";
 import {
@@ -22,7 +25,7 @@ import {
 } from "../utils/navigation";
 import { ArtistCreditText } from "./PagesShared";
 import type { View } from "./Sidebar";
-import { ArtworkImage, DefaultArtwork, encodeTrackForContextMenu, getArtworkRoundedClass } from "./Shared";
+import { ArtworkImage, DefaultArtwork, getArtworkRoundedClass } from "./Shared";
 import { Marquee } from "./Marquee";
 import {
   AnimatedRepeat,
@@ -122,13 +125,14 @@ export default function PlayerBar({
   onNavigate: (view: View) => void;
   viewName: string;
 }) {
-  const player = usePlayer();
-  const collection = useCollection();
+  const playerState = usePlayerState();
+  const playerActions = usePlayerActions();
+  const player = { ...playerState, ...playerActions };
   const [volumeHover, setVolumeHover] = useState(false);
   const [dragVolume, setDragVolume] = useState<number | null>(null);
   const [queueOpen, setQueueOpen] = useState(false);
   const prevQueueOpenRef = useRef(false);
-  const [queueEverOpened, setQueueEverOpened] = useState(false);
+  const [queueMounted, setQueueMounted] = useState(false);
   const [titleOverflow, setTitleOverflow] = useState(0);
   const [artistOverflow, setArtistOverflow] = useState(0);
   const [syncOverflow, setSyncOverflow] = useState(0);
@@ -190,6 +194,15 @@ export default function PlayerBar({
     setAlbumPending(false);
     setArtistPending(false);
   }, [track?.id]);
+
+  useEffect(() => {
+    if (queueOpen) {
+      setQueueMounted(true);
+      return;
+    }
+    const timer = window.setTimeout(() => setQueueMounted(false), 320);
+    return () => window.clearTimeout(timer);
+  }, [queueOpen]);
   const draggingVolume = useRef(false);
   const draggingSeek = useRef(false);
   const wasPlayingBeforeSeekDragRef = useRef(false);
@@ -205,8 +218,17 @@ export default function PlayerBar({
   const seekRemainingRef = useRef<HTMLSpanElement | null>(null);
   const playerRef = useRef(player);
   playerRef.current = player;
-  const seekScrubProgressRef = useRef(player.seekScrubProgress);
-  seekScrubProgressRef.current = player.seekScrubProgress;
+  const seekScrubProgressRef = useRef<number | null>(null);
+  useEffect(() => {
+    const unsub = usePlayerUiStore.subscribe(
+      (state) => state.seekScrubProgress,
+      (scrub) => {
+        seekScrubProgressRef.current = scrub;
+      },
+    );
+    seekScrubProgressRef.current = usePlayerUiStore.getState().seekScrubProgress;
+    return unsub;
+  }, []);
   const liveDurationRef = useRef(0);
 
   useEffect(() => {
@@ -564,6 +586,8 @@ export default function PlayerBar({
   // behind sparse React context updates or missing duration metadata.
   useEffect(() => {
     if (!track) return;
+    const audio = currentAudio.current;
+    if (!audio) return;
 
     let frameId = 0;
     let running = true;
@@ -573,16 +597,18 @@ export default function PlayerBar({
 
     const paintSeekBar = () => {
       if (!running) return;
+
+      const scrub = seekScrubProgressRef.current;
+      if (audio.paused && scrub === null) return;
+
       frameId = window.requestAnimationFrame(paintSeekBar);
 
-      const p = playerRef.current;
-      const audio = currentAudio.current;
-      const scrub = seekScrubProgressRef.current;
+      const latestAudio = currentAudio.current;
       const progress =
         scrub ??
-        (audio && Number.isFinite(audio.currentTime)
-          ? audio.currentTime
-          : p.progress);
+        (latestAudio && Number.isFinite(latestAudio.currentTime)
+          ? latestAudio.currentTime
+          : usePlayerUiStore.getState().progress);
       const duration = resolveSeekDuration();
 
       const pct =
@@ -616,10 +642,35 @@ export default function PlayerBar({
       }
     };
 
-    frameId = window.requestAnimationFrame(paintSeekBar);
+    const schedule = () => {
+      if (!running) return;
+      window.cancelAnimationFrame(frameId);
+      frameId = window.requestAnimationFrame(paintSeekBar);
+    };
+
+    const onWake = () => schedule();
+    audio.addEventListener("play", onWake);
+    audio.addEventListener("seeking", onWake);
+    audio.addEventListener("seeked", onWake);
+
+    const unsubScrub = usePlayerUiStore.subscribe(
+      (state) => state.seekScrubProgress,
+      (scrub) => {
+        if (scrub !== null) schedule();
+      },
+    );
+
+    if (!audio.paused || seekScrubProgressRef.current !== null) {
+      schedule();
+    }
+
     return () => {
       running = false;
       window.cancelAnimationFrame(frameId);
+      audio.removeEventListener("play", onWake);
+      audio.removeEventListener("seeking", onWake);
+      audio.removeEventListener("seeked", onWake);
+      unsubScrub();
     };
   }, [track?.id, resolveSeekDuration]);
 
@@ -739,10 +790,7 @@ export default function PlayerBar({
     };
   }, [queueOpen]);
 
-  const trackContextPayload = useMemo(
-    () => (track ? encodeTrackForContextMenu(track) : ""),
-    [track],
-  );
+  const contextTarget = useContextTrackTarget(track!, Boolean(track));
   const directAlbumBrowseId = track ? getDirectAlbumBrowseId(track) : null;
   const handleNavigateToAlbum = useCallback(() => {
     if (!track || albumPending) return;
@@ -784,7 +832,9 @@ export default function PlayerBar({
     player.duration ||
     track.durationSeconds ||
     0;
-  const displayProgress = player.seekScrubProgress ?? player.progress;
+  const seekScrubProgress = usePlayerUiStore((state) => state.seekScrubProgress);
+  const displayProgress =
+    seekScrubProgress ?? usePlayerUiStore.getState().progress;
   const remaining = Math.max(0, duration - displayProgress);
   const progressPct = duration ? (displayProgress / duration) * 100 : 0;
 
@@ -815,7 +865,7 @@ export default function PlayerBar({
           }
         }}
       >
-        {(queueOpen || queueEverOpened) && (
+        {queueMounted && (
           <Suspense fallback={null}>
             <QueuePanel open={queueOpen} onNavigate={onNavigate} />
           </Suspense>
@@ -835,9 +885,7 @@ export default function PlayerBar({
           }}
         >
           <div
-            data-song-context-target="true"
-            data-track={trackContextPayload}
-            data-track-source={track.source ?? "stream"}
+            {...contextTarget}
             className="hidden min-w-0 w-[var(--ui-player-side)] shrink-0 items-center gap-2 min-[720px]:flex"
           >
             <div className={`group relative h-[var(--ui-art-sm)] w-[var(--ui-art-sm)] shrink-0 overflow-hidden bg-neutral-800 ${getArtworkRoundedClass()}`}>
@@ -967,13 +1015,7 @@ export default function PlayerBar({
                   </div>
                   {track.source !== "upload" && (
                     <div className="shrink-0 mt-1">
-                      <SaveButton
-                        isSaved={collection.isTrackSaved(track)}
-                        size="sm"
-                        onToggle={() => collection.toggleSong(track)}
-                        ariaLabel={collection.isTrackSaved(track) ? "Remove from collection" : "Save to collection"}
-                        className="!h-5 !w-5"
-                      />
+                      <PlayerBarTrackSave track={track} />
                     </div>
                   )}
                 </div>
@@ -1125,7 +1167,7 @@ export default function PlayerBar({
                   return;
                 }
 
-                setQueueEverOpened(true);
+                setQueueMounted(true);
                 setQueueOpen(false);
                 void loadQueuePanel().finally(() => {
                   window.requestAnimationFrame(() => {
@@ -1196,5 +1238,19 @@ export default function PlayerBar({
           </div>
         </div>
       </div>
+  );
+}
+
+function PlayerBarTrackSave({ track }: { track: MediaTrack }) {
+  const isSaved = useIsTrackSaved(track);
+  const toggleSave = useToggleTrackSave(track);
+  return (
+    <SaveButton
+      isSaved={isSaved}
+      size="sm"
+      onToggle={toggleSave}
+      ariaLabel={isSaved ? "Remove from collection" : "Save to collection"}
+      className="!h-5 !w-5"
+    />
   );
 }

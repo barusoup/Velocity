@@ -9,6 +9,7 @@ import { fetchSyncedLyrics, fetchSyncedLyricsByMeta, findActiveLyricIndex, type 
 import { useAccent } from "../accent-context";
 import { useSetting } from "../settings";
 import { currentAudio, usePlayer } from "../player";
+import { usePlayerUiStore } from "../store/playerUiStore";
 import { rgbToCss, type RgbColor } from "../utils/artwork-color";
 import { type View } from "./Sidebar";
 
@@ -267,8 +268,8 @@ export function LyricsPage({
   const lyricLineRefs = useRef<Array<HTMLButtonElement | null>>([]);
   const lastScrolledIndexRef = useRef(-1);
   const displayProgressRef = useRef(0);
-  const playerProgressRef = useRef(player.progress);
-  const seekScrubProgressRef = useRef(player.seekScrubProgress);
+  const playerProgressRef = useRef(0);
+  const seekScrubProgressRef = useRef<number | null>(null);
   const isProgrammaticScrollRef = useRef(false);
   const autoScrollTimeoutRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const scrollContainerRef = useRef<HTMLElement | null>(null);
@@ -406,20 +407,16 @@ export function LyricsPage({
     return () => cancelAnimationFrame(id);
   }, [lyrics, updateLineOpacities]);
 
-  // Keep the fallback ref in sync with the coarse player.progress (used
-  // only when currentAudio.current is unavailable inside the rAF loop).
-  // We deliberately do NOT touch displayProgressRef / displayProgress here:
-  // player.progress is driven by the HTML media `timeupdate` event (~4 Hz),
-  // which is much coarser than the rAF loop below (~60 Hz). Overwriting the
-  // rAF-refined value on every timeupdate would snap the active lyric
-  // backwards ~4 times per second, producing a visible flicker / desync.
   useEffect(() => {
-    playerProgressRef.current = player.progress;
-  }, [player.progress]);
-
-  useEffect(() => {
-    seekScrubProgressRef.current = player.seekScrubProgress;
-  }, [player.seekScrubProgress]);
+    const unsub = usePlayerUiStore.subscribe(
+      (state) => state.seekScrubProgress,
+      (scrub) => {
+        seekScrubProgressRef.current = scrub;
+      },
+    );
+    seekScrubProgressRef.current = usePlayerUiStore.getState().seekScrubProgress;
+    return unsub;
+  }, []);
 
   // Reset scroll position and display progress when the track changes.
   // Jump to the top immediately so we are not still scrolled to the
@@ -465,30 +462,66 @@ export function LyricsPage({
 
   useEffect(() => {
     if (!track) return;
+    const audio = currentAudio.current;
+    if (!audio) return;
 
     let frameId = 0;
     let running = true;
 
     const syncProgress = () => {
       if (!running) return;
+
+      const scrubbing = seekScrubProgressRef.current !== null;
+      if (audio.paused && !scrubbing) return;
+
       frameId = window.requestAnimationFrame(syncProgress);
-      if (seekScrubProgressRef.current !== null) return;
-      const liveProgress = currentAudio.current?.currentTime;
-      const nextProgress = Number.isFinite(liveProgress) ? liveProgress ?? 0 : playerProgressRef.current;
+      if (scrubbing) return;
+
+      const liveProgress = audio.currentTime;
+      const nextProgress = Number.isFinite(liveProgress)
+        ? liveProgress
+        : playerProgressRef.current;
       if (Math.abs(nextProgress - displayProgressRef.current) >= 0.01) {
         displayProgressRef.current = nextProgress;
+        playerProgressRef.current = nextProgress;
         setDisplayProgress(nextProgress);
       }
     };
 
-    frameId = window.requestAnimationFrame(syncProgress);
+    const schedule = () => {
+      if (!running) return;
+      window.cancelAnimationFrame(frameId);
+      frameId = window.requestAnimationFrame(syncProgress);
+    };
+
+    const onWake = () => schedule();
+    audio.addEventListener("play", onWake);
+    audio.addEventListener("seeking", onWake);
+    audio.addEventListener("seeked", onWake);
+
+    const unsubScrub = usePlayerUiStore.subscribe(
+      (state) => state.seekScrubProgress,
+      (scrub) => {
+        if (scrub !== null) schedule();
+      },
+    );
+
+    if (!audio.paused || seekScrubProgressRef.current !== null) {
+      schedule();
+    }
+
     return () => {
       running = false;
       window.cancelAnimationFrame(frameId);
+      audio.removeEventListener("play", onWake);
+      audio.removeEventListener("seeking", onWake);
+      audio.removeEventListener("seeked", onWake);
+      unsubScrub();
     };
   }, [track?.id]);
 
-  const progressForLyrics = player.seekScrubProgress ?? displayProgress;
+  const seekScrubProgress = usePlayerUiStore((state) => state.seekScrubProgress);
+  const progressForLyrics = seekScrubProgress ?? displayProgress;
 
   const activeLyricIndex = useMemo(() => {
     if (!lyrics || !track) return -1;

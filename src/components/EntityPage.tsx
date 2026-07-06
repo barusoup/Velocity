@@ -11,8 +11,16 @@ import {
   Play,
 } from "lucide-react";
 import { getEntityDetail, peekEntityDetail } from "../api";
-import { useCollection, type SavedAlbum } from "../collection";
-import { usePlayer, type QueueOrigin } from "../player";
+import { type SavedAlbum } from "../collection";
+import {
+  useIsAlbumSaved,
+  useIsSongSavedByVideo,
+  useIsTrackSaved,
+  useToggleAlbumSave,
+  useToggleTrackSave,
+} from "../hooks/useCollectionSelectors";
+import { useCollectionActions } from "../collection";
+import { usePlayer, usePlayerActions, type QueueOrigin } from "../player";
 import { AlbumContextMenu } from "./AlbumContextMenu";
 import { SaveButton } from "./SaveButton";
 import { AnimatedShuffle } from "./PlayerButtonIcons";
@@ -25,7 +33,7 @@ import {
   formatPlayCount,
   isSameSongTrack,
 } from "../utils/media";
-import { ArtworkImage, MoreButton, TrackRow, encodeTrackForContextMenu } from "./Shared";
+import { ArtworkImage, MoreButton, TrackRow } from "./Shared";
 import { Marquee } from "./Marquee";
 import {
   ALBUM_TRACK_GRID_WITH_PLAYS,
@@ -43,6 +51,9 @@ import {
 import { getDirectArtistBrowseId, resolveArtistBrowseId } from "../utils/navigation";
 import { useSetting, setSetting, type ViewMode } from "../settings";
 import { useTrackMetadataBackfill } from "../hooks/useTrackMetadataBackfill";
+import { useContextTrackTarget } from "../hooks/useContextTrackTarget";
+import { useTrackPlaybackState } from "../hooks/usePlayerSelectors";
+import { VirtualList } from "./VirtualList";
 
 export function EntityPage({
   browseId,
@@ -264,23 +275,27 @@ function PlaylistPage({
       </section>
 
       <section className="bg-black px-[var(--ui-page-pad)] pb-[clamp(2.5rem,3.125vw,4rem)] pt-[clamp(1.4rem,3vw,2.2rem)]">
-        {displayPlaylistTracks.map((track, index) => (
-          <TrackRow
-            key={track.id}
-            track={track}
-            index={index}
-            onPlay={() => onPlayMany(displayPlaylistTracks, index, { kind: "playlist", browseId })}
-            showArtist
-            showAlbum
-            onNavigate={onNavigate}
-            onNavigateToAlbum={
-              track.albumBrowseId
-                ? () => onNavigate({ name: "album", browseId: track.albumBrowseId!, context: "default" })
-                : undefined
-            }
-            queueOrigin={{ kind: "playlist", browseId }}
-          />
-        ))}
+        <VirtualList
+          items={displayPlaylistTracks}
+          estimateSize={56}
+          getItemKey={(track) => track.id}
+          renderItem={(track, index) => (
+            <TrackRow
+              track={track}
+              index={index}
+              onPlay={() => onPlayMany(displayPlaylistTracks, index, { kind: "playlist", browseId })}
+              showArtist
+              showAlbum
+              onNavigate={onNavigate}
+              onNavigateToAlbum={
+                track.albumBrowseId
+                  ? () => onNavigate({ name: "album", browseId: track.albumBrowseId!, context: "default" })
+                  : undefined
+              }
+              queueOrigin={{ kind: "playlist", browseId }}
+            />
+          )}
+        />
       </section>
     </div>
   );
@@ -306,7 +321,7 @@ function AlbumPage({
   ) => Promise<Array<{ browseId: string; title: string; subtitle?: string | null; cover?: string | null }>>;
 }) {
   const player = usePlayer();
-  const collection = useCollection();
+  const { toggleSong } = useCollectionActions();
   const albumOrigin = player.queueOrigin;
   const albumBrowseId = browseId;
   const isAlbumActive =
@@ -389,11 +404,11 @@ function AlbumPage({
   const viewMenuScopeRef = useRef<HTMLDivElement | null>(null);
   const savedAlbum = useMemo<SavedAlbum>(() => entityToSavedAlbum(detail), [detail]);
   const isSingle = displayAlbumTracks.length === 1;
-  const isReleaseSaved = isSingle
-    ? (displayAlbumTracks[0]?.videoId
-        ? collection.isSongSavedByVideo(displayAlbumTracks[0].videoId)
-        : false)
-    : collection.isAlbumSaved(browseId);
+  const firstTrackVideoId = displayAlbumTracks[0]?.videoId;
+  const isSingleSaved = useIsSongSavedByVideo(isSingle ? firstTrackVideoId : null);
+  const isAlbumSavedState = useIsAlbumSaved(isSingle ? null : browseId);
+  const isReleaseSaved = isSingle ? isSingleSaved : isAlbumSavedState;
+  const toggleAlbumSave = useToggleAlbumSave(savedAlbum);
 
   useEffect(() => {
     setViewMenuOpen(false);
@@ -535,9 +550,9 @@ function AlbumPage({
             isSaved={isReleaseSaved}
             onToggle={() => {
               if (isSingle && displayAlbumTracks[0]) {
-                collection.toggleSong(displayAlbumTracks[0]);
+                toggleSong(displayAlbumTracks[0]);
               } else {
-                collection.toggleAlbum(savedAlbum);
+                toggleAlbumSave();
               }
             }}
             ariaLabel={isReleaseSaved ? "Remove from collection" : `Save ${isSingle ? "song" : "album"} to collection`}
@@ -612,11 +627,13 @@ function AlbumPage({
           <TrackListHeader showPlays dividerHidden={firstTrackHovered || firstTrackActive} />
         )}
 
-        <div>
-          {displayAlbumTracks.map((track, index) =>
+        <VirtualList
+          items={displayAlbumTracks}
+          estimateSize={viewMode === "compact" ? 44 : 56}
+          getItemKey={(track) => track.id}
+          renderItem={(track, index) =>
             viewMode === "compact" ? (
               <CompactTrackRow
-                key={track.id}
                 track={track}
                 index={index}
                 playColor={playColor}
@@ -626,7 +643,6 @@ function AlbumPage({
               />
             ) : (
               <AlbumTrackRow
-                key={track.id}
                 track={track}
                 index={index}
                 playColor={playColor}
@@ -636,9 +652,9 @@ function AlbumPage({
                 queueOrigin={{ kind: "album", browseId }}
                 parentIsSaved={isSingle ? isReleaseSaved : undefined}
               />
-            ),
-          )}
-        </div>
+            )
+          }
+        />
       </section>
     </div>
   );
@@ -651,7 +667,7 @@ function AlbumTrackRow({
   onPlay,
   onNavigate,
   onHoverChange,
-  queueOrigin,
+  queueOrigin: _queueOrigin,
   parentIsSaved,
 }: {
   track: MediaTrack;
@@ -663,13 +679,12 @@ function AlbumTrackRow({
   queueOrigin?: QueueOrigin | null;
   parentIsSaved?: boolean;
 }) {
-  const player = usePlayer();
-  const collection = useCollection();
-  const active = isSameSongTrack(player.currentTrack, track);
-  const playingActive = active && player.isPlaying;
-  const bufferingActive = active && player.isBuffering;
-  const contextPayload = useMemo(() => encodeTrackForContextMenu(track), [track]);
-  const isSaved = parentIsSaved ?? collection.isTrackSaved(track);
+  const { togglePlay } = usePlayerActions();
+  const rowIsSaved = useIsTrackSaved(track);
+  const toggleSave = useToggleTrackSave(track);
+  const { active, playingActive, bufferingActive } = useTrackPlaybackState(track);
+  const contextTarget = useContextTrackTarget(track);
+  const isSaved = parentIsSaved ?? rowIsSaved;
   const directArtistBrowseId = getDirectArtistBrowseId(track);
   const handleResolveNavigate = useCallback(() => {
     void resolveArtistBrowseId(track)
@@ -690,13 +705,11 @@ function AlbumTrackRow({
 
   return (
     <div
-      data-song-context-target="true"
-      data-track={contextPayload}
-      data-track-source={track.source ?? "stream"}
+      {...contextTarget}
       className={`group grid cursor-pointer ${ALBUM_TRACK_GRID_WITH_PLAYS} gap-3 rounded-lg px-4 py-2 transition-colors ${
         active ? "bg-white/[0.04]" : "hover:bg-neutral-900"
       }`}
-      onClick={active ? player.togglePlay : onPlay}
+      onClick={active ? togglePlay : onPlay}
       onContextMenu={(event) => {
         // Right-click should still trigger our custom menu, but the row's
         // primary click handler also opens playback. Stop propagation so the
@@ -720,7 +733,7 @@ function AlbumTrackRow({
           type="button"
           onClick={(event) => {
             event.stopPropagation();
-            (active ? player.togglePlay : onPlay)();
+            (active ? togglePlay : onPlay)();
           }}
           className={`absolute flex h-7 w-7 items-center justify-center text-white animate-none ${
             active ? "opacity-100" : "opacity-0 group-hover:opacity-100"
@@ -765,7 +778,7 @@ function AlbumTrackRow({
             <SaveButton
               isSaved={isSaved}
               size="sm"
-              onToggle={() => collection.toggleSong(track)}
+              onToggle={toggleSave}
               ariaLabel={isSaved ? "Remove from collection" : "Save to collection"}
             />
           </div>
@@ -798,7 +811,7 @@ function CompactTrackRow({
   playColor,
   onPlay,
   onHoverChange,
-  queueOrigin,
+  queueOrigin: _queueOrigin2,
 }: {
   track: MediaTrack;
   index: number;
@@ -807,21 +820,17 @@ function CompactTrackRow({
   onHoverChange?: (hovered: boolean) => void;
   queueOrigin?: QueueOrigin | null;
 }) {
-  const player = usePlayer();
-  const active = isSameSongTrack(player.currentTrack, track);
-  const playingActive = active && player.isPlaying;
-  const bufferingActive = active && player.isBuffering;
-  const contextPayload = useMemo(() => encodeTrackForContextMenu(track), [track]);
+  const { togglePlay } = usePlayerActions();
+  const { active, playingActive, bufferingActive } = useTrackPlaybackState(track);
+  const contextTarget = useContextTrackTarget(track);
 
   return (
     <div
-      data-song-context-target="true"
-      data-track={contextPayload}
-      data-track-source={track.source ?? "stream"}
+      {...contextTarget}
       className={`group grid cursor-pointer ${COMPACT_TRACK_GRID} gap-3 rounded-lg px-4 py-1.5 transition-colors ${
         active ? "bg-white/[0.04]" : "hover:bg-neutral-900"
       }`}
-      onClick={active ? player.togglePlay : onPlay}
+      onClick={active ? togglePlay : onPlay}
       onContextMenu={(event) => {
         // Right-click must surface our custom menu, but the row's primary
         // click handler also opens playback. Stop propagation so the
@@ -845,7 +854,7 @@ function CompactTrackRow({
           type="button"
           onClick={(event) => {
             event.stopPropagation();
-            (active ? player.togglePlay : onPlay)();
+            (active ? togglePlay : onPlay)();
           }}
           className={`absolute flex h-7 w-7 items-center justify-center text-white animate-none ${
             active ? "opacity-100" : "opacity-0 group-hover:opacity-100"

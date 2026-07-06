@@ -1,7 +1,7 @@
 import { createContext, useContext, useEffect, useState, type ReactNode } from "react";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { cacheArtwork } from "./api";
-import { usePlayer } from "./player";
+import { usePlayerCover } from "./hooks/usePlayerSelectors";
 import {
   extractInterestingArtworkColor,
   peekArtworkAccent,
@@ -17,8 +17,7 @@ type AccentContextValue = {
 const AccentContext = createContext<AccentContextValue>({ accent: DEFAULT_ACCENT });
 
 export function AccentProvider({ children }: { children: ReactNode }) {
-  const player = usePlayer();
-  const cover = player.currentTrack?.cover ?? null;
+  const cover = usePlayerCover();
   const [accent, setAccent] = useState<RgbColor>(() => peekArtworkAccent(cover) ?? DEFAULT_ACCENT);
 
   useEffect(() => {

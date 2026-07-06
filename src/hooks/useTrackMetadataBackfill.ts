@@ -1,6 +1,10 @@
 import { useEffect, useRef } from "react";
 import type { MediaTrack } from "../types";
-import { mergeTrackListMetadata, resolveTrackMetadata } from "../utils/track-metadata-backfill";
+import {
+  mergeTrackListMetadataBatch,
+  resolveTrackMetadata,
+  type TrackMetadataUpdates,
+} from "../utils/track-metadata-backfill";
 
 const MAX_ATTEMPTS = 3;
 const RETRY_DELAYS_MS = [700, 2500, 5000];
@@ -32,7 +36,19 @@ export function useTrackMetadataBackfill(
     const controller = new AbortController();
     let currentTracks = tracks;
 
-    async function backfillTrack(track: MediaTrack): Promise<boolean> {
+    const applyBatch = (updatesById: ReadonlyMap<string, TrackMetadataUpdates>) => {
+      if (updatesById.size === 0 || controller.signal.aborted) return false;
+      const next = mergeTrackListMetadataBatch(currentTracks, updatesById);
+      if (next === currentTracks) return false;
+      currentTracks = next;
+      onTracksChangeRef.current(currentTracks);
+      return true;
+    };
+
+    async function backfillTrack(
+      track: MediaTrack,
+      updatesById: Map<string, TrackMetadataUpdates>,
+    ): Promise<boolean> {
       if (controller.signal.aborted) return false;
       try {
         const updates = await resolveTrackMetadata(track, {
@@ -40,8 +56,7 @@ export function useTrackMetadataBackfill(
           needsPlayCount: backfillPlayCount && track.playCount == null,
         });
         if (!updates || controller.signal.aborted) return false;
-        currentTracks = mergeTrackListMetadata(currentTracks, track.id, updates);
-        onTracksChangeRef.current(currentTracks);
+        updatesById.set(track.id, updates);
         return true;
       } catch {
         return false;
@@ -49,8 +64,10 @@ export function useTrackMetadataBackfill(
     }
 
     async function backfillBatch(batch: MediaTrack[]): Promise<boolean> {
-      const results = await Promise.all(batch.map((track) => backfillTrack(track)));
-      return results.some(Boolean);
+      const updatesById = new Map<string, TrackMetadataUpdates>();
+      const results = await Promise.all(batch.map((track) => backfillTrack(track, updatesById)));
+      if (!results.some(Boolean)) return false;
+      return applyBatch(updatesById);
     }
 
     async function backfill() {

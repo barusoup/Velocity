@@ -1,7 +1,7 @@
 {
   "name": "velocity",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.1.1",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -14,9 +14,11 @@
     "test": "vitest run",
     "test:discord-presence": "vitest run src/discord-presence",
     "test:discord-presence:deep": "vitest run src/discord-presence/deep-scenarios.test.ts src/discord-presence/fuzz.test.ts",
-    "harness:discord-presence": "node scripts/discord-presence-harness.mjs"
+    "harness:discord-presence": "node scripts/discord-presence-harness.mjs",
+    "harness:memory-stress": "node scripts/memory-stress-harness.mjs"
   },
   "dependencies": {
+    "@tanstack/react-virtual": "^3.14.5",
     "@tauri-apps/api": "^2.10.0",
     "@tauri-apps/plugin-autostart": "^2.5.1",
     "@tauri-apps/plugin-dialog": "^2.7.1",

@@ -7,7 +7,7 @@
 //!   3. LRCLIB, then regional fallbacks (Kugou, QQ, NetEase)
 
 use std::{
-    path::{Path, PathBuf},
+    path::Path,
     time::{Duration, Instant, SystemTime},
 };
 
@@ -183,7 +183,7 @@ pub async fn build_resolve_context(
         None => None,
     };
     let leading_silence_skip_ms = match stream_file_path.as_deref() {
-        Some(path) => analyze_leading_silence_skip_ms(path).await.unwrap_or(0),
+        Some(path) => analyze_leading_silence_skip_ms(app, path).await.unwrap_or(0),
         None => 0,
     };
     LyricsResolveContext {
@@ -698,7 +698,7 @@ fn build_lyrics_from_lrc(lrc: &str, source: &str) -> Option<SyncedLyricsResponse
 // Leading silence (align third-party lyrics with stream playback position)
 // ---------------------------------------------------------------------------
 
-async fn analyze_leading_silence_skip_ms(file_path: &str) -> Option<u32> {
+async fn analyze_leading_silence_skip_ms(app: &AppHandle, file_path: &str) -> Option<u32> {
     const ANALYSIS_MAX_SECONDS: f64 = 45.0;
     const SILENCE_NOISE_DB: f64 = -30.0;
     const SILENCE_MIN_DURATION: f64 = 0.25;
@@ -714,7 +714,7 @@ async fn analyze_leading_silence_skip_ms(file_path: &str) -> Option<u32> {
         token.parse::<f64>().ok().filter(|value| value.is_finite())
     }
 
-    let ffmpeg = check_ffmpeg().await?;
+    let ffmpeg = crate::resolve_ffmpeg(app).await?;
     let null_device = if cfg!(target_os = "windows") {
         "NUL"
     } else {
@@ -776,20 +776,6 @@ async fn analyze_leading_silence_skip_ms(file_path: &str) -> Option<u32> {
             Some((clamped * 1000.0).round() as u32)
         }
     })
-}
-
-async fn check_ffmpeg() -> Option<PathBuf> {
-    let name = if cfg!(target_os = "windows") {
-        "ffmpeg.exe"
-    } else {
-        "ffmpeg"
-    };
-    let mut cmd = Command::new(name);
-    cmd.arg("-version");
-    #[cfg(target_os = "windows")]
-    cmd.creation_flags(CREATE_NO_WINDOW);
-    cmd.output().await.ok().filter(|o| o.status.success())?;
-    Some(PathBuf::from(name))
 }
 
 // ---------------------------------------------------------------------------
