@@ -8,6 +8,9 @@ static SAVED_WINDOW_BOUNDS: Lazy<
 
 static APP_FULLSCREEN: Lazy<StdMutex<bool>> = Lazy::new(|| StdMutex::new(false));
 
+static WAS_MAXIMIZED_BEFORE_FULLSCREEN: Lazy<StdMutex<bool>> =
+    Lazy::new(|| StdMutex::new(false));
+
 static APP_HANDLE: Lazy<StdMutex<Option<AppHandle>>> = Lazy::new(|| StdMutex::new(None));
 
 const MAIN_WINDOW_LABEL: &str = "main";
@@ -28,10 +31,18 @@ fn main_window() -> Option<WebviewWindow> {
 
 #[tauri::command]
 pub fn remember_window_bounds(window: WebviewWindow) -> Result<(), String> {
-    let size = window.outer_size().map_err(|e| e.to_string())?;
-    let position = window.outer_position().map_err(|e| e.to_string())?;
     #[cfg(windows)]
     {
+        let maximized = window.is_maximized().map_err(|e| e.to_string())?;
+        let (size, position) = if maximized {
+            restore_rect_from_placement(&window)?
+        } else {
+            (
+                window.outer_size().map_err(|e| e.to_string())?,
+                window.outer_position().map_err(|e| e.to_string())?,
+            )
+        };
+
         if window_fills_monitor(&window, size, position)? {
             // Pseudo-fullscreen dimensions — keep the pre-fullscreen bounds.
             if SAVED_WINDOW_BOUNDS
@@ -43,11 +54,22 @@ pub fn remember_window_bounds(window: WebviewWindow) -> Result<(), String> {
                 return Ok(());
             }
         }
+
+        if let Ok(mut saved) = SAVED_WINDOW_BOUNDS.lock() {
+            *saved = Some((size, position));
+        }
+        return Ok(());
     }
-    if let Ok(mut saved) = SAVED_WINDOW_BOUNDS.lock() {
-        *saved = Some((size, position));
+
+    #[cfg(not(windows))]
+    {
+        let size = window.outer_size().map_err(|e| e.to_string())?;
+        let position = window.outer_position().map_err(|e| e.to_string())?;
+        if let Ok(mut saved) = SAVED_WINDOW_BOUNDS.lock() {
+            *saved = Some((size, position));
+        }
+        Ok(())
     }
-    Ok(())
 }
 
 #[tauri::command]
@@ -113,6 +135,10 @@ pub fn toggle_app_fullscreen(window: WebviewWindow) -> Result<bool, String> {
             *app_fs = false;
             return Ok(false);
         }
+        let maximized = window.is_maximized().map_err(|e| e.to_string())?;
+        if let Ok(mut was_maximized) = WAS_MAXIMIZED_BEFORE_FULLSCREEN.lock() {
+            *was_maximized = maximized;
+        }
         remember_window_bounds(window.clone())?;
         apply_pseudo_fullscreen(&window)?;
         *app_fs = true;
@@ -158,8 +184,52 @@ fn exit_pseudo_fullscreen(window: &WebviewWindow) -> Result<(), String> {
     // Restore shadow before applying saved outer bounds so Tauri measures
     // size the same way as when remember_window_bounds captured them.
     window.set_shadow(true).map_err(|e| e.to_string())?;
+
+    let should_remaximize = WAS_MAXIMIZED_BEFORE_FULLSCREEN
+        .lock()
+        .map(|state| *state)
+        .unwrap_or(false);
+
+    // Pseudo-fullscreen can leave WS_MAXIMIZE set when entered from the
+    // titlebar maximize button — unmaximize so restore bounds are applied.
+    if window.is_maximized().map_err(|e| e.to_string())? {
+        window.unmaximize().map_err(|e| e.to_string())?;
+    }
+
     restore_saved_bounds(window)?;
+
+    if should_remaximize {
+        window.maximize().map_err(|e| e.to_string())?;
+    }
+    if let Ok(mut was_maximized) = WAS_MAXIMIZED_BEFORE_FULLSCREEN.lock() {
+        *was_maximized = false;
+    }
     Ok(())
+}
+
+#[cfg(windows)]
+fn restore_rect_from_placement(
+    window: &WebviewWindow,
+) -> Result<(PhysicalSize<u32>, PhysicalPosition<i32>), String> {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::{GetWindowPlacement, WINDOWPLACEMENT};
+
+    let hwnd: HWND = window.hwnd().map_err(|e| e.to_string())?;
+    let mut placement = WINDOWPLACEMENT {
+        length: std::mem::size_of::<WINDOWPLACEMENT>() as u32,
+        ..Default::default()
+    };
+    unsafe {
+        GetWindowPlacement(hwnd, &mut placement).map_err(|e| e.to_string())?;
+    }
+
+    let rect = placement.rcNormalPosition;
+    let width = (rect.right - rect.left).max(1) as u32;
+    let height = (rect.bottom - rect.top).max(1) as u32;
+    Ok((
+        PhysicalSize::new(width, height),
+        PhysicalPosition::new(rect.left, rect.top),
+    ))
 }
 
 #[cfg(windows)]
@@ -256,6 +326,9 @@ unsafe extern "system" fn fullscreen_drag_subclass(
         if let Ok(mut app_fs) = APP_FULLSCREEN.lock() {
             if *app_fs && restore_under_cursor(hwnd).is_ok() {
                 *app_fs = false;
+                if let Ok(mut was_maximized) = WAS_MAXIMIZED_BEFORE_FULLSCREEN.lock() {
+                    *was_maximized = false;
+                }
             }
         }
     }

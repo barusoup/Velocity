@@ -1,5 +1,5 @@
 import { useVirtualizer, type Virtualizer } from "@tanstack/react-virtual";
-import { useRef, type ReactNode, type RefObject } from "react";
+import { useLayoutEffect, useRef, type ReactNode, type RefObject } from "react";
 
 const MAIN_SCROLLPORT_SELECTOR = ".main-scrollport";
 
@@ -17,6 +17,12 @@ type VirtualListProps<T> = {
   className?: string;
   /** Override the scroll container (e.g. queue panel's own scrollport). */
   scrollElement?: RefObject<Element | null>;
+  /**
+   * When false, virtual row DOM is not mounted. Use for lists inside
+   * `display:none` / inert containers so stale transforms are not painted
+   * on the first frame after the parent becomes visible.
+   */
+  enabled?: boolean;
 };
 
 export function VirtualList<T>({
@@ -27,6 +33,7 @@ export function VirtualList<T>({
   overscan = 10,
   className,
   scrollElement,
+  enabled = true,
 }: VirtualListProps<T>) {
   const listRef = useRef<HTMLDivElement>(null);
 
@@ -42,7 +49,12 @@ export function VirtualList<T>({
 
   return (
     <div ref={listRef} className={className}>
-      <VirtualListBody virtualizer={virtualizer} items={items} renderItem={renderItem} />
+      <VirtualListBody
+        virtualizer={virtualizer}
+        items={items}
+        renderItem={renderItem}
+        enabled={enabled}
+      />
     </div>
   );
 }
@@ -51,17 +63,39 @@ function VirtualListBody<T>({
   virtualizer,
   items,
   renderItem,
+  enabled,
 }: {
   virtualizer: Virtualizer<Element, Element>;
   items: T[];
   renderItem: (item: T, index: number) => ReactNode;
+  enabled: boolean;
 }) {
+  useLayoutEffect(() => {
+    if (!enabled) return;
+    // Re-sync positions after a hidden→visible transition before paint.
+    virtualizer.scrollToOffset(virtualizer.scrollOffset, { behavior: "auto" });
+  }, [enabled, virtualizer, items.length]);
+
+  const totalSize = virtualizer.getTotalSize();
+
+  if (!enabled) {
+    return (
+      <div
+        style={{
+          height: totalSize,
+          width: "100%",
+          position: "relative",
+        }}
+      />
+    );
+  }
+
   const virtualItems = virtualizer.getVirtualItems();
 
   return (
     <div
       style={{
-        height: virtualizer.getTotalSize(),
+        height: totalSize,
         width: "100%",
         position: "relative",
       }}
@@ -77,8 +111,6 @@ function VirtualListBody<T>({
             left: 0,
             width: "100%",
             transform: `translateY(${virtualRow.start}px)`,
-            contentVisibility: "auto",
-            containIntrinsicSize: `auto ${virtualRow.size}px`,
           }}
         >
           {renderItem(items[virtualRow.index]!, virtualRow.index)}

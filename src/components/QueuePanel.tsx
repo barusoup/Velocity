@@ -525,6 +525,7 @@ export function QueuePanel({ open, onNavigate }: { open: boolean; onNavigate: (v
           <QueueSection label="Recently played">
             <VirtualList
               items={player.recentlyPlayed}
+              enabled={open}
               estimateSize={ROW_HEIGHT}
               scrollElement={scrollRef}
               overscan={8}

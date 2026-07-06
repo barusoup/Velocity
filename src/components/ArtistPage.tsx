@@ -283,7 +283,7 @@ export function ArtistPage({
   );
   const [displayTopSongs, setDisplayTopSongs] = useState<MediaTrack[]>(topSongs);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     setDisplayTopSongs(topSongs);
   }, [topSongs]);
 
@@ -316,7 +316,7 @@ export function ArtistPage({
   );
 
   const showTopTracksExpand =
-    (detail?.topSongs.length ?? 0) > 5 || Boolean(detail?.topSongsHasMore);
+    displayTopSongs.length > 5 || Boolean(detail?.topSongsHasMore);
 
   const handleTogglePopular = useCallback(async () => {
     if (collapseTimerRef.current) {
@@ -536,7 +536,9 @@ function ArtistOverview({
   );
   const toggleArtistSave = useToggleArtistSave(savedArtist);
   const [topTrackHovered, setTopTrackHovered] = useState(false);
-  const firstTopTrackActive = topSongs[0] ? isSameSongTrack(player.currentTrack, topSongs[0]) : false;
+  const firstTopTrackActive = topSongs[0]
+    ? isSameSongTrack(player.currentTrack, topSongs[0])
+    : false;
   const handlePlayRelease = useCallback((item: ReleaseItem) => {
     const browseId = item.browseId;
     if (!browseId) return;
@@ -709,7 +711,7 @@ function ArtistOverview({
 
           <button
             type="button"
-              onClick={player.toggleShuffle}
+            onClick={player.toggleShuffle}
             disabled={topSongs.length === 0}
             className={`flex h-10 w-10 items-center justify-center transition hover:text-white animate-none ${
               player.shuffle ? "text-white" : "text-white/58"

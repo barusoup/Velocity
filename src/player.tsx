@@ -200,6 +200,11 @@ type SavedSession = {
   savedAt: number;
 };
 
+type BootRestorePending = {
+  trackId: string;
+  progress: number;
+};
+
 function parseSavedSessionRaw(raw: string | null): SavedSession | null {
   if (!raw) return null;
   try {
@@ -226,6 +231,9 @@ function getBootSession(): SavedSession | null {
     }
     if (cachedBootSession) {
       hydratePersistedLyricsForTrack(cachedBootSession.track);
+      // Seed the UI store synchronously so the player bar can paint the
+      // saved timestamp on the first frame — the mount effect runs too late.
+      usePlayerUiStore.getState().resetProgress(cachedBootSession.progress);
     }
   }
   return cachedBootSession;
@@ -253,17 +261,31 @@ function readAudioElementDuration(audio: HTMLAudioElement): number | null {
   return value > 0 ? value : null;
 }
 
-function waitForMediaReady(audio: HTMLAudioElement): Promise<void> {
+function waitForMediaReady(
+  audio: HTMLAudioElement,
+  isStale?: () => boolean,
+): Promise<void> {
+  if (isStale?.()) {
+    return Promise.reject(new Error("STALE_LOAD"));
+  }
   if (audio.readyState >= HTMLMediaElement.HAVE_FUTURE_DATA) {
     return Promise.resolve();
   }
   return new Promise((resolve, reject) => {
     const onReady = () => {
       cleanup();
+      if (isStale?.()) {
+        reject(new Error("STALE_LOAD"));
+        return;
+      }
       resolve();
     };
     const onError = () => {
       cleanup();
+      if (isStale?.()) {
+        reject(new Error("STALE_LOAD"));
+        return;
+      }
       reject(new Error(describeMediaError(audio.error) ?? "The audio could not be reloaded."));
     };
     const cleanup = () => {
@@ -273,6 +295,10 @@ function waitForMediaReady(audio: HTMLAudioElement): Promise<void> {
     audio.addEventListener("canplay", onReady);
     audio.addEventListener("error", onError);
   });
+}
+
+function isStaleLoadError(error: unknown): boolean {
+  return error instanceof Error && error.message === "STALE_LOAD";
 }
 
 function isPlaybackIdleLongEnough(idleSinceMs: number): boolean {
@@ -707,16 +733,14 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
   // Set by the load effect while it owns the audio element (loading or
   // retrying) so the global error handler doesn't undo the buffering state.
   const loadInProgressRef = useRef(false);
-  // Guards the very first track load of the session: any track that is set
-  // without an explicit user-initiated play() / playMany() call (e.g. a
-  // session restore from saveTimestamp) starts paused so the user is never
-  // surprised by auto-playing audio on app launch. The flag is cleared
-  // before the first user-driven play() runs so normal playback is
-  // unaffected.
-  const isSessionRestoreRef = useRef(Boolean(bootSession));
-  // When restoring a session, carry the saved seek position so the load
-  // effect can jump to it before the first paint.
-  const seekOnNextLoadRef = useRef(bootSession?.progress ?? 0);
+  // Survives load-effect re-runs (e.g. React Strict Mode) until the user
+  // explicitly starts playback. Any load of this track without a user
+  // play() / playMany() / togglePlay() intent must start paused.
+  const bootRestorePendingRef = useRef<BootRestorePending | null>(
+    bootSession
+      ? { trackId: bootSession.track.id, progress: bootSession.progress }
+      : null,
+  );
   // Wall-clock time when playback last went idle (paused or loaded-but-not-
   // playing). Used to decide whether the cached stream file must be
   // re-resolved before the next play() call.
@@ -740,9 +764,14 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
     usePlayerUiStore.getState().setSeekScrubProgress(value);
   }, []);
   // User play/pause intent captured while the load effect still owns the audio
-  // element. `null` = no preference (normal play()/next() loads still auto-play);
-  // `true`/`false` = the user explicitly toggled during load.
+  // element. `null` = no preference (normal play()/playMany() loads still auto-play);
+  // `true`/`false` = the user explicitly toggled during load, or navigation captured
+  // whether the prior track was playing.
   const playWhenReadyRef = useRef<boolean | null>(null);
+  // Set by navigation stops that tear down audio without changing the active
+  // queue slot (e.g. removing a duplicate of the current track). Consumed by
+  // setQueueState to bump loadToken so the load effect re-runs.
+  const pendingForceReloadRef = useRef(false);
   const currentAudioPathRef = useRef<string | null>(null);
   const leadingSilenceSkipRef = useRef(0);
 
@@ -979,6 +1008,8 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
     // replacement (play/playMany/reloadAutoplay/restoreHistoryEntry all
     // change the seed; queue reorders and appends do not).
     const prevAutoplaySeed = autoplaySeedRef.current;
+    const priorTrackId = trackRef.current?.id ?? null;
+    const priorIndex = queueIndexRef.current;
 
     queueRef.current = normalizedQueue;
     queueIndexRef.current = normalizedIndex;
@@ -1007,6 +1038,16 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
       trackRef.current = activeTrack;
       setCurrentTrack(activeTrack);
       setDuration(activeTrack.durationSeconds ?? 0);
+      const navigationChanged =
+        activeTrack.id !== priorTrackId || normalizedIndex !== priorIndex;
+      if (navigationChanged || pendingForceReloadRef.current) {
+        pendingForceReloadRef.current = false;
+        setLoadToken((token) => token + 1);
+      }
+    }
+
+    if (normalizedQueue.length === 0) {
+      pendingForceReloadRef.current = false;
     }
 
     // If the autoplay seed has just been replaced, cancel any pending
@@ -1198,10 +1239,22 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
     audio.muted = nextMuted;
   }, []);
 
-  const stopCurrentPlayback = useCallback(() => {
+  const stopCurrentPlayback = useCallback((options?: {
+    capturePlayIntent?: boolean;
+    forceReload?: boolean;
+  }) => {
     const audio = audioRef.current;
     if (!audio) return;
-    playWhenReadyRef.current = null;
+    if (options?.capturePlayIntent) {
+      if (playWhenReadyRef.current === null) {
+        playWhenReadyRef.current = !audio.paused;
+      }
+      if (options.forceReload) {
+        pendingForceReloadRef.current = true;
+      }
+    } else {
+      playWhenReadyRef.current = null;
+    }
     audio.pause();
     audio.removeAttribute("src");
     audio.currentTime = 0;
@@ -1494,9 +1547,12 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
       const currentTime = audio.currentTime || 0;
       // While a session-restore load is still resolving audio, keep showing
       // the saved position instead of flashing 0:00 on every timeupdate.
+      const bootPending = bootRestorePendingRef.current;
       if (
         loadInProgressRef.current &&
-        seekOnNextLoadRef.current > 0 &&
+        bootPending &&
+        bootPending.trackId === trackRef.current?.id &&
+        bootPending.progress > 0 &&
         currentTime === 0
       ) {
         return;
@@ -1508,8 +1564,14 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
     };
 
     const handlePlay = () => {
-      if (isSessionRestoreRef.current) {
+      const bootPending = bootRestorePendingRef.current;
+      if (
+        bootPending &&
+        bootPending.trackId === trackRef.current?.id &&
+        playWhenReadyRef.current !== true
+      ) {
         audio.pause();
+        setIsPlaying(false);
         return;
       }
       if (sourceRefreshInProgressRef.current) {
@@ -1609,6 +1671,9 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
         (autoplayRef.current && autoplaySeedRef.current?.videoId)
       );
       if (hasMore) {
+        // Ended tracks report `paused === true`; seed play intent before
+        // next() captures from the audio element so queue advance keeps going.
+        playWhenReadyRef.current = true;
         void nextRef.current?.(true);
       } else {
         setIsPlaying(false);
@@ -1723,9 +1788,12 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
 
       const currentTime = audio.currentTime;
       if (!Number.isFinite(currentTime)) return;
+      const bootPending = bootRestorePendingRef.current;
       if (
         loadInProgressRef.current &&
-        seekOnNextLoadRef.current > 0 &&
+        bootPending &&
+        bootPending.trackId === trackRef.current?.id &&
+        bootPending.progress > 0 &&
         currentTime === 0
       ) {
         return;
@@ -1917,9 +1985,10 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
 
     setLastError(null);
     setIsBuffering(true);
+    const bootPending = bootRestorePendingRef.current;
     const pendingRestoreProgress =
-      isSessionRestoreRef.current && seekOnNextLoadRef.current > 0
-        ? seekOnNextLoadRef.current
+      bootPending && bootPending.trackId === currentTrack.id
+        ? bootPending.progress
         : 0;
     progressRef.current = pendingRestoreProgress;
     writeProgress(pendingRestoreProgress);
@@ -2119,13 +2188,16 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
         if (!src) throw new Error("No audio source is available for this track.");
         if (cancelled) return;
         audio.src = src;
+        audio.load();
 
         const loudnessCacheKey = getAudioCacheKey(trackForLoad);
         refreshLeadingSilenceSkipRef(loudnessCacheKey);
         if (resolvedFilePath) {
           void ensureLeadingSilenceAnalyzed(loudnessCacheKey, resolvedFilePath);
         }
-        await waitForMediaReady(audio);
+        const isStaleLoad = () =>
+          cancelled || trackRef.current?.id !== loadTrackId;
+        await waitForMediaReady(audio, isStaleLoad);
         if (cancelled || trackRef.current?.id !== loadTrackId) return;
         applyDurationFromAudio(audio);
 
@@ -2158,10 +2230,9 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
         // On initial app boot, any track that was loaded without an explicit
         // user play() call (session restore, etc.) must start paused so the
         // app never auto-plays on launch. Also seek to the saved position
-        // carried by seekOnNextLoadRef.
-        if (isSessionRestoreRef.current) {
-          const savedPos = seekOnNextLoadRef.current;
-          seekOnNextLoadRef.current = 0;
+        // carried by bootRestorePendingRef (survives load-effect re-runs).
+        if (bootPending && bootPending.trackId === loadTrackId) {
+          const savedPos = bootPending.progress;
           if (savedPos > 0) {
             audio.currentTime = savedPos;
             progressRef.current = savedPos;
@@ -2171,13 +2242,14 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
           }
           const shouldPlay = playWhenReadyRef.current === true;
           playWhenReadyRef.current = null;
-          isSessionRestoreRef.current = false;
           lastPlaybackIdleAtRef.current = shouldPlay ? 0 : Date.now();
           loadInProgressRef.current = false;
           setLastError(null);
           if (shouldPlay) {
+            bootRestorePendingRef.current = null;
             await audio.play();
             if (cancelled) return;
+            setIsPlaying(true);
           } else {
             audio.pause();
             setIsPlaying(false);
@@ -2196,7 +2268,17 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
         playWhenReadyRef.current = null;
         const shouldPlay = userIntent !== false;
         if (shouldPlay) {
-          await audio.play();
+          try {
+            await audio.play();
+          } catch (playError) {
+            if (cancelled || trackRef.current?.id !== loadTrackId) return;
+            throw playError;
+          }
+          if (cancelled || trackRef.current?.id !== loadTrackId) return;
+          setIsPlaying(true);
+          if (!audio.readyState || audio.readyState < HTMLMediaElement.HAVE_FUTURE_DATA) {
+            setIsBuffering(true);
+          }
         } else {
           audio.pause();
           setIsPlaying(false);
@@ -2209,7 +2291,7 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
         loadInProgressRef.current = false;
         setLastError(null);
       } catch (err) {
-        if (cancelled) return;
+        if (cancelled || isStaleLoadError(err)) return;
         lastAttemptError = err;
         if (retriesLeft <= 0) {
           finalize();
@@ -2234,7 +2316,7 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
       audio.pause();
       audio.currentTime = 0;
     };
-  }, [currentTrack?.id, ensureAudioGraph, loadToken, patchQueueTrackInRef, applyDurationFromAudio]);
+  }, [currentTrack?.id, queueIndex, ensureAudioGraph, loadToken, patchQueueTrackInRef, applyDurationFromAudio]);
 
   useEffect(() => {
     if (!currentTrack) {
@@ -2419,7 +2501,7 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
     // Record the previous track in history before any async work so that
     // navigating away while a track is still loading still registers it.
     if (trackRef.current) rememberPlaybackHistory();
-    isSessionRestoreRef.current = false;
+    bootRestorePendingRef.current = null;
     const version = ++playVersionRef.current;
     stopCurrentPlayback();
     autoplayAdvancePendingRef.current = false;
@@ -2481,7 +2563,7 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
     if (queueable.length === 0) return;
     // Record the previous track in history before any async work.
     if (trackRef.current) rememberPlaybackHistory();
-    isSessionRestoreRef.current = false;
+    bootRestorePendingRef.current = null;
     const version = ++playVersionRef.current;
     stopCurrentPlayback();
     autoplayAdvancePendingRef.current = false;
@@ -2596,6 +2678,7 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
     const crossfadeOn = getSetting("crossfade");
 
     if (audio.paused) {
+      bootRestorePendingRef.current = null;
       setIsPlaying(true);
       setIsBuffering(!audio.readyState || audio.readyState < HTMLMediaElement.HAVE_FUTURE_DATA);
       void ensureAudioGraph();
@@ -3093,7 +3176,7 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
       if (recordRecentlyPlayed && !redoingForward) rememberPlaybackHistory();
       const nextTrack = currentQueue[currentIndex + 1];
       if (nextTrack) markQueueTrackVisited(nextTrack.id);
-      stopCurrentPlayback();
+      stopCurrentPlayback({ capturePlayIntent: true });
       invalidateAutoplayFetch();
       setQueueState({
         queue: currentQueue,
@@ -3110,7 +3193,7 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
       if (recordRecentlyPlayed) rememberPlaybackHistory();
       const wrapTrack = currentQueue[0];
       if (wrapTrack) markQueueTrackVisited(wrapTrack.id);
-      stopCurrentPlayback();
+      stopCurrentPlayback({ capturePlayIntent: true });
       invalidateAutoplayFetch();
       setQueueState({
         queue: currentQueue,
@@ -3124,7 +3207,7 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
     }
     if (autoplayRef.current && autoplaySeedRef.current?.videoId) {
       if (recordRecentlyPlayed) rememberPlaybackHistory();
-      stopCurrentPlayback();
+      stopCurrentPlayback({ capturePlayIntent: true });
       autoplayAdvancePendingRef.current = true;
       invalidateAutoplayFetch();
       void fetchAndAppendAutoplay();
@@ -3161,7 +3244,7 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
     }
     const targetTrack = currentQueue[nextIndex];
     if (targetTrack) markQueueTrackVisited(targetTrack.id);
-    stopCurrentPlayback();
+    stopCurrentPlayback({ capturePlayIntent: true });
     invalidateAutoplayFetch();
     setQueueState({
       queue: currentQueue,
@@ -3178,7 +3261,7 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
     if (!entry) return;
 
     autoplayAdvancePendingRef.current = false;
-    stopCurrentPlayback();
+    stopCurrentPlayback({ capturePlayIntent: true });
 
     let restoredEntry = entry;
     if (entry.queueOrigin) {
@@ -3301,7 +3384,7 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
       : autoplayIds;
 
     if (isCurrent) {
-      stopCurrentPlayback();
+      stopCurrentPlayback({ capturePlayIntent: true, forceReload: true });
     }
 
     setQueueVisitedTrackIds((current) => removeVisitedQueueTrack(current, trackId));
@@ -3440,7 +3523,7 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
       queueVisitedTrackIdsRef.current,
     );
     if (previousVisitedIndex >= 0) {
-      stopCurrentPlayback();
+      stopCurrentPlayback({ capturePlayIntent: true });
       setQueueState({
         queue: queueRef.current,
         queueIndex: previousVisitedIndex,

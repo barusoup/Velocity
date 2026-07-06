@@ -9,6 +9,62 @@ export type TrackMetadataUpdates = {
   albumBrowseId?: string | null;
 };
 
+const METADATA_MEMORY_MAX = 1000;
+const metadataResolvedMemory = new Map<string, TrackMetadataUpdates>();
+const metadataExhaustedKeys = new Set<string>();
+
+function metadataMemoryKey(trackId: string, scope: "core" | "album"): string {
+  return `${scope}:${trackId}`;
+}
+
+function rememberMetadata(key: string, updates: TrackMetadataUpdates | null): void {
+  if (updates && Object.keys(updates).length > 0) {
+    metadataResolvedMemory.set(key, updates);
+    while (metadataResolvedMemory.size > METADATA_MEMORY_MAX) {
+      const oldest = metadataResolvedMemory.keys().next().value;
+      if (oldest === undefined) break;
+      metadataResolvedMemory.delete(oldest);
+    }
+    return;
+  }
+  metadataExhaustedKeys.add(key);
+}
+
+export function peekTrackMetadataCache(
+  trackId: string,
+  scope: "core" | "album",
+): TrackMetadataUpdates | null {
+  return metadataResolvedMemory.get(metadataMemoryKey(trackId, scope)) ?? null;
+}
+
+export function isTrackMetadataBackfillExhausted(
+  trackId: string,
+  scope: "core" | "album",
+): boolean {
+  return metadataExhaustedKeys.has(metadataMemoryKey(trackId, scope));
+}
+
+export function trackNeedsCollectionMetadataBackfill(track: MediaTrack): boolean {
+  if (!track.videoId) return false;
+  const needsDuration = track.durationSeconds == null;
+  const needsPlayCount = track.playCount == null;
+  const needsAlbum = isPlaceholderAlbumName(track.album);
+  const needsAlbumBrowseId = !track.albumBrowseId?.trim();
+  if (!needsDuration && !needsPlayCount && !needsAlbum && !needsAlbumBrowseId) return false;
+
+  const coreKey = metadataMemoryKey(track.id, "core");
+  const albumKey = metadataMemoryKey(track.id, "album");
+  const corePending =
+    (needsDuration || needsPlayCount) &&
+    !metadataResolvedMemory.has(coreKey) &&
+    !metadataExhaustedKeys.has(coreKey);
+  const albumPending =
+    (needsAlbum || needsAlbumBrowseId) &&
+    !metadataResolvedMemory.has(albumKey) &&
+    !metadataExhaustedKeys.has(albumKey);
+  return corePending || albumPending;
+}
+
 export async function resolveTrackMetadata(
   track: MediaTrack,
   options?: { needsDuration?: boolean; needsPlayCount?: boolean },
@@ -16,6 +72,20 @@ export async function resolveTrackMetadata(
   const needsDuration = options?.needsDuration ?? track.durationSeconds == null;
   const needsPlayCount = options?.needsPlayCount ?? track.playCount == null;
   if (!track.videoId || (!needsDuration && !needsPlayCount)) return null;
+
+  const memoryKey = metadataMemoryKey(track.id, "core");
+  if (metadataExhaustedKeys.has(memoryKey)) return null;
+  const cached = metadataResolvedMemory.get(memoryKey);
+  if (cached) {
+    const filtered: TrackMetadataUpdates = {};
+    if (needsDuration && cached.durationSeconds != null) {
+      filtered.durationSeconds = cached.durationSeconds;
+    }
+    if (needsPlayCount && cached.playCount != null) {
+      filtered.playCount = cached.playCount;
+    }
+    return Object.keys(filtered).length > 0 ? filtered : null;
+  }
 
   let duration: number | null = track.durationSeconds ?? null;
   let playCount: string | null = track.playCount ?? null;
@@ -61,7 +131,9 @@ export async function resolveTrackMetadata(
   const updates: TrackMetadataUpdates = {};
   if (needsDuration && duration != null) updates.durationSeconds = duration;
   if (needsPlayCount && playCount != null) updates.playCount = playCount;
-  return Object.keys(updates).length > 0 ? updates : null;
+  const result = Object.keys(updates).length > 0 ? updates : null;
+  rememberMetadata(memoryKey, result);
+  return result;
 }
 
 export async function resolveTrackAlbumMetadata(
@@ -73,6 +145,18 @@ export async function resolveTrackAlbumMetadata(
   const needsBrowseId = !track.albumBrowseId?.trim();
   if (!needsAlbum && !needsBrowseId) return null;
 
+  const memoryKey = metadataMemoryKey(track.id, "album");
+  if (metadataExhaustedKeys.has(memoryKey)) return null;
+  const cached = metadataResolvedMemory.get(memoryKey);
+  if (cached) {
+    const filtered: Pick<TrackMetadataUpdates, "album" | "albumBrowseId"> = {};
+    if (needsAlbum && cached.album != null) filtered.album = cached.album;
+    if (needsBrowseId && cached.albumBrowseId != null) {
+      filtered.albumBrowseId = cached.albumBrowseId;
+    }
+    return Object.keys(filtered).length > 0 ? filtered : null;
+  }
+
   try {
     const resolution = await resolveTrackAlbum(track.videoId);
     const updates: Pick<TrackMetadataUpdates, "album" | "albumBrowseId"> = {};
@@ -82,8 +166,11 @@ export async function resolveTrackAlbumMetadata(
     if (needsBrowseId && resolution.albumBrowseId?.trim()) {
       updates.albumBrowseId = resolution.albumBrowseId.trim();
     }
-    return Object.keys(updates).length > 0 ? updates : null;
+    const result = Object.keys(updates).length > 0 ? updates : null;
+    rememberMetadata(memoryKey, result);
+    return result;
   } catch {
+    rememberMetadata(memoryKey, null);
     return null;
   }
 }
