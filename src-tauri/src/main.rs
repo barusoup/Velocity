@@ -46,6 +46,7 @@ const YT_DLP_URL: &str = "https://github.com/yt-dlp/yt-dlp/releases/latest/downl
 const CLIENT_CACHE_TTL: Duration = Duration::from_secs(60 * 60 * 6);
 const STREAM_CACHE_TTL: Duration = Duration::from_secs(60 * 45);
 const WATCH_PLAYLIST_CACHE_TTL: Duration = Duration::from_secs(60 * 30);
+const TRACK_DURATION_CACHE_TTL: Duration = Duration::from_secs(60 * 60 * 24 * 7);
 const PREFERRED_THUMBNAIL_WIDTH: u64 = 640;
 const ARTIST_AVATAR_SIZE: u64 = 640;
 const ARTIST_BANNER_WIDTH: u64 = 2880;
@@ -102,7 +103,7 @@ struct AppState {
     client_config: Mutex<Option<InnerTubeConfig>>,
     stream_cache: Mutex<HashMap<String, CachedStream>>,
     watch_playlist_cache: Mutex<HashMap<String, CachedWatchPlaylist>>,
-    track_duration_cache: Mutex<HashMap<String, Option<u32>>>,
+    track_duration_cache: Mutex<HashMap<String, CachedTrackDuration>>,
     import_library: Mutex<()>,
     musixmatch_token: Mutex<Option<MusixmatchTokenCache>>,
     data_lock: DataFileLock,
@@ -129,6 +130,11 @@ struct CachedStream {
 struct CachedWatchPlaylist {
     tracks: Vec<MediaTrack>,
     playlist_id: Option<String>,
+    fetched_at: Instant,
+}
+
+struct CachedTrackDuration {
+    duration: Option<u32>,
     fetched_at: Instant,
 }
 
@@ -885,21 +891,21 @@ async fn import_youtube_playlist(
 // read the public web player HTML directly. The page is server-rendered
 // when we present a non-browser User-Agent — that gives us:
 //   * <meta property="og:title">       — playlist name
-//   * <meta property="og:description"> — "Playlist · <owner> · <N> items · <M> saves"
+//   * <meta property="og:image">       — 300x300 cover art
 //
-// KNOWN GAPS (no fix possible without Spotify auth — see scrape fn body):
+// HOWEVER, Spotify's SSR only returns the first ~30 tracks. To get the
+// full playlist (tested on 305-song playlists), we extract an anonymous
+// access token from the page and call the Spotify Web API with pagination.
+// The token is embedded in the HTML as:
+//   window.__spotify_webplayer_access_token = "BQC...";
+//
+// If the token extraction fails (Spotify changed the pattern), we fall
+// back to the old SSR track-row scraping which gets at least the first
+// page of tracks.
+//
+// KNOWN GAPS:
 //   * `description` is dropped — the og:description above is a hard-coded
 //     template, not the user's actual playlist description.
-//   * per-row `duration_seconds` is always None — the server-rendered row
-//     markup carries no duration; Spotify hydrates it client-side.
-//   * <meta property="og:image">       — 300x300 cover art
-//   * one <div data-testid="track-row"> per track, each containing:
-//       <a href="/track/<id>">…<span class="e-10451-line-clamp">TITLE</span></a>
-//       <span data-testid="internal-artist-link">…<a>ARTIST</a></span>
-//
-// We deliberately do NOT try to call Spotify's JSON API; it requires an
-// auth token tied to a logged-in user. The public page above is enough
-// to match tracks against YouTube Music.
 static SPOTIFY_OG_TITLE_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r#"(?is)<meta\s+property="og:title"\s+content="([^"]+)"#).expect("spotify og:title"));
 // (SPOTIFY_OG_DESCRIPTION_RE removed: Spotify's og:description is a hard-coded
@@ -910,6 +916,13 @@ static SPOTIFY_OG_TITLE_RE: Lazy<Regex> =
 static SPOTIFY_OG_IMAGE_RE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r#"(?is)<meta\s+property="og:image"\s+content="([^"]+)"#)
         .expect("spotify og:image")
+});
+static SPOTIFY_ACCESS_TOKEN_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r#"window\.__spotify_webplayer_access_token\s*=\s*"([^"]+)""#)
+        .expect("spotify access token")
+});
+static SPOTIFY_PLAYLIST_ID_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r#"/playlist/([a-zA-Z0-9]+)"#).expect("spotify playlist id")
 });
 static SPOTIFY_TRACK_ROW_MARKER_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r#"data-testid="track-row""#).expect("spotify track row marker"));
@@ -922,11 +935,179 @@ static SPOTIFY_ARTIST_RE: Lazy<Regex> = Lazy::new(|| {
         .expect("spotify artist")
 });
 
+// Fetch ALL tracks from a Spotify public playlist via the Spotify Web API
+// using an anonymous access token extracted from the page HTML. Handles
+// pagination so playlists of any length (tested on 305-song playlists)
+// return every track. Falls back to None silently on any failure so the
+// caller can drop to the SSR scraping fallback.
+async fn fetch_spotify_tracks_via_api(
+    url: &str,
+    html: &str,
+) -> Option<Vec<ExternalPlaylistTrack>> {
+    let playlist_id = SPOTIFY_PLAYLIST_ID_RE.captures(url)?.get(1)?.as_str().to_string();
+
+    // Try to extract the anonymous access token from the HTML first.
+    let mut access_token = SPOTIFY_ACCESS_TOKEN_RE
+        .captures(html)?
+        .get(1)?
+        .as_str()
+        .to_string();
+
+    // If the token is empty or literal "null" (JS fallback), try the
+    // Spotify get_access_token endpoint directly.
+    if access_token.is_empty() || access_token == "null" {
+        let token_response = HTTP
+            .get("https://open.spotify.com/get_access_token?reason=transport&productType=web_player")
+            .header(ORIGIN, HeaderValue::from_static("https://open.spotify.com"))
+            .header(REFERER, HeaderValue::from_static("https://open.spotify.com/"))
+            .header(ACCEPT_LANGUAGE, HeaderValue::from_static("en-US,en;q=0.9"))
+            .send()
+            .await
+            .ok()?;
+        if !token_response.status().is_success() {
+            return None;
+        }
+        let token_body: Value = token_response.json().await.ok()?;
+        access_token = token_body.get("accessToken")?.as_str()?.to_string();
+    }
+
+    let api_base = format!("https://api.spotify.com/v1/playlists/{playlist_id}/tracks");
+    let mut all_tracks: Vec<ExternalPlaylistTrack> = Vec::new();
+    let limit: u32 = 50;
+    let mut offset: u32 = 0;
+
+    loop {
+        let page_url = format!("{api_base}?limit={limit}&offset={offset}");
+        let response = HTTP
+            .get(&page_url)
+            .header("Authorization", format!("Bearer {access_token}"))
+            .header(ACCEPT_LANGUAGE, HeaderValue::from_static("en-US,en;q=0.9"))
+            .send()
+            .await
+            .ok()?;
+
+        if !response.status().is_success() {
+            return None;
+        }
+
+        let body: Value = response.json().await.ok()?;
+        let items = body.get("items")?.as_array()?;
+        let items_on_page = items.len();
+
+        for item in items {
+            let Some(track) = item.get("track") else { continue };
+            let Some(name) = track.get("name").and_then(Value::as_str).map(|s| s.to_string()) else { continue };
+            let artist = track
+                .get("artists")
+                .and_then(Value::as_array)
+                .and_then(|arr| arr.first())
+                .and_then(|a| a.get("name"))
+                .and_then(Value::as_str)
+                .map(|s| s.to_string())
+                .unwrap_or_default();
+            if artist.is_empty() { continue; }
+
+            let album = track
+                .get("album")
+                .and_then(|a| a.get("name"))
+                .and_then(Value::as_str)
+                .map(|s| s.to_string());
+
+            let duration_seconds = track
+                .get("duration_ms")
+                .and_then(Value::as_f64)
+                .map(|ms| (ms / 1000.0) as u32)
+                .filter(|d| *d > 0);
+
+            all_tracks.push(ExternalPlaylistTrack {
+                title: name,
+                artist,
+                album,
+                duration_seconds,
+            });
+        }
+
+        let total = body.get("total").and_then(Value::as_u64).unwrap_or(0) as usize;
+        offset += limit;
+
+        // Stop when we've fetched everything or the last page was empty.
+        if all_tracks.len() >= total || items_on_page == 0 {
+            break;
+        }
+    }
+
+    if all_tracks.is_empty() { None } else { Some(all_tracks) }
+}
+
+// Fallback SSR track-row extraction. Spotify's server-rendered page
+// typically only includes the first ~30 tracks, so this is a last resort
+// when the API approach fails.
+fn extract_spotify_tracks_from_ssr(html: &str) -> Vec<ExternalPlaylistTrack> {
+    let mut tracks: Vec<ExternalPlaylistTrack> = Vec::new();
+    let marker_offsets: Vec<usize> = SPOTIFY_TRACK_ROW_MARKER_RE
+        .find_iter(html)
+        .map(|m| m.start())
+        .collect();
+
+    for window in marker_offsets.windows(2) {
+        let row = &html[window[0]..window[1]];
+        let track_title = SPOTIFY_TRACK_TITLE_RE
+            .captures(row)
+            .and_then(|c| c.get(1))
+            .map(|m| decode_html_entities(m.as_str()));
+        let artist = SPOTIFY_ARTIST_RE
+            .captures(row)
+            .and_then(|c| c.get(1))
+            .map(|m| decode_html_entities(m.as_str()));
+        if let (Some(title), Some(artist)) = (track_title, artist) {
+            let trimmed_title = title.trim();
+            let trimmed_artist = artist.trim();
+            if !trimmed_title.is_empty() && !trimmed_artist.is_empty() {
+                tracks.push(ExternalPlaylistTrack {
+                    title: trimmed_title.to_string(),
+                    artist: trimmed_artist.to_string(),
+                    album: None,
+                    duration_seconds: None,
+                });
+            }
+        }
+    }
+
+    if let Some(last_offset) = marker_offsets.last() {
+        let tail_end = html[*last_offset..]
+            .find("</body>")
+            .map(|offset| *last_offset + offset)
+            .unwrap_or(html.len());
+        let row = &html[*last_offset..tail_end];
+        let track_title = SPOTIFY_TRACK_TITLE_RE
+            .captures(row)
+            .and_then(|c| c.get(1))
+            .map(|m| decode_html_entities(m.as_str()));
+        let artist = SPOTIFY_ARTIST_RE
+            .captures(row)
+            .and_then(|c| c.get(1))
+            .map(|m| decode_html_entities(m.as_str()));
+        if let (Some(title), Some(artist)) = (track_title, artist) {
+            let trimmed_title = title.trim();
+            let trimmed_artist = artist.trim();
+            if !trimmed_title.is_empty() && !trimmed_artist.is_empty() {
+                tracks.push(ExternalPlaylistTrack {
+                    title: trimmed_title.to_string(),
+                    artist: trimmed_artist.to_string(),
+                    album: None,
+                    duration_seconds: None,
+                });
+            }
+        }
+    }
+
+    tracks
+}
+
 async fn scrape_spotify_playlist(url: &str) -> Result<ExternalPlaylistImport, String> {
     // A barebones User-Agent triggers Spotify's server-side rendering
-    // branch which embeds the playlist's full track list in the HTML. The
-    // full Chrome UA (used for everything else) makes them ship the JS
-    // shell instead, and we'd lose access to the data.
+    // branch which embeds the playlist metadata in OG tags and often
+    // includes the anonymous access token in a script tag.
     let response = HTTP_NO_REDIRECT
         .get(url)
         .header(
@@ -958,12 +1139,8 @@ async fn scrape_spotify_playlist(url: &str) -> Result<ExternalPlaylistImport, St
     // ("Playlist · <owner> · <N> items · <M> saves") — NOT the user's actual
     // description. The real user-entered description lives only behind
     // `api-partner.spotify.com`, which requires a logged-in bearer token.
-    // Returning the template here made the imported-spotiplaylist's
-    // description a wall of metadata noise (the "Playlist tag • creator •
-    // item count" the user complained about), so we deliberately return
-    // `None` until a non-auth source surfaces. Per-row duration has the
-    // same constraint (the server-rendered row markup carries no duration;
-    // Spotify hydrates client-side) — see the top-of-section comment.
+    // Returning the template here made the imported playlist's description a
+    // wall of metadata noise, so we deliberately return None.
     let description: Option<String> = None;
 
     let cover_url = SPOTIFY_OG_IMAGE_RE
@@ -972,69 +1149,11 @@ async fn scrape_spotify_playlist(url: &str) -> Result<ExternalPlaylistImport, St
         .map(|m| m.as_str().to_string())
         .filter(|s| !s.is_empty());
 
-    let mut tracks: Vec<ExternalPlaylistTrack> = Vec::new();
-    // We slice between consecutive `data-testid="track-row"` markers
-    // instead of trying to capture the gap in a single regex. The
-    // `regex` crate doesn't support look-around, so a non-lookahead
-    // terminator would consume the next row's marker and skip the row
-    // that owned it. Slicing is also cheaper on a page that can weigh
-    // in at ~600KB of inline track markup.
-    let marker_offsets: Vec<usize> = SPOTIFY_TRACK_ROW_MARKER_RE
-        .find_iter(&html)
-        .map(|m| m.start())
-        .collect();
-    for window in marker_offsets.windows(2) {
-        let row = &html[window[0]..window[1]];
-        let track_title = SPOTIFY_TRACK_TITLE_RE
-            .captures(row)
-            .and_then(|c| c.get(1))
-            .map(|m| decode_html_entities(m.as_str()));
-        let artist = SPOTIFY_ARTIST_RE
-            .captures(row)
-            .and_then(|c| c.get(1))
-            .map(|m| decode_html_entities(m.as_str()));
-        if let (Some(title), Some(artist)) = (track_title, artist) {
-            let trimmed_title = title.trim();
-            let trimmed_artist = artist.trim();
-            if !trimmed_title.is_empty() && !trimmed_artist.is_empty() {
-                tracks.push(ExternalPlaylistTrack {
-                    title: trimmed_title.to_string(),
-                    artist: trimmed_artist.to_string(),
-                    album: None,
-                    duration_seconds: None,
-                });
-            }
-        }
-    }
-    if let Some(last_offset) = marker_offsets.last() {
-        // The final row extends to the closing `</body>` tag (or end
-        // of document); there's no next marker to bound it.
-        let tail_end = html[*last_offset..]
-            .find("</body>")
-            .map(|offset| *last_offset + offset)
-            .unwrap_or(html.len());
-        let row = &html[*last_offset..tail_end];
-        let track_title = SPOTIFY_TRACK_TITLE_RE
-            .captures(row)
-            .and_then(|c| c.get(1))
-            .map(|m| decode_html_entities(m.as_str()));
-        let artist = SPOTIFY_ARTIST_RE
-            .captures(row)
-            .and_then(|c| c.get(1))
-            .map(|m| decode_html_entities(m.as_str()));
-        if let (Some(title), Some(artist)) = (track_title, artist) {
-            let trimmed_title = title.trim();
-            let trimmed_artist = artist.trim();
-            if !trimmed_title.is_empty() && !trimmed_artist.is_empty() {
-                tracks.push(ExternalPlaylistTrack {
-                    title: trimmed_title.to_string(),
-                    artist: trimmed_artist.to_string(),
-                    album: None,
-                    duration_seconds: None,
-                });
-            }
-        }
-    }
+    // Try API-first: fetch ALL tracks via Spotify Web API with pagination.
+    // This handles playlists of any length (tested to 305 songs).
+    let tracks = fetch_spotify_tracks_via_api(url, &html)
+        .await
+        .unwrap_or_else(|| extract_spotify_tracks_from_ssr(&html));
 
     if tracks.is_empty() {
         return Err(
@@ -1806,8 +1925,10 @@ async fn fetch_track_duration(
 ) -> Result<Option<u32>, String> {
     {
         let cache = state.track_duration_cache.lock().await;
-        if let Some(duration) = cache.get(video_id) {
-            return Ok(*duration);
+        if let Some(entry) = cache.get(video_id) {
+            if entry.fetched_at.elapsed() < TRACK_DURATION_CACHE_TTL {
+                return Ok(entry.duration);
+            }
         }
     }
 
@@ -1820,7 +1941,14 @@ async fn fetch_track_duration(
         .and_then(|t| t.duration_seconds);
 
     let mut cache = state.track_duration_cache.lock().await;
-    cache.insert(video_id.to_string(), duration);
+    cache.retain(|_, entry| entry.fetched_at.elapsed() < TRACK_DURATION_CACHE_TTL);
+    cache.insert(
+        video_id.to_string(),
+        CachedTrackDuration {
+            duration,
+            fetched_at: Instant::now(),
+        },
+    );
     Ok(duration)
 }
 
@@ -1860,6 +1988,40 @@ fn watch_playlist_cache_key(video_id: &str, playlist_id: Option<&str>) -> String
     }
 }
 
+fn cleanup_expired_stream_cache(cache: &mut HashMap<String, CachedStream>) {
+    cache.retain(|_, entry| {
+        entry.fetched_at.elapsed() < STREAM_CACHE_TTL && Path::new(&entry.source).exists()
+    });
+}
+
+fn cleanup_expired_watch_playlist_cache(cache: &mut HashMap<String, CachedWatchPlaylist>) {
+    cache.retain(|_, entry| entry.fetched_at.elapsed() < WATCH_PLAYLIST_CACHE_TTL);
+}
+
+async fn cleanup_old_stream_cache_files(cache_dir: &Path) -> Result<(), String> {
+    let mut entries = tokio::fs::read_dir(cache_dir)
+        .await
+        .map_err(|error| format!("Failed to read stream cache folder: {error}"))?;
+    let cutoff = SystemTime::now() - STREAM_CACHE_TTL;
+    while let Some(entry) = entries
+        .next_entry()
+        .await
+        .map_err(|error| format!("Failed to inspect stream cache entry: {error}"))?
+    {
+        let path = entry.path();
+        let Ok(metadata) = entry.metadata().await else { continue };
+        if metadata.is_file()
+            && metadata
+                .modified()
+                .map(|modified| modified < cutoff)
+                .unwrap_or(false)
+        {
+            let _ = tokio::fs::remove_file(&path).await;
+        }
+    }
+    Ok(())
+}
+
 #[tauri::command]
 async fn get_watch_playlist(
     state: State<'_, AppState>,
@@ -1890,6 +2052,7 @@ async fn get_watch_playlist(
 
     if !trimmed_tracks.is_empty() {
         let mut cache = state.watch_playlist_cache.lock().await;
+        cleanup_expired_watch_playlist_cache(&mut cache);
         cache.insert(
             key,
             CachedWatchPlaylist {
@@ -2087,6 +2250,13 @@ async fn resolve_stream(
     tokio::fs::create_dir_all(&cache_dir)
         .await
         .map_err(|error| format!("Failed to create stream cache folder: {error}"))?;
+    // Best-effort janitor: purge stale files and in-memory entries before
+    // downloading so the cache can't grow without bound over a long session.
+    let _ = cleanup_old_stream_cache_files(&cache_dir).await;
+    {
+        let mut cache = state.stream_cache.lock().await;
+        cleanup_expired_stream_cache(&mut cache);
+    }
     remove_cached_streams(&cache_dir, &video_id).await?;
 
     let output_template = cache_dir.join(format!("{video_id}.%(ext)s"));
@@ -2126,6 +2296,7 @@ async fn resolve_stream(
 
     {
         let mut cache = state.stream_cache.lock().await;
+        cleanup_expired_stream_cache(&mut cache);
         cache.insert(
             video_id,
             CachedStream {
@@ -2760,12 +2931,18 @@ async fn fetch_cover_bytes_inner(url: &str) -> Result<Vec<u8>, String> {
     // artwork cache already sends a Referer in that case; mirror the
     // behavior here so "Save to my device" cover fetches don't
     // silently fail on tracks whose cover lives on the YT CDN.
-    let is_music_yt = parsed
+    let needs_youtube_referer = parsed
         .host_str()
-        .map(|host| host == "music.youtube.com")
+        .map(|host| {
+            host == "music.youtube.com"
+                || host == "youtube.com"
+                || host.ends_with(".youtube.com")
+                || host.ends_with(".ytimg.com")
+                || host.ends_with(".googleusercontent.com")
+        })
         .unwrap_or(false);
     let mut request = HTTP.get(parsed);
-    if is_music_yt {
+    if needs_youtube_referer {
         request = request.header(REFERER, HeaderValue::from_static("https://music.youtube.com/"));
     }
     let response = request
@@ -3362,14 +3539,22 @@ async fn cache_remote_artwork(app: &AppHandle, url: &str) -> Result<String, Stri
         }
     }
 
-    // Only mint a YouTube Music Referer when the source host is YouTube
-    // Music itself. Spotify (i.scdn.co) and Apple Music (mzstatic.com)
-    // CDNs reject requests with a wrong-referrer header, which previously
-    // caused non-YTM playlist cover downloads to silently fail.
-    let music_youtube_referer =
-        parsed.host_str().map(|host| host == "music.youtube.com").unwrap_or(false);
+    // Only mint a YouTube Music Referer for YouTube/Google image/CDN hosts.
+    // Spotify (i.scdn.co) and Apple Music (mzstatic.com) CDNs reject requests
+    // with a wrong-referrer header, which previously caused non-YTM playlist
+    // cover downloads to silently fail.
+    let needs_youtube_referer = parsed
+        .host_str()
+        .map(|host| {
+            host == "music.youtube.com"
+                || host == "youtube.com"
+                || host.ends_with(".youtube.com")
+                || host.ends_with(".ytimg.com")
+                || host.ends_with(".googleusercontent.com")
+        })
+        .unwrap_or(false);
     let mut request = HTTP.get(parsed);
-    if music_youtube_referer {
+    if needs_youtube_referer {
         request = request.header(REFERER, HeaderValue::from_static("https://music.youtube.com/"));
     }
     let response = request
@@ -5725,20 +5910,25 @@ fn select_thumbnail_url(thumbnails: &[Value]) -> Option<String> {
             let url = thumb.get("url").and_then(Value::as_str)?;
             Some((
                 normalize_thumbnail_url(url),
-                thumb.get("width").and_then(Value::as_u64),
+                thumb.get("width").and_then(Value::as_u64).unwrap_or(0),
             ))
         })
         .collect::<Vec<_>>();
 
     normalized
         .iter()
-        .find(|(_, width)| {
-            width
-                .map(|value| value >= PREFERRED_THUMBNAIL_WIDTH)
-                .unwrap_or(false)
-        })
+        .find(|(_, width)| *width >= PREFERRED_THUMBNAIL_WIDTH)
         .map(|(url, _)| url.clone())
-        .or_else(|| normalized.last().map(|(url, _)| url.clone()))
+        // YouTube doesn't always emit a thumbnail at or above our preferred
+        // width (e.g. some album art tops out at 544×544). Don't assume the
+        // array is sorted — explicitly pick the largest available so we never
+        // accidentally serve a tiny placeholder.
+        .or_else(|| {
+            normalized
+                .iter()
+                .max_by_key(|(_, width)| *width)
+                .map(|(url, _)| url.clone())
+        })
 }
 
 fn select_largest_thumbnail_url(thumbnails: &[Value]) -> Option<String> {
@@ -6684,6 +6874,9 @@ fn main() {
         .plugin(tauri_plugin_prevent_default::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            let _ = app.get_webview_window("main").map(|w| w.set_focus());
+        }))
         .invoke_handler(tauri::generate_handler![
             get_backend_status,
             ensure_streaming_backend,

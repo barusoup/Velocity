@@ -67,6 +67,14 @@ jobs:
       - name: Install JS deps
         run: npm ci
 
+      - name: Verify release assets (fail-fast gate)
+        # Catches icon-system regressions (single-frame ICO, missing
+        # tracked public files, opaque-magic icns, bundle.icon re-adds of
+        # the desktop-icon wrapper) BEFORE the 8-min platform builds
+        # burn CI minutes. Implemented in scripts/verify-release-assets.mjs.
+        shell: bash
+        run: npm run verify-release
+
       - name: Build signed bundles
         shell: bash
         run: npm run tauri -- build ${{ matrix.target != '' && format('--target {0}', matrix.target) || '' }}
@@ -174,19 +182,26 @@ jobs:
 
           # node reads the values from env so JSON.stringify handles all
           # escaping (release notes carry newlines/quotes; signatures are base64).
+          # Platforms with no signature (skipped in the build matrix) are
+          # omitted from the manifest entirely, so the Tauri updater on
+          # those platforms never tries to validate an empty signature and
+          # users stay on their current build.
           node <<'JS' > latest.json
           const env = process.env;
           const trim = (v) => (v || "").replace(/\r?\n/g, "");
+          const platform = (sig, url) => sig ? { signature: sig, url } : null;
+          const all = {
+            "windows-x86_64": platform(trim(env.WIN_SIG),  env.BASE + "/Velocity-Setup-x64.exe"),
+            "darwin-aarch64": platform(trim(env.MAC_A_SIG), env.BASE + "/Velocity-macOS-arm64.app.tar.gz"),
+            "darwin-x86_64":  platform(trim(env.MAC_X_SIG), env.BASE + "/Velocity-macOS-x64.app.tar.gz"),
+            "linux-x86_64":   platform(trim(env.LIN_SIG),   env.BASE + "/Velocity-Linux-x86_64.AppImage")
+          };
+          const platforms = Object.fromEntries(Object.entries(all).filter(([, v]) => v !== null));
           const m = {
             version: env.VER,
             notes: env.NOTES,
             pub_date: env.PUB_DATE,
-            platforms: {
-              "windows-x86_64": { signature: trim(env.WIN_SIG),  url: env.BASE + "/Velocity-Setup-x64.exe" },
-              "darwin-aarch64": { signature: trim(env.MAC_A_SIG), url: env.BASE + "/Velocity-macOS-arm64.app.tar.gz" },
-              "darwin-x86_64":  { signature: trim(env.MAC_X_SIG), url: env.BASE + "/Velocity-macOS-x64.app.tar.gz" },
-              "linux-x86_64":   { signature: trim(env.LIN_SIG),   url: env.BASE + "/Velocity-Linux-x86_64.AppImage" }
-            }
+            platforms
           };
           process.stdout.write(JSON.stringify(m, null, 2));
           JS

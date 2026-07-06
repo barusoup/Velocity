@@ -745,8 +745,8 @@ function DialogMatching({ flow, onClose }: { flow: Extract<ImportFlowState, { ki
   return (
     <div className="flex flex-col gap-4">
       <p className="text-sm leading-relaxed text-neutral-400">
-        Looking up <span className="font-semibold text-white">{flow.source.title}</span> on
-        YouTube Music. Matched <span className="font-semibold text-white">{flow.matched}</span>{" "}
+        Looking up <span className="font-semibold text-white">{flow.source.title}</span> on{" "}
+        {serviceLabel(flow.service)}. Matched <span className="font-semibold text-white">{flow.matched}</span>{" "}
         of {total} so far.
       </p>
       <ProgressBar percent={pct} />

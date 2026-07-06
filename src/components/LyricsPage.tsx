@@ -21,6 +21,9 @@ function WaveformVisualizer({
   const opacityRef = useRef(0);
   const targetOpacityRef = useRef(0);
   const isPlayingRef = useRef(isPlaying);
+  const dataArrayRef = useRef<Uint8Array<ArrayBuffer> | null>(null);
+  const lastDrawRef = useRef(0);
+  const hiddenRef = useRef(document.hidden);
 
   useEffect(() => {
     isPlayingRef.current = isPlaying;
@@ -39,16 +42,40 @@ function WaveformVisualizer({
   }, [isPlaying]);
 
   useEffect(() => {
+    const onVisibility = () => {
+      hiddenRef.current = document.hidden;
+    };
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => document.removeEventListener("visibilitychange", onVisibility);
+  }, []);
+
+  useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
 
     let running = true;
+    const FRAME_BUDGET_MS = 33; // ~30 fps; enough for a background decoration
 
-    const draw = () => {
+    const draw = (now?: number) => {
       if (!running) return;
       frameRef.current = requestAnimationFrame(draw);
+
+      // Throttle to ~30 fps to keep CPU/GPU headroom on low-end Windows
+      // machines and software-rendered WebView2 contexts. We still use
+      // requestAnimationFrame so the loop pauses in background tabs.
+      if (now !== undefined) {
+        if (now - lastDrawRef.current < FRAME_BUDGET_MS) return;
+        lastDrawRef.current = now;
+      }
+
+      // Skip expensive work when the tab is hidden. The loop keeps
+      // scheduling itself so it resumes instantly on visibilitychange.
+      if (hiddenRef.current) {
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        return;
+      }
 
       // The Web Audio graph (and thus the AnalyserNode) is built lazily
       // inside ensureAudioGraph(), which only runs on the first togglePlay
@@ -62,7 +89,11 @@ function WaveformVisualizer({
       }
 
       const bufferLength = analyser.frequencyBinCount;
-      const dataArray = new Uint8Array(bufferLength);
+      let dataArray: Uint8Array<ArrayBuffer> | null = dataArrayRef.current;
+      if (!dataArray || dataArray.length !== bufferLength) {
+        dataArray = new Uint8Array(bufferLength) as Uint8Array<ArrayBuffer>;
+        dataArrayRef.current = dataArray;
+      }
       analyser.getByteFrequencyData(dataArray);
 
       let sum = 0;
@@ -120,7 +151,10 @@ function WaveformVisualizer({
 
       ctx.clearRect(0, 0, w, h);
 
-      const barCount = Math.min(bufferLength, 64);
+      // Scale bar density with display width so narrow windows don't pay
+      // for a full 64-bar analysis/draw loop, while wide windows keep the
+      // detailed look.
+      const barCount = Math.min(bufferLength, Math.max(32, Math.floor(w / 14)));
       const totalBarWidth = w / barCount;
       const gap = 2;
       const globalAlpha = opacityRef.current;
@@ -150,6 +184,8 @@ function WaveformVisualizer({
     return () => {
       running = false;
       cancelAnimationFrame(frameRef.current);
+      dataArrayRef.current = null;
+      lastDrawRef.current = 0;
     };
   }, [accent, getAnalyser]);
 
@@ -279,16 +315,20 @@ export function LyricsPage({
 
     let frameId = 0;
     let running = true;
+    const FRAME_BUDGET_MS = 33;
+    let lastSync = 0;
 
-    const syncProgress = () => {
+    const syncProgress = (now?: number) => {
       if (!running) return;
+      frameId = window.requestAnimationFrame(syncProgress);
+      if (now !== undefined && now - lastSync < FRAME_BUDGET_MS) return;
+      lastSync = now ?? performance.now();
       const liveProgress = currentAudio.current?.currentTime;
       const nextProgress = Number.isFinite(liveProgress) ? liveProgress ?? 0 : playerProgressRef.current;
       if (Math.abs(nextProgress - displayProgressRef.current) >= 0.01) {
         displayProgressRef.current = nextProgress;
         setDisplayProgress(nextProgress);
       }
-      frameId = window.requestAnimationFrame(syncProgress);
     };
 
     frameId = window.requestAnimationFrame(syncProgress);

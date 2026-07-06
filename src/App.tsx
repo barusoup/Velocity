@@ -303,7 +303,7 @@ function Shell() {
     if (!getSetting("startMinimized")) return;
     const frame = requestAnimationFrame(() => {
       requestAnimationFrame(() => {
-        getCurrentWindow().minimize().catch(() => {});
+        getCurrentWindow().minimize().catch((e) => console.warn("Failed to minimize on startup:", e));
       });
     });
     return () => cancelAnimationFrame(frame);
@@ -392,20 +392,22 @@ function Shell() {
       if (contentIsTallEnough && closeEnough) stopRestoring();
     };
 
+    // Only watch the scrollport; child mutations that change its scrollHeight
+    // already bubble up to the container's ResizeObserver. Observing the
+    // first child as well doubled the callback volume on pages with many
+    // loading placeholders, costing layout cycles for no benefit.
     resizeObserver.observe(container);
-    if (container.firstElementChild instanceof HTMLElement) {
-      resizeObserver.observe(container.firstElementChild);
-    }
 
     container.addEventListener("wheel", stopRestoring, { passive: true, capture: true });
     container.addEventListener("touchstart", stopRestoring, { passive: true, capture: true });
     container.addEventListener("pointerdown", stopRestoring, { passive: true, capture: true });
 
     // Put history entries at their saved position before the browser paints.
-    // The observer keeps correcting it while async content fills in.
+    // The observer keeps correcting it while async content fills in; the
+    // hard timeout ensures the observer is always disconnected so it can't
+    // leak or keep forcing layouts after the page has settled.
     restoreScrollPosition();
     if (!cancelled) {
-      scrollRestoreFrameRef.current = window.requestAnimationFrame(restoreScrollPosition);
       timeoutId = window.setTimeout(stopRestoring, 2500);
     }
 
