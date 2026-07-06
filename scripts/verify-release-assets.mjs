@@ -79,17 +79,35 @@ if (!existsSync(icoPath)) {
       } else {
         // Walk each ICONDIRENTRY to confirm frame dimensions are sensible.
         const dims = [];
+        let largestFirst = true;
+        let prevArea = Infinity;
         for (let i = 0; i < count; i++) {
           const off = 6 + i * 16;
           const w = buf.readUInt8(off);
           const h = buf.readUInt8(off + 1);
           const bitCount = buf.readUInt16LE(off + 6);
-          dims.push(`${w || 256}x${h || 256}@${bitCount}bpp`);
+          const fw = w || 256;
+          const fh = h || 256;
+          dims.push(`${fw}x${fh}@${bitCount}bpp`);
+          const area = fw * fh;
+          if (area > prevArea) {
+            largestFirst = false;
+          }
+          prevArea = area;
         }
-        pass(
-          `icon.ico has ${count} frames`,
-          `typical Tauri output is 6 (16/24/32/48/64/256); got ${dims.join(", ")}`,
-        );
+        if (!largestFirst) {
+          fail(
+            `icon.ico frames are not ordered largest-first (${dims.join(", ")}). ` +
+              `Some Windows shortcut rendering paths use the first frame they can load ` +
+              `and scale it, so the largest frame must be first. Re-run ` +
+              `\`npm run regen-icons\`.`
+          );
+        } else {
+          pass(
+            `icon.ico has ${count} frames`,
+            `largest-first order expected; got ${dims.join(", ")}`,
+          );
+        }
       }
     }
   } catch (err) {

@@ -103,13 +103,20 @@ textarea,
    so suppress them everywhere `nice-scroll` is used. The corner
    piece that fills the L-shaped gap between an X and Y scrollbar (in
    places like Collection's tab strip) gets the same treatment so it
-   never reads as a stray swatch. */
+   never reads as a stray swatch.
+
+   The `!important` and `-webkit-appearance: none` guards are belt-and-
+   suspenders: some WebView2 builds still render the tiny up/down arrow
+   buttons even when `display: none` is set, which is the stray arrow
+   reported to the right of playlist pages at larger window sizes. */
 .nice-scroll::-webkit-scrollbar-button,
 .nice-scroll::-webkit-scrollbar-corner {
-  display: none;
-  width: 0;
-  height: 0;
-  background: transparent;
+  display: none !important;
+  -webkit-appearance: none !important;
+  appearance: none !important;
+  width: 0 !important;
+  height: 0 !important;
+  background: transparent !important;
 }
 
 /* Playlist description textarea — same arrow-button suppression so the
@@ -117,7 +124,24 @@ textarea,
    look like stray raw-HTML buttons next to the description text. */
 .user-playlist-description-input::-webkit-scrollbar-button,
 .user-playlist-description-input::-webkit-scrollbar-corner {
+  display: none !important;
+  -webkit-appearance: none !important;
+  appearance: none !important;
+  width: 0 !important;
+  height: 0 !important;
+  background: transparent !important;
+}
+
+/* Global fallback: any scrollable element that isn't explicitly styled
+   by `.nice-scroll` or `.sidebar-playlists-scroll` should also avoid
+   showing native arrow buttons. This catches edge cases where a vertical
+   scrollbar appears on a container we forgot to tag (e.g. context menus,
+   lyrics panels) without changing thumb visibility. */
+::-webkit-scrollbar-button,
+::-webkit-scrollbar-corner {
   display: none;
+  -webkit-appearance: none;
+  appearance: none;
   width: 0;
   height: 0;
   background: transparent;
@@ -131,9 +155,10 @@ textarea,
  * already-black sidebar background, so the visible state is just a
  * gray line floating in a black panel. The list still scrolls (mouse
  * wheel, touch, keyboard) but no thumb is ever rendered. Scoped to a
- * dedicated class so the other 5+ uses of `.nice-scroll` (App.tsx main
- * scrollport, QueuePanel, LyricsPage, CollectionPage, ArtistPage
- * scrollport ancestor) keep their themed scrollbar.
+ * dedicated class so the other `.nice-scroll` uses (QueuePanel,
+ * LyricsPage, CollectionPage, ArtistPage scrollport ancestor) keep their
+ * themed scrollbar. The App.tsx main scrollport now uses `.main-scrollport`
+ * instead so it can hide its scrollbar entirely.
  *
  * Firefox uses `scrollbar-width: none`; legacy Edge/IE uses
  * `-ms-overflow-style: none`; WebKit/Blink uses `::-webkit-scrollbar
@@ -147,6 +172,23 @@ textarea,
 }
 
 .sidebar-playlists-scroll::-webkit-scrollbar {
+  display: none;
+}
+
+/* Main content scrollport — same hidden-scrollbar treatment as the sidebar
+   playlist list. The themed `.nice-scroll` thumb is supposed to render here,
+   but on some Windows/WebView2 builds the OS classic scrollbar appears
+   instead, showing the small up/down arrow buttons reported at larger window
+   sizes. Hiding the scrollbar entirely on this container removes those
+   buttons while keeping mouse-wheel / touch / keyboard scrolling. Other
+   `.nice-scroll` uses (queue, lyrics, collection, artist page) keep their
+   themed scrollbars. */
+.main-scrollport {
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+
+.main-scrollport::-webkit-scrollbar {
   display: none;
 }
 

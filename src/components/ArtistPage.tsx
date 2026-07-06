@@ -40,6 +40,7 @@ import {
   LoadingPanel,
   useArtworkAccent,
 } from "./PagesShared";
+import { useSetting, setSetting } from "../settings";
 import { getDirectArtistBrowseId, resolveArtistBrowseId } from "../utils/navigation";
 
 export type ReleaseType = "album" | "single" | "compilation";
@@ -186,10 +187,7 @@ export function ArtistPage({
   const [pillStyle, setPillStyle] = useState<CSSProperties>({});
   const [releaseFilter, setReleaseFilter] = useState<ReleaseFilter>("all");
   const [sortMode, setSortMode] = useState<SortMode>("releaseDate");
-  // Discography view mode always starts in list mode for every visit —
-  // toggling to grid is per-session only and resets when the user enters
-  // (or re-enters) the discography page, including across different artists.
-  const [viewMode, setViewMode] = useState<ViewMode>("list");
+  const viewMode = useSetting("viewModeDiscography");
   const [filterMenuOpen, setFilterMenuOpen] = useState(false);
   const [sortMenuOpen, setSortMenuOpen] = useState(false);
   const fullDiscographyOpen = section === "discography";
@@ -386,7 +384,7 @@ export function ArtistPage({
           onPlayTrack={onPlayTrack}
           onChangeFilter={setReleaseFilter}
           onChangeSort={setSortMode}
-          onChangeViewMode={setViewMode}
+          onChangeViewMode={(mode) => setSetting("viewModeDiscography", mode)}
           onToggleFilterMenu={() => {
             setFilterMenuOpen((open) => !open);
             setSortMenuOpen(false);

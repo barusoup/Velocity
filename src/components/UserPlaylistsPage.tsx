@@ -170,7 +170,32 @@ export function UserPlaylistsPage({
         });
       } catch (error) {
         if (cancelRef.current) return;
-        const message = error instanceof Error ? error.message : "Failed to import playlist.";
+        // Tauri rejects the JS Promise with the Rust command's
+        // `Err(String)` directly — a primitive JS string, NOT an
+        // `Error` instance. The previous `error instanceof Error`
+        // check therefore surfaced the generic "Failed to import
+        // playlist." fallback for every Rust-side failure and
+        // swallowed the actionable root cause ("yt-dlp timed out",
+        // "Spotify request failed", etc.) so the user couldn't tell
+        // what was wrong. Now we accept every common rejection
+        // shape: a raw string, a real Error, or a plain
+        // `{ message: string }` object that Tauri's internals
+        // occasionally produce from the panic path.
+        let message: string;
+        if (typeof error === "string") {
+          message = error;
+        } else if (error instanceof Error) {
+          message = error.message;
+        } else if (
+          error &&
+          typeof error === "object" &&
+          "message" in error &&
+          typeof (error as { message: unknown }).message === "string"
+        ) {
+          message = (error as { message: string }).message;
+        } else {
+          message = "Failed to import playlist.";
+        }
         setImportFlow((current) => ({
           kind: "error",
           service: current?.service ?? "youtube",

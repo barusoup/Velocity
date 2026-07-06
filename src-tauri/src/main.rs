@@ -86,6 +86,14 @@ static CLIENT_VERSION_RE: Lazy<Regex> = Lazy::new(|| {
 static VISITOR_DATA_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r#""VISITOR_DATA":"([^"]+)""#).expect("visitor data regex"));
 
+// Extract the `list` query parameter from a YT Music playlist URL. Used
+// to seed the InnerTube `next` call (which needs both a videoId and a
+// playlistId to return the full queue) and to build the browseId for the
+// playlist header (browseId = "VL" + playlistId).
+static YT_PLAYLIST_ID_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r#"[?&]list=([A-Za-z0-9_-]+)"#).expect("yt playlist id regex")
+});
+
 static LRC_TIMESTAMP_RE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"^\[(\d+):(\d{1,2})(?:[.:](\d{1,3}))?]").expect("lrc timestamp regex")
 });
@@ -544,6 +552,9 @@ struct ExternalPlaylistTrack {
     duration_seconds: Option<u32>,
 }
 
+
+
+
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ExternalPlaylistImport {
@@ -620,51 +631,10 @@ fn pick_best_thumbnail_url(value: &Value) -> Option<String> {
         .find_map(|entry| entry.get("url").and_then(Value::as_str).map(str::to_string))
 }
 
-fn str_field(value: &Value, keys: &[&str]) -> Option<String> {
-    for key in keys {
-        if let Some(s) = value.get(*key).and_then(Value::as_str) {
-            let trimmed = s.trim();
-            if !trimmed.is_empty() {
-                return Some(trimmed.to_string());
-            }
-        }
-    }
-    None
-}
-
-fn duration_from_value(value: f64) -> Option<u32> {
-    if !value.is_finite() || value <= 0.0 {
-        return None;
-    }
-    Some(value as u32)
-}
-
-async fn run_yt_dlp_playlist_dump(yt_dlp: &Path, url: &str) -> Result<String, String> {
-    // We deliberately do NOT pass `--flat-playlist` even though it'd be the
-    // fastest path: in flat mode yt-dlp emits only the per-track video id +
-    // title (no `artist`, `album`, `duration`), which is unusable for our
-    // title+artist matcher downstream. Without `--flat-playlist`, yt-dlp
-    // runs the full extractor on every track and prints one JSON object
-    // per line (via `--dump-json`), each carrying `title`/`track`,
-    // `artist`/`artists`, `album`, and `duration` — exactly what the
-    // matcher wants. `--yes-playlist` keeps the run alive past the first
-    // private/unavailable track so a single dead video can't poison the
-    // whole import. `--no-warnings` keeps stderr quiet for expected
-    // "unable to extract description" warnings on YT Music playlists.
-    //
-    // Note: `--no-playlist-error` is NOT a real yt-dlp flag and silently
-    // crashes the shell-out before extraction even starts — this was the
-    // first bug behind "imports don't work".
-    run_command(
-        yt_dlp,
-        ["--yes-playlist", "--dump-json", "--no-warnings", url],
-    )
-    .await
-}
-
 #[tauri::command]
 async fn import_external_playlist(
     app: AppHandle,
+    state: State<'_, AppState>,
     request: ExternalPlaylistImportRequest,
 ) -> Result<ExternalPlaylistImport, String> {
     let url = request.url.trim().to_string();
@@ -674,31 +644,38 @@ async fn import_external_playlist(
     let service = detect_playlist_service(&url)?;
 
     match service {
-        // YouTube Music is the only service that still works through
-        // yt-dlp's `--dump-json` playlist walk. Spotify's extractor was
-        // removed upstream (DRM), and Apple Music's extractor doesn't
-        // recognize the `pl.u-...` Universal Link share tokens the user
-        // pastes. Both services have public web players that render
-        // server-side, so we read those pages directly.
-        "youtube" => import_youtube_playlist(&app, &url).await,
+        // YouTube Music: InnerTube `browse` (`VL` + playlistId) is the
+        // primary import path; yt-dlp flat-playlist + InnerTube `next`
+        // are the fallback. Spotify and Apple Music are scraped from
+        // the public web player.
+        "youtube" => import_youtube_playlist(&app, &state, &url).await,
         "spotify" => scrape_spotify_playlist(&url).await,
         "apple" => scrape_apple_music_playlist(&url).await,
         _ => Err(format!("Unsupported playlist service: {service}")),
     }
 }
 
-// Fast partner to `run_yt_dlp_playlist_dump`: returns the playlist-root
-// JSON document carrying the REAL playlist cover (`thumbnails[]`) and
-// the playlist-level title/description, without paying the per-track-
-// extraction cost. We pass `--flat-playlist` so yt-dlp short-circuits
-// per-track work and resolves only the playlist shell — empirically a
-// sub-second call even on YT Music where the per-track dump takes tens
-// of seconds for large playlists.
+// Lightweight header dump used by the YT Music import path. yt-dlp's
+// `--flat-playlist --dump-single-json` returns the playlist shell
+// (title, thumbnails[], entries[].id) without paying the per-track
+// extraction cost — empirically a sub-second call even on large
+// playlists where `--dump-json` itself takes tens of seconds (or
+// hangs outright; see `import_youtube_playlist`). Two reasons we
+// still need a subprocess here:
+//   1. We need ONE videoId from the playlist to seed the InnerTube
+//      `next` call (the API takes `{videoId, playlistId}` and won't
+//      resolve a playlistId on its own).
+//   2. When InnerTube `browse` fails or returns an unknown header
+//      shape, the flat-playlist dump is the most reliable fallback
+//      for the playlist-level title and cover.
 async fn run_yt_dlp_playlist_header_dump(
     yt_dlp: &Path,
     url: &str,
 ) -> Result<String, String> {
-    run_command(
+    // 15s is plenty for the flat-playlist header call (empirically
+    // sub-second on healthy connections). A short bound keeps a stuck
+    // header from blocking the import for the full 30s window.
+    run_command_with_timeout(
         yt_dlp,
         [
             "--yes-playlist",
@@ -707,182 +684,319 @@ async fn run_yt_dlp_playlist_header_dump(
             "--no-warnings",
             url,
         ],
+        Duration::from_secs(15),
     )
     .await
 }
 
-async fn import_youtube_playlist(
-    app: &AppHandle,
+// Fast per-track dump used as the InnerTube fallback in
+// `import_youtube_playlist`. `yt-dlp --flat-playlist --print` walks
+// the playlist shell (no per-track page extraction, so it never
+// hangs) and emits one line per track with id/title/uploader/index.
+// This is the same data the old `--dump-json` path produced for
+// non-hanging URLs, minus the full per-track page metadata
+// (artist/album/duration). The frontend's title+artist matcher can
+// fill those in later from search results.
+//
+// Output format per line: `<id>|||<title>|||<uploader>|||<index>`
+// `|||` is chosen because it's vanishingly rare in track metadata
+// and won't collide with the separator. Lines that don't parse are
+// silently dropped so a malformed line from one track doesn't kill
+// the whole import.
+//
+// 20s upper bound. This call is empirically sub-second on healthy
+// connections, but we keep a generous bound so a slow CDN doesn't
+// surface as a "Failed to import" error during the InnerTube
+// fallback path (which only runs when InnerTube itself failed, so
+// the user is already seeing an error — we want to maximize the
+// chance the fallback succeeds).
+async fn run_yt_dlp_playlist_tracks_dump(
+    yt_dlp: &Path,
     url: &str,
-) -> Result<ExternalPlaylistImport, String> {
-    let yt_dlp = ensure_yt_dlp(app).await?;
-    // Two concurrent yt-dlp invocations:
-    //   1. `--dump-json` streams per-track metadata line-by-line so the
-    //      import dialog can show progress as tracks extract.
-    //   2. `--flat-playlist --dump-single-json` runs in parallel and
-    //      returns the playlist root document carrying the REAL playlist
-    //      cover (`thumbnails[]`) plus title/description. Empirically
-    //      resolves in ~1s — well before the streaming call has finished
-    //      its first tracks — so cover loading adds no perceptible delay.
-    let (tracks_result, header_result) = tokio::join!(
-        run_yt_dlp_playlist_dump(&yt_dlp, url),
-        run_yt_dlp_playlist_header_dump(&yt_dlp, url),
-    );
-    let output = tracks_result?;
-    if output.trim().is_empty() {
-        return Err(
-            "YouTube Music didn't return any playlist data for that link. Make sure it's a public playlist."
-                .to_string(),
-        );
-    }
+) -> Result<String, String> {
+    run_command_with_timeout(
+        yt_dlp,
+        [
+            "--yes-playlist",
+            "--flat-playlist",
+            "--no-warnings",
+            "--print",
+            "%(id)s|||%(title)s|||%(uploader)s|||%(playlist_index)d",
+            url,
+        ],
+        Duration::from_secs(20),
+    )
+    .await
+}
 
-    // Parse the header dump best-effort. yt-dlp's `--dump-single-json`
-    // emits one document whose root carries `thumbnails[]`, `title`, and
-    // `description` for the playlist. If parsing fails (network blip,
-    // malformed JSON, etc.) we fall through so the per-track gates below
-    // still run as defense-in-depth.
-    let header_value = header_result
-        .ok()
-        .and_then(|raw| serde_json::from_str::<Value>(raw.trim()).ok())
-        .unwrap_or(Value::Null);
-    let header_cover_url = pick_best_thumbnail_url(&header_value);
-    let header_title = header_value
-        .get("title")
-        .and_then(Value::as_str)
-        .map(str::to_string);
-    let header_description = header_value
-        .get("description")
-        .and_then(Value::as_str)
-        .map(str::to_string);
-
-    let mut title: Option<String> = None;
-    let mut description: Option<String> = None;
-    let mut cover_url: Option<String> = None;
-    let mut first_track_cover: Option<String> = None;
-    let mut tracks: Vec<ExternalPlaylistTrack> = Vec::new();
-
-    // Seed from the header dump first so the REAL playlist cover (which
-    // lives ONLY on the root document) wins over the per-track gates.
-    title = title.or(header_title);
-    description = description.or(header_description);
-    cover_url = cover_url.or(header_cover_url);
-
-    for line in output.lines() {
+// Parse the per-track output of `run_yt_dlp_playlist_tracks_dump`
+// into `MediaTrack`s. Each non-empty line is shaped
+// `<id>|||<title>|||<uploader>|||<playlist_index>`.
+//
+// `<uploader>` is the field where YT Music flat-playlist mode has
+// a known pathology: for every track yt-dlp returns the literal
+// string `"NA"` because the per-track channel isn't resolved at
+// the playlist API level (verified against `?list=PLJNrpU5NGP0Y`;
+// the same applies to `channel`, `artist`, `creator`, etc. — only
+// the top-level `playlist_uploader`/`playlist_title`/`playlist_id`
+// are populated). Treat `"NA"` as unknown (empty artist) rather
+// than dropping the track: the frontend's title-only lenient
+// matcher relies on `topArtist.includes("")` being true for an
+// empty `targetArtist`, which is what unlocks a match for the
+// YT Music topResult when no real artist survives the flat-mode
+// uploader normalization. Leaving the bogus `"NA"` in place makes
+// `"na".includes("radiohead")` false and drops every track —
+// which is the actual user-visible "YT Music playlists fail to
+// load" bug this fixes.
+fn parse_flat_playlist_tracks(raw: &str) -> Vec<MediaTrack> {
+    let mut tracks: Vec<MediaTrack> = Vec::new();
+    for line in raw.lines() {
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
         }
-        let parsed: Value = match serde_json::from_str(trimmed) {
-            Ok(value) => value,
-            Err(_) => continue,
+        let parts: Vec<&str> = trimmed.split("|||").collect();
+        if parts.len() < 4 {
+            continue;
+        }
+        let id = parts[0].trim();
+        let title = parts[1].trim();
+        let uploader = parts[2].trim();
+        if id.is_empty() || title.is_empty() {
+            continue;
+        }
+        // Strip the trailing " - Topic" / " - VEVO" / " - Vevo" /
+        // " - Official" suffix from the uploader to get the artist
+        // name. YT Music channels follow the "<Artist> - Topic"
+        // convention; non-music uploads use " - VEVO" / " - Official".
+        // The function is a no-op for uploaders that don't match the
+        // pattern. The YT Music flat-mode "NA" is normalized to empty
+        // above — see the function-level comment for why.
+        let artist = normalize_flat_uploader(uploader);
+        let track_id = id.to_string();
+        tracks.push(MediaTrack {
+            id: track_id.clone(),
+            kind: Some("song".to_string()),
+            title: title.to_string(),
+            artist,
+            album: None,
+            album_browse_id: None,
+            artist_browse_id: None,
+            artist_credits: None,
+            duration_seconds: None,
+            play_count: None,
+            cover: None,
+            video_id: Some(track_id),
+            source: "stream",
+            audio_src: None,
+            file_path: None,
+            find_lyrics: false,
+        });
+    }
+    tracks
+}
+
+fn normalize_flat_uploader(uploader: &str) -> String {
+    let trimmed = uploader.trim();
+    if trimmed.eq_ignore_ascii_case("na") || trimmed.eq_ignore_ascii_case("n/a") {
+        return String::new();
+    }
+    strip_artist_noise(trimmed)
+}
+
+fn first_video_id_from_playlist_header(value: &Value) -> Option<String> {
+    value
+        .get("entries")
+        .and_then(Value::as_array)
+        .and_then(|entries| {
+            entries.iter().find_map(|entry| {
+                entry
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|id| !id.is_empty())
+                    .map(str::to_string)
+            })
+        })
+}
+
+fn first_video_id_from_tracks_dump(raw: &str) -> Option<String> {
+    raw.lines().find_map(|line| {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        trimmed
+            .split("|||")
+            .next()
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .map(str::to_string)
+    })
+}
+
+fn flat_playlist_tracks_from_dump(dump_result: &Result<String, String>) -> Vec<MediaTrack> {
+    match dump_result {
+        Ok(raw) => parse_flat_playlist_tracks(raw),
+        Err(_) => Vec::new(),
+    }
+}
+
+// Load every track from a YT Music playlist via InnerTube `browse`
+// (`browseId = "VL" + playlistId`). This is the native playlist page
+// API — no yt-dlp subprocess and no seed videoId required.
+async fn fetch_ytm_playlist_via_browse(
+    state: &State<'_, AppState>,
+    playlist_id: &str,
+) -> Result<Option<EntityDetail>, String> {
+    let browse_id = format!("VL{playlist_id}");
+    let response = post_ytmusic(state, "browse", json!({ "browseId": &browse_id })).await?;
+    let detail = parse_entity_detail(&browse_id, &response)?;
+    if detail.tracks.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(detail))
+}
+
+// YouTube Music playlist import.
+//
+//   1. InnerTube `browse` with `browseId = "VL" + playlistId` — the
+//      native playlist shelf (primary; no yt-dlp required).
+//   2. yt-dlp `--flat-playlist` header + `--print` tracks dump, plus
+//      InnerTube `next` with `watch_next_payload`, when browse fails.
+//   3. Never `yt-dlp --dump-json` — it can stall on large playlists.
+async fn import_youtube_playlist(
+    app: &AppHandle,
+    state: &State<'_, AppState>,
+    url: &str,
+) -> Result<ExternalPlaylistImport, String> {
+    let playlist_id = YT_PLAYLIST_ID_RE
+        .captures(url)
+        .and_then(|c| c.get(1))
+        .map(|m| m.as_str().to_string())
+        .ok_or_else(|| {
+            "That YouTube Music URL didn't include a playlist ID. Paste a link like https://music.youtube.com/playlist?list=..."
+                .to_string()
+        })?;
+
+    let mut title: Option<String> = None;
+    let mut cover_url: Option<String> = None;
+    let mut media_tracks: Vec<MediaTrack> = Vec::new();
+    let mut last_error: Option<String> = None;
+
+    match fetch_ytm_playlist_via_browse(state, &playlist_id).await {
+        Ok(Some(detail)) => {
+            title = Some(detail.title);
+            cover_url = detail.cover;
+            media_tracks = detail.tracks;
+        }
+        Ok(None) => {}
+        Err(error) => last_error = Some(error),
+    }
+
+    if media_tracks.is_empty() {
+        let yt_dlp = ensure_yt_dlp(app).await?;
+        let (header_result, tracks_dump_result) = tokio::join!(
+            run_yt_dlp_playlist_header_dump(&yt_dlp, url),
+            run_yt_dlp_playlist_tracks_dump(&yt_dlp, url),
+        );
+
+        let mut header_stderr = String::new();
+        let mut tracks_stderr = String::new();
+        let mut first_video_id: Option<String> = None;
+
+        match header_result {
+            Ok(raw) => {
+                if let Ok(value) = serde_json::from_str::<Value>(&raw) {
+                    title = title.or_else(|| {
+                        value
+                            .get("title")
+                            .and_then(Value::as_str)
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_string)
+                    });
+                    cover_url = cover_url.or_else(|| pick_best_thumbnail_url(&value));
+                    first_video_id = first_video_id_from_playlist_header(&value);
+                }
+            }
+            Err(stderr_msg) => header_stderr = stderr_msg,
+        }
+
+        if first_video_id.is_none() {
+            if let Ok(ref raw) = tracks_dump_result {
+                first_video_id = first_video_id_from_tracks_dump(raw);
+            }
+        }
+        if let Err(stderr_msg) = &tracks_dump_result {
+            tracks_stderr = stderr_msg.clone();
+        }
+
+        media_tracks = if let Some(seed_video_id) = first_video_id {
+            match post_ytmusic(
+                state,
+                "next",
+                watch_next_payload(&seed_video_id, Some(playlist_id.as_str())),
+            )
+            .await
+            {
+                Ok(response) => {
+                    let (tracks, _) = extract_watch_playlist(&response, None);
+                    if tracks.is_empty() {
+                        flat_playlist_tracks_from_dump(&tracks_dump_result)
+                    } else {
+                        tracks
+                    }
+                }
+                Err(error) => {
+                    last_error = Some(error);
+                    flat_playlist_tracks_from_dump(&tracks_dump_result)
+                }
+            }
+        } else {
+            flat_playlist_tracks_from_dump(&tracks_dump_result)
         };
 
-        // Playlist-level metadata — every entry exposes it on Spotify/Apple
-        // because each track line carries the playlist header. Take the
-        // first non-empty value we see.
-        if title.is_none() {
-            if let Some(candidate) = str_field(&parsed, &["playlist_title", "title"]) {
-                title = Some(candidate);
-            }
-        }
-        if description.is_none() {
-            // Only consume `playlist_description` from the playlist-level entry.
-            // The previous fallback to `description` was happily reading track-level
-            // metadata dumps ("Provided to YouTube by Universal Music Group ...")
-            // whenever the playlist header omitted its own description, which then
-            // landed in the import dialog and in newly-saved playlists as a giant
-            // wall of text. The front-end also drops the description display from
-            // the import dialog as a defense-in-depth measure.
-            if let Some(candidate) = str_field(&parsed, &["playlist_description"]) {
-                description = Some(candidate);
-            }
-        }
-        if cover_url.is_none() {
-            // Strict gate: only set the playlist-level cover from a line yt-dlp
-            // explicitly marks as the playlist header. When no such line shows
-            // up — YT Music with --dump-json streams only per-track
-            // `_type: "video"` lines — capture the first track's thumbnails as
-            // `first_track_cover` so the new playlist shows a real image instead
-            // of the DefaultArtwork placeholder.
-            if parsed.get("_type").and_then(Value::as_str) == Some("playlist") {
-                cover_url = pick_best_thumbnail_url(&parsed);
-            } else if first_track_cover.is_none() {
-                first_track_cover = pick_best_thumbnail_url(&parsed);
-            }
-        }
-
-        // Track title. YouTube Music returns `title` on flat-playlist
-        // entries; Spotify/Apple prefer `track`. Some scrapers only
-        // populate `title` (the playlist title bleeds in). Skip entries
-        // without a real track title.
-        let track_title = str_field(&parsed, &["track", "title"]);
-        // Artist extraction handles three yt-dlp shapes depending on the
-        // service:
-        //   * `artist`   — single string (Spotify, Apple Music).
-        //   * `uploader` — single string (YT Music fallback).
-        //   * `artists`  — JSON array of strings (YT Music full mode
-        //                  returns ["Michael Kiwanuka"]; SoundCloud
-        //                  and others can return multi-artist arrays).
-        // `str_field` only reads strings, so the array shape silently
-        // drops the track. We explicitly coerce the array to a
-        // comma-joined string before falling through.
-        let track_artist = {
-            if let Some(arr) = parsed.get("artists").and_then(Value::as_array) {
-                let joined: Vec<String> = arr
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-                    .collect();
-                if joined.is_empty() {
-                    None
-                } else {
-                    Some(joined.join(", "))
-                }
+        if media_tracks.is_empty() {
+            last_error = Some(if !tracks_stderr.is_empty() {
+                tracks_stderr
+            } else if !header_stderr.is_empty() {
+                header_stderr
             } else {
-                str_field(&parsed, &["artist", "uploader", "channel"])
-            }
-        }
-        // Strip trailing " - Topic" / " - VEVO" suffix yt-dlp appends for
-        // YT Music channels. Apple Music and Spotify emit clean artist
-        // names so this is a no-op for them.
-        .map(|value| strip_artist_noise(&value));
-        let track_album = str_field(&parsed, &["album"]);
-        let track_duration = parsed
-            .get("duration")
-            .and_then(Value::as_f64)
-            .and_then(duration_from_value);
-
-        let Some(title) = track_title else { continue };
-        let Some(artist) = track_artist else { continue };
-        if !title.is_empty() && !artist.is_empty() {
-            tracks.push(ExternalPlaylistTrack {
-                title,
-                artist,
-                album: track_album,
-                duration_seconds: track_duration,
+                last_error.unwrap_or_else(|| {
+                    "We couldn't read any songs from that YouTube Music playlist. Check that the link is public and try again."
+                        .to_string()
+                })
             });
         }
     }
 
-    if tracks.is_empty() {
-        return Err(
-            "We couldn't read any songs from that YouTube Music playlist. Some playlists require sign-in or are region-locked."
-                .to_string(),
-        );
+    if media_tracks.is_empty() {
+        return Err(last_error.unwrap_or_else(|| {
+            "We couldn't read any songs from that YouTube Music playlist. Check that the link is public and try again."
+                .to_string()
+        }));
     }
+
+    let tracks: Vec<ExternalPlaylistTrack> = media_tracks
+        .into_iter()
+        .map(|track| ExternalPlaylistTrack {
+            title: track.title,
+            artist: track.artist,
+            album: track.album,
+            duration_seconds: track.duration_seconds,
+        })
+        .collect();
 
     Ok(ExternalPlaylistImport {
         service: "youtube".to_string(),
         title: title.unwrap_or_else(|| "Imported playlist".to_string()),
-        description,
-        // Prefer the playlist-level cover when yt-dlp emitted a header line;
-        // otherwise fall through to the first track's thumbnail (the YT
-        // Music case where no `_type: "playlist"` line appears in --dump-json).
-        cover_url: cover_url.or(first_track_cover),
+        description: None,
+        cover_url,
         tracks,
     })
 }
+
 
 // ── Spotify web scrape ────────────────────────────────────────────────────
 //
@@ -921,6 +1035,27 @@ static SPOTIFY_ACCESS_TOKEN_RE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r#"window\.__spotify_webplayer_access_token\s*=\s*"([^"]+)""#)
         .expect("spotify access token")
 });
+// `<script id="initialState">` holds a base64 JSON blob carrying the
+// full playlist state (entities keyed by `spotify:track:` and
+// `spotify:playlist:` URIs). Used as the *primary* Spotify import
+// path because the anonymous /get_access_token endpoint is currently
+// 403-blocked upstream, which kills the older API pagination path.
+static SPOTIFY_INITIAL_STATE_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r#"(?is)<script[^>]+id="initialState"[^>]*>(.+?)</script>"#)
+        .expect("spotify initialState")
+});
+// The Spotify EMBED page (open.spotify.com/embed/playlist/<id>)
+// ships the full track list inside a Next.js <script id="__NEXT_DATA__">
+// JSON blob, so we can read 98-track (or larger) public playlists in a
+// single fetch. The main web-player's initialState blob only inlines
+// the first 30 tracks + a pagingInfo cursor, and the anonymous token
+// endpoint we would need to keep paginating via the public Web API is
+// currently 403-blocked at the edge. Embed is the only path that
+// reliably hands us every track for an anonymous public playlist.
+static SPOTIFY_NEXT_DATA_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r#"(?is)<script[^>]+id="__NEXT_DATA__"[^>]*>(.+?)</script>"#)
+        .expect("spotify next data")
+});
 static SPOTIFY_PLAYLIST_ID_RE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r#"/playlist/([a-zA-Z0-9]+)"#).expect("spotify playlist id")
 });
@@ -935,46 +1070,99 @@ static SPOTIFY_ARTIST_RE: Lazy<Regex> = Lazy::new(|| {
         .expect("spotify artist")
 });
 
-// Fetch ALL tracks from a Spotify public playlist via the Spotify Web API
-// using an anonymous access token extracted from the page HTML. Handles
-// pagination so playlists of any length (tested on 305-song playlists)
-// return every track. Falls back to None silently on any failure so the
-// caller can drop to the SSR scraping fallback.
+// Hit the Spotify anonymous-token endpoint and return a sanitized
+// token, or `None` for any failure (network, non-2xx, malformed body,
+// missing `accessToken` key). Centralized so the upfront fallback and
+// the mid-loop 401 retry share the same extraction logic.
+async fn fetch_spotify_access_token() -> Option<String> {
+    let token_response = HTTP
+        .get("https://open.spotify.com/get_access_token?reason=transport&productType=web_player")
+        .header(ORIGIN, HeaderValue::from_static("https://open.spotify.com"))
+        .header(REFERER, HeaderValue::from_static("https://open.spotify.com/"))
+        .header(ACCEPT_LANGUAGE, HeaderValue::from_static("en-US,en;q=0.9"))
+        .send()
+        .await
+        .ok()?;
+    if !token_response.status().is_success() {
+        return None;
+    }
+    let token_body: Value = token_response.json().await.ok()?;
+    let token = token_body.get("accessToken")?.as_str()?.trim().to_string();
+    if token.is_empty() || token == "null" || token.len() < 40 {
+        return None;
+    }
+    Some(token)
+}
+
+// Decode Spotify's `initialState` base64 JSON blob to a `Value`.
+// `None` for any decode failure so the caller can silently fall
+// through to the next import path.
+fn decode_spotify_initial_state(html: &str) -> Option<Value> {
+    let raw = SPOTIFY_INITIAL_STATE_RE
+        .captures(html)?
+        .get(1)?
+        .as_str()
+        .trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(raw)
+        .ok()?;
+    let text = std::str::from_utf8(bytes.as_slice()).ok()?;
+    serde_json::from_str::<Value>(&text).ok()
+}
+
+// Fetch ALL tracks from a Spotify public playlist via the Spotify Web
+// API using an anonymous access token. Pagination handles playlists
+// of any length. Returns `Some(tracks)` on success, `None` for any
+// failure that the caller should treat as "try the next path".
 async fn fetch_spotify_tracks_via_api(
     url: &str,
     html: &str,
 ) -> Option<Vec<ExternalPlaylistTrack>> {
     let playlist_id = SPOTIFY_PLAYLIST_ID_RE.captures(url)?.get(1)?.as_str().to_string();
 
-    // Try to extract the anonymous access token from the HTML first.
+    // Extract anonymous token; the `?` chain is intentionally NOT
+    // used -- a regex miss must fall through to fetch_spotify_access_token()
+    // below, not abort the whole function. The previous `?`-chain
+    // silently dropped every auth-miss to a 30-track SSR scrape (the
+    // user-facing "cap at 30" bug).
     let mut access_token = SPOTIFY_ACCESS_TOKEN_RE
-        .captures(html)?
-        .get(1)?
-        .as_str()
-        .to_string();
+        .captures(html)
+        .and_then(|c| c.get(1))
+        .map(|m| m.as_str().to_string())
+        .unwrap_or_default();
 
-    // If the token is empty or literal "null" (JS fallback), try the
-    // Spotify get_access_token endpoint directly.
-    if access_token.is_empty() || access_token == "null" {
-        let token_response = HTTP
-            .get("https://open.spotify.com/get_access_token?reason=transport&productType=web_player")
-            .header(ORIGIN, HeaderValue::from_static("https://open.spotify.com"))
-            .header(REFERER, HeaderValue::from_static("https://open.spotify.com/"))
-            .header(ACCEPT_LANGUAGE, HeaderValue::from_static("en-US,en;q=0.9"))
-            .send()
-            .await
-            .ok()?;
-        if !token_response.status().is_success() {
-            return None;
-        }
-        let token_body: Value = token_response.json().await.ok()?;
-        access_token = token_body.get("accessToken")?.as_str()?.to_string();
+    // Reject empty / "null" / "undefined" / too-short / non-token-
+    // charset values; fetch a fresh token explicitly. Spotify BQ
+    // tokens are ~150–250 chars of `[A-Za-z0-9_-]`, so 100 chars +
+    // charset is comfortably below the real floor and above any
+    // padded-sentinel attack ("null" x 100, etc.).
+    let looks_usable = !access_token.is_empty()
+        && access_token != "null"
+        && access_token != "undefined"
+        && access_token.len() >= 100
+        && access_token
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+    if !looks_usable {
+        access_token = match fetch_spotify_access_token().await {
+            Some(token) => token,
+            None => return None,
+        };
     }
 
     let api_base = format!("https://api.spotify.com/v1/playlists/{playlist_id}/tracks");
     let mut all_tracks: Vec<ExternalPlaylistTrack> = Vec::new();
     let limit: u32 = 50;
     let mut offset: u32 = 0;
+    // Per-page refresh guard. The retry path `continue`s back to the
+    // top of the same page, so this counter must be declared OUTSIDE
+    // the loop to actually cap retries. We reset it to 0 right after
+    // each successful `offset += limit;` so every page gets a fresh
+    // budget of one token refresh+retry.
+    let mut refresh_attempts: u8 = 0;
 
     loop {
         let page_url = format!("{api_base}?limit={limit}&offset={offset}");
@@ -985,6 +1173,34 @@ async fn fetch_spotify_tracks_via_api(
             .send()
             .await
             .ok()?;
+
+        // 401 = token expired; 429 = Spotify rate-limited us. Either
+        // is worth a single refresh+retry per page; 429 we back off
+        // briefly so the rate limiter doesn't escalate.
+        //
+        // We deliberately do NOT set a "this page already retried"
+        // flag before `continue`ing. The flag was only ever silencing
+        // retries on every subsequent page after the first one -- the
+        // retry path jumps past the post-block reset, and the next
+        // iteration's check would then see `flag = true` and bail.
+        // Each iteration is a fresh HTTP call on a new offset, so the
+        // flag was guarding nothing useful and just suppressing
+        // recoveries from token rotations that hit mid-import.
+        let is_401 = response.status() == reqwest::StatusCode::UNAUTHORIZED;
+        let is_429 = response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS;
+        if (is_401 || is_429) && refresh_attempts < 1 {
+            if is_429 {
+                // Short backoff before retrying so the rate limiter
+                // doesn't escalate.
+                tokio::time::sleep(Duration::from_millis(750)).await;
+            }
+            if let Some(refreshed) = fetch_spotify_access_token().await {
+                access_token = refreshed;
+                refresh_attempts += 1;
+                continue;
+            }
+            return None;
+        }
 
         if !response.status().is_success() {
             return None;
@@ -1029,6 +1245,9 @@ async fn fetch_spotify_tracks_via_api(
 
         let total = body.get("total").and_then(Value::as_u64).unwrap_or(0) as usize;
         offset += limit;
+        // Reset the per-page refresh budget now that this page is
+        // fully processed. The next iteration starts a fresh page.
+        refresh_attempts = 0;
 
         // Stop when we've fetched everything or the last page was empty.
         if all_tracks.len() >= total || items_on_page == 0 {
@@ -1037,6 +1256,454 @@ async fn fetch_spotify_tracks_via_api(
     }
 
     if all_tracks.is_empty() { None } else { Some(all_tracks) }
+}
+
+// --- Spotify initialState helpers ---------------------------------
+
+// Walk the playlist entity's track-list of choice. Spotify's
+// hydration shape has shifted across web-player rollouts; we try
+// the most common keys in order (`tracksV2` -> `contents` ->
+// `tracks`) and return whichever is the first non-empty array.
+fn spotify_playlist_track_items(playlist: &Value) -> Option<&Vec<Value>> {
+    let candidates = [
+        playlist.get("tracksV2").and_then(|v| v.get("items")),
+        playlist
+            .get("contents")
+            .and_then(|v| v.get("items"))
+            .or_else(|| playlist.get("contents")),
+        playlist.get("tracks"),
+    ];
+    candidates
+        .into_iter()
+        .flatten()
+        .find_map(|value| value.as_array().filter(|arr| !arr.is_empty()))
+}
+
+// Extract a track URI from one entry in the playlist entity's track-
+// list array. Spotify ships it directly (`uri`), nested under
+// `trackItem.v2.data.uri`, or wrapped under `track.uri`; we try
+// all three so a hydration-blob shape rotation doesn't drop tracks.
+fn spotify_track_item_uri(item: &Value) -> Option<String> {
+    const URI_KEYS: [&str; 3] = ["uri", "track_uri", "trackUri"];
+    for key in URI_KEYS {
+        if let Some(s) = item.get(key).and_then(Value::as_str) {
+            if s.starts_with("spotify:track:") {
+                return Some(s.to_string());
+            }
+        }
+    }
+    if let Some(s) = item
+        .get("trackItem")
+        .and_then(|t| t.get("v2"))
+        .and_then(|t| t.get("data"))
+        .and_then(|d| d.get("uri"))
+        .and_then(Value::as_str)
+    {
+        if s.starts_with("spotify:track:") {
+            return Some(s.to_string());
+        }
+    }
+    item.get("track")
+        .and_then(|t| t.get("uri"))
+        .and_then(Value::as_str)
+        .filter(|s| s.starts_with("spotify:track:"))
+        .map(str::to_string)
+}
+
+// Largest cover URL from the playlist entity's `images` array. The
+// shape has rotated a few times, so this is deliberately permissive.
+fn spotify_playlist_cover(playlist: &Value) -> Option<String> {
+    let images = playlist.get("images").and_then(Value::as_array)?;
+    let mut best_width: u64 = 0;
+    let mut best_url: Option<String> = None;
+    for entry in images {
+        let url = entry
+            .as_str()
+            .map(str::to_string)
+            .or_else(|| entry.get("url").and_then(Value::as_str).map(str::to_string))
+            .or_else(|| {
+                entry.as_array().and_then(|inner| {
+                    inner
+                        .last()
+                        .and_then(|v| {
+                            v.as_str()
+                                .map(str::to_string)
+                                .or_else(|| v.get("url").and_then(Value::as_str).map(str::to_string))
+                        })
+                        .or_else(|| {
+                            inner.first().and_then(|v| {
+                                v.as_str()
+                                    .map(str::to_string)
+                                    .or_else(|| v.get("url").and_then(Value::as_str).map(str::to_string))
+                            })
+                        })
+                })
+            });
+        let width = entry
+            .get("maxWidth")
+            .and_then(Value::as_u64)
+            .or_else(|| entry.get("width").and_then(Value::as_u64))
+            .unwrap_or(0);
+        if let Some(url) = url {
+            if width > best_width || best_url.is_none() {
+                best_url = Some(url);
+                best_width = width;
+            }
+        }
+    }
+    best_url
+}
+
+// ── Spotify embed page helpers ──────────────────────────────────
+
+// Fetch the public embed page for a playlist ID. The embed page
+// (open.spotify.com/embed/playlist/<id>) is less rate-limited than
+// the main web player and does not require a session cookie, so it
+// works for anonymous imports. We use a 10s timeout (shorter than the
+// default 15s) so a slow embed page does not block the import path
+// for the full 15s when the primary path will end up timing out.
+async fn fetch_spotify_embed_html(playlist_id: &str) -> Option<String> {
+    let url = format!("https://open.spotify.com/embed/playlist/{playlist_id}");
+    let response = HTTP
+        .get(&url)
+        .header(reqwest::header::USER_AGENT, HeaderValue::from_static(USER_AGENT))
+        .header(ACCEPT_LANGUAGE, HeaderValue::from_static("en-US,en;q=0.9"))
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await
+        .ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    response.text().await.ok()
+}
+
+// Decode the embed page's <script id="__NEXT_DATA__"> body to a
+// `Value`. Returns `None` for any decode failure so the caller can
+// silently fall through to the next import path.
+fn decode_spotify_next_data(html: &str) -> Option<Value> {
+    let raw = SPOTIFY_NEXT_DATA_RE
+        .captures(html)?
+        .get(1)?
+        .as_str()
+        .trim();
+    if raw.is_empty() {
+        return None;
+    }
+    serde_json::from_str::<Value>(raw).ok()
+}
+
+// Walk a `state.data.entity` JSON tree looking for the playlist
+// entity (a dict with a non-empty `trackList` array). The embed
+// page's Next.js payload nests the playlist under a few possible
+// paths; we probe them in order. Returns the entity dict and the
+// resolved trackList array length so the caller can decide whether
+// the find was useful.
+fn find_embed_playlist_entity(root: &Value) -> Option<(&Value, usize)> {
+    let state = root.pointer("/props/pageProps/state")?;
+    let data = state.get("data")?;
+    let entity = data.get("entity")?;
+    if let Some(tl) = entity.get("trackList").and_then(Value::as_array) {
+        if !tl.is_empty() {
+            return Some((entity, tl.len()));
+        }
+    }
+    // Older embed rollouts nested the entity directly under
+    // `pageProps.data.entity` (no `state` wrapper). Fallback probe.
+    if let Some(data) = root.pointer("/props/pageProps/data") {
+        if let Some(entity) = data.get("entity") {
+            if let Some(tl) = entity.get("trackList").and_then(Value::as_array) {
+                if !tl.is_empty() {
+                    return Some((entity, tl.len()));
+                }
+            }
+        }
+    }
+    None
+}
+
+// Convert one trackList entry to our internal `ExternalPlaylistTrack`.
+// Embed trackList items have a flat shape: `title` (the song name),
+// `subtitle` (the artist, already a string), `duration` (ms),
+// and `uri` (the Spotify track URI). Album info is NOT present on
+// the embed trackList; the initialState path enriches it where both
+// sides overlap (see `enrich_tracks_with_album_info` below).
+fn parse_embed_track(item: &Value) -> Option<ExternalPlaylistTrack> {
+    let title = item.get("title").and_then(Value::as_str)?.trim().to_string();
+    if title.is_empty() {
+        return None;
+    }
+    let artist = item
+        .get("subtitle")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("")
+        .to_string();
+    if artist.is_empty() {
+        return None;
+    }
+    let duration_seconds = item
+        .get("duration")
+        .and_then(Value::as_f64)
+        .map(|ms| (ms / 1000.0) as u32)
+        .filter(|d| *d > 0);
+    Some(ExternalPlaylistTrack {
+        title,
+        artist,
+        album: None,
+        duration_seconds,
+    })
+}
+
+// Find the best cover URL on the embed entity, preferring the
+// `coverArt.sources[0].url` Spotify ships in the Next.js payload.
+fn embed_entity_cover(entity: &Value) -> Option<String> {
+    if let Some(url) = entity
+        .pointer("/coverArt/sources/0/url")
+        .and_then(Value::as_str)
+    {
+        let trimmed = url.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+    if let Some(images) = entity
+        .pointer("/visualIdentity/image")
+        .and_then(Value::as_array)
+    {
+        for entry in images {
+            if let Some(url) = entry.get("url").and_then(Value::as_str) {
+                let trimmed = url.trim();
+                if !trimmed.is_empty() {
+                    return Some(trimmed.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+// Pull the full track list out of the embed page's __NEXT_DATA__
+// JSON. Returns `None` if the embed fetch fails, the script tag is
+// missing, or the playlist entity has no trackList. The caller is
+// expected to fall back to the initialState/API/SSR paths in that
+// case.
+async fn scrape_playlist_via_embed_page(
+    url: &str,
+) -> Option<ExternalPlaylistImport> {
+    let playlist_id = SPOTIFY_PLAYLIST_ID_RE.captures(url)?.get(1)?.as_str();
+    let embed_html = fetch_spotify_embed_html(playlist_id).await?;
+    let root = decode_spotify_next_data(&embed_html)?;
+    let (entity, _track_list_len) = find_embed_playlist_entity(&root)?;
+
+    let track_list = entity.get("trackList").and_then(Value::as_array)?;
+    let mut tracks: Vec<ExternalPlaylistTrack> = Vec::with_capacity(track_list.len());
+    for item in track_list.iter() {
+        if let Some(track) = parse_embed_track(item) {
+            tracks.push(track);
+        }
+    }
+    if tracks.is_empty() {
+        return None;
+    }
+
+    let title = entity
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| "Imported playlist".to_string());
+    // The embed entity does not expose the user-entered playlist
+    // description; leave it None for the caller to fall through to
+    // og:description.
+    let description: Option<String> = None;
+    let cover_url = embed_entity_cover(entity);
+
+    Some(ExternalPlaylistImport {
+        service: "spotify".to_string(),
+        title,
+        description,
+        cover_url,
+        tracks,
+    })
+}
+
+// Enrich the embed-page tracks (which lack album info) with the
+// album metadata from the main page's initialState blob, where the
+// two sides overlap. Matches by (title, artist) case-insensitively.
+// Tracks that appear ONLY in the embed list (the 31st..Nth) keep
+// `album = None`.
+fn enrich_tracks_with_album_info(
+    tracks: &mut [ExternalPlaylistTrack],
+    initial_state: Option<&ExternalPlaylistImport>,
+) {
+    let Some(import) = initial_state else {
+        return;
+    };
+    for track in tracks.iter_mut() {
+        if track.album.is_some() {
+            continue;
+        }
+        if let Some(matched) = import.tracks.iter().find(|t| {
+            t.title.eq_ignore_ascii_case(&track.title)
+                && t.artist.eq_ignore_ascii_case(&track.artist)
+        }) {
+            track.album = matched.album.clone();
+        }
+    }
+}
+
+// Pull every track out of Spotify's hydration blob without going
+// through the auth path. Returns `None` if the blob is missing,
+// the playlist entity isn't present, or no tracks can be
+// resolved -- in those cases the caller is expected to fall back
+// to the API/SSR paths.
+fn scrape_playlist_via_initial_state(
+    url: &str,
+    html: &str,
+) -> Option<ExternalPlaylistImport> {
+    let blob = decode_spotify_initial_state(html)?;
+    let playlist_id = SPOTIFY_PLAYLIST_ID_RE
+        .captures(url)?
+        .get(1)?
+        .as_str()
+        .to_ascii_uppercase();
+    let entities = blob.get("entities").and_then(Value::as_object)?;
+
+    // Compare URI keys case-insensitively (modern builds lowercase,
+    // older rollouts keep the original case).
+    let playlist = entities.iter().find_map(|(key, value)| {
+        key.strip_prefix("spotify:playlist:")
+            .filter(|rest| rest.eq_ignore_ascii_case(&playlist_id))
+            .map(|_| value)
+    })?;
+
+    let items = spotify_playlist_track_items(playlist)?;
+
+    let mut tracks: Vec<ExternalPlaylistTrack> = Vec::with_capacity(items.len());
+    for item in items.iter() {
+        let Some(uri) = spotify_track_item_uri(item) else {
+            continue;
+        };
+        let Some(track_entity) = entities.get(&uri) else {
+            continue;
+        };
+        let title = track_entity
+            .get("name")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let artist = {
+            let arr = track_entity.get("artists").and_then(Value::as_array);
+            let names: Vec<String> = arr
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|a| {
+                            a.get("profile")
+                                .and_then(|p| p.get("name"))
+                                .and_then(Value::as_str)
+                                .map(str::to_string)
+                                .or_else(|| a.get("name").and_then(Value::as_str).map(str::to_string))
+                                .or_else(|| {
+                                    a.get("uri")
+                                        .and_then(Value::as_str)
+                                        .filter(|s| s.starts_with("spotify:artist:"))
+                                        .and_then(|uri| entities.get(uri))
+                                        .and_then(|ent| ent.get("name").and_then(Value::as_str))
+                                        .map(str::to_string)
+                                })
+                        })
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default();
+            if names.is_empty() {
+                String::new()
+            } else {
+                names.join(", ")
+            }
+        };
+        let album = track_entity
+            .get("albumOfTrack")
+            .and_then(|a| a.get("name"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .or_else(|| {
+                track_entity.get("album").and_then(|a| {
+                    a.get("name")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                        .or_else(|| {
+                            a.get("uri")
+                                .and_then(Value::as_str)
+                                .filter(|s| s.starts_with("spotify:album:"))
+                                .and_then(|uri| entities.get(uri))
+                                .and_then(|ent| ent.get("name").and_then(Value::as_str))
+                                .map(str::to_string)
+                        })
+                })
+            });
+        let duration_seconds = track_entity
+            .get("duration")
+            .and_then(|d| d.get("totalMilliseconds"))
+            .and_then(Value::as_f64)
+            .map(|ms| (ms / 1000.0) as u32)
+            .filter(|d| *d > 0);
+
+        let (Some(title), false) = (title, artist.is_empty()) else {
+            continue;
+        };
+        tracks.push(ExternalPlaylistTrack {
+            title,
+            artist,
+            album,
+            duration_seconds,
+        });
+    }
+
+    if tracks.is_empty() {
+        return None;
+    }
+
+    let title = playlist
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| "Imported playlist".to_string());
+    let description = playlist.get("description").and_then(|d| match d {
+        Value::String(s) => {
+            let trimmed = s.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        }
+        Value::Object(_) => d
+            .get("text")
+            .and_then(Value::as_str)
+            .map(|s| decode_html_entities(s).trim().to_string())
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                d.get("html")
+                    .and_then(Value::as_str)
+                    .map(|s| decode_html_entities(s).trim().to_string())
+                    .filter(|s| !s.is_empty())
+            }),
+        _ => None,
+    });
+    let cover_url = spotify_playlist_cover(playlist);
+
+    Some(ExternalPlaylistImport {
+        service: "spotify".to_string(),
+        title,
+        description,
+        cover_url,
+        tracks,
+    })
 }
 
 // Fallback SSR track-row extraction. Spotify's server-rendered page
@@ -1149,11 +1816,61 @@ async fn scrape_spotify_playlist(url: &str) -> Result<ExternalPlaylistImport, St
         .map(|m| m.as_str().to_string())
         .filter(|s| !s.is_empty());
 
-    // Try API-first: fetch ALL tracks via Spotify Web API with pagination.
-    // This handles playlists of any length (tested to 305 songs).
-    let tracks = fetch_spotify_tracks_via_api(url, &html)
-        .await
-        .unwrap_or_else(|| extract_spotify_tracks_from_ssr(&html));
+    // Four-leg fallback chain. Order matters: each leg returns the
+    // full track list when it works, otherwise hands off to the
+    // next. The previous implementation silently dropped the API
+    // path's auth failures to a 30-track SSR scrape (the
+    // "cap at 30" bug).
+    //   1. Embed page __NEXT_DATA__. The public embed page inlines
+    //      every track of a public playlist in one Next.js JSON
+    //      payload; this is the only path that reliably hands us
+    //      98+ tracks for an anonymous import. The trade-off is
+    //      the per-track items don't carry album info, so we
+    //      cross-enrich below using whatever the initialState
+    //      blob happens to also know about.
+    //   2. initialState blob. The main web-player's hydration
+    //      carries album metadata for the first 30 tracks and is
+    //      used both as a track source AND as the album-info
+    //      enrichment for the embed path.
+    //   3. Spotify Web API. Backed by the implicit anonymous
+    //      token. The previous `?`-early-return bug is fixed.
+    //   4. SSR scrape. Last resort.
+    let mut tracks: Vec<ExternalPlaylistTrack>;
+    let mut last_error: Option<String> = None;
+    let mut embed_import: Option<ExternalPlaylistImport> = None;
+    let mut initial_state_import: Option<ExternalPlaylistImport> = None;
+
+    if let Some(mut import) = scrape_playlist_via_embed_page(url).await {
+        // `mem::take` moves the `tracks` Vec out of `import` without
+        // cloning it. `import` itself stays owned, just with an empty
+        // tracks Vec -- that's what gets stored in `embed_import` for
+        // the cover-url fallback below.
+        tracks = std::mem::take(&mut import.tracks);
+        embed_import = Some(import);
+        // Cross-enrich the embed tracks (which lack album info) with
+        // whatever the initialState happens to also know. Reuse the
+        // `initial_state_import` binding so we don't pay for a Vec
+        // clone of the first 30 tracks.
+        initial_state_import = scrape_playlist_via_initial_state(url, &html);
+        enrich_tracks_with_album_info(&mut tracks, initial_state_import.as_ref());
+    } else if let Some(mut import) = scrape_playlist_via_initial_state(url, &html) {
+        tracks = std::mem::take(&mut import.tracks);
+        initial_state_import = Some(import);
+    } else if let Some(api_tracks) = fetch_spotify_tracks_via_api(url, &html).await {
+        tracks = api_tracks;
+    } else {
+        tracks = extract_spotify_tracks_from_ssr(&html);
+        if tracks.is_empty() {
+            last_error = Some(
+                "We couldn't read any songs from that Spotify playlist. Some playlists require sign-in or are region-locked."
+                    .to_string(),
+            );
+        }
+    }
+
+    if let Some(error) = last_error {
+        return Err(error);
+    }
 
     if tracks.is_empty() {
         return Err(
@@ -1161,6 +1878,15 @@ async fn scrape_spotify_playlist(url: &str) -> Result<ExternalPlaylistImport, St
                 .to_string(),
         );
     }
+
+    // Prefer the highest-resolution cover available. The embed page's
+    // `coverArt.sources` typically ships the largest variant
+    // (~640x640); the initialState blob's playlist entity and the
+    // og:image tag are fallbacks when the embed path didn't run.
+    let cover_url = embed_import
+        .and_then(|i| i.cover_url)
+        .or_else(|| initial_state_import.and_then(|i| i.cover_url))
+        .or(cover_url);
 
     Ok(ExternalPlaylistImport {
         service: "spotify".to_string(),
@@ -1532,7 +2258,7 @@ fn parse_playlist_panel_video(value: &Value) -> Option<MediaTrack> {
     })
 }
 
-fn extract_watch_playlist(value: &Value, seed_video_id: &str) -> (Vec<MediaTrack>, Option<String>) {
+fn extract_watch_playlist(value: &Value, seed_video_id: Option<&str>) -> (Vec<MediaTrack>, Option<String>) {
     // The queue has appeared under more than one watch-page layout. Find the
     // renderer itself instead of depending on one brittle wrapper path.
     fn find_panel(value: &Value) -> Option<&Value> {
@@ -1563,11 +2289,20 @@ fn extract_watch_playlist(value: &Value, seed_video_id: &str) -> (Vec<MediaTrack
         .cloned()
         .unwrap_or_default();
 
-    let tracks = items
+    // The watch-page queue and the import path both consume this
+    // function. The watch-page use case wants to drop the currently-
+    // playing seed video so the autoplay queue doesn't start with the
+    // track the user is already listening to. The import use case
+    // wants every track in the playlist, INCLUDING the seed (which
+    // is just the playlist's first video). `Some(seed)` filters;
+    // `None` keeps everything.
+    let mut tracks: Vec<MediaTrack> = items
         .iter()
         .filter_map(parse_playlist_panel_video)
-        .filter(|track| track.video_id.as_deref() != Some(seed_video_id))
         .collect();
+    if let Some(seed) = seed_video_id {
+        tracks.retain(|track| track.video_id.as_deref() != Some(seed));
+    }
 
     (tracks, playlist_id)
 }
@@ -1933,7 +2668,7 @@ async fn fetch_track_duration(
     }
 
     let response = post_ytmusic(state, "next", watch_next_payload(video_id, None)).await?;
-    let (tracks, _) = extract_watch_playlist(&response, video_id);
+    let (tracks, _) = extract_watch_playlist(&response, Some(video_id));
     let duration = tracks
         .iter()
         .find(|t| t.video_id.as_deref() == Some(video_id))
@@ -2044,7 +2779,7 @@ async fn get_watch_playlist(
     let payload = watch_next_payload(&video_id, playlist_id.as_deref());
 
     let response = post_ytmusic(&state, "next", payload).await?;
-    let (tracks, next_playlist_id) = extract_watch_playlist(&response, &video_id);
+    let (tracks, next_playlist_id) = extract_watch_playlist(&response, Some(&video_id));
 
     let trimmed_tracks: Vec<MediaTrack> = tracks.into_iter().take(25).collect();
 
@@ -4056,6 +4791,61 @@ where
         .output()
         .await
         .map_err(|error| format!("Failed to run {}: {error}", program.display()))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(if stderr.is_empty() {
+            format!("{} exited with {}", program.display(), output.status)
+        } else {
+            stderr
+        });
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+// Bounded variant of `run_command` for callers that can hang
+// indefinitely if the child process stalls (yt-dlp against a
+// rate-limited or malformed playlist URL, for example). Spawns the
+// child with `kill_on_drop(true)` and wraps `wait_with_output` in
+// `tokio::time::timeout`; on timeout the inner future is dropped,
+// which kills the OS process via `kill_on_drop` so we don't leak a
+// zombie. Returns a clear error so the caller can surface it to the
+// user instead of hanging the import dialog.
+async fn run_command_with_timeout<'a, I>(
+    program: &Path,
+    args: I,
+    timeout: Duration,
+) -> Result<String, String>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    let mut command = Command::new(program);
+    command.args(args).kill_on_drop(true);
+    #[cfg(target_os = "windows")]
+    command.creation_flags(CREATE_NO_WINDOW);
+
+    // Spawn the child so we own the `Child` handle and can explicitly
+    // bound the wait. `wait_with_output()` consumes the child and
+    // reads stdout/stderr to completion; dropping that future on
+    // timeout is what triggers the `kill_on_drop` reaper.
+    let child = command
+        .spawn()
+        .map_err(|error| format!("Failed to run {}: {error}", program.display()))?;
+
+    let output = match tokio::time::timeout(timeout, child.wait_with_output()).await {
+        Ok(Ok(out)) => out,
+        Ok(Err(error)) => {
+            return Err(format!("Failed to run {}: {error}", program.display()));
+        }
+        Err(_elapsed) => {
+            return Err(format!(
+                "{} didn't respond within {}s. The playlist might be unusually large or the service is rate-limiting anonymous requests. Try again in a few minutes.",
+                program.display(),
+                timeout.as_secs()
+            ));
+        }
+    };
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -6974,7 +7764,7 @@ mod tests {
             }
         });
 
-        let (tracks, playlist_id) = extract_watch_playlist(&response, "seed");
+        let (tracks, playlist_id) = extract_watch_playlist(&response, Some("seed"));
         assert_eq!(playlist_id.as_deref(), Some("RDAMVMseed"));
         assert_eq!(tracks.len(), 1);
         assert_eq!(tracks[0].video_id.as_deref(), Some("next-song"));
@@ -7627,6 +8417,33 @@ mod tests {
         assert_eq!(track.artist, "Radiohead");
         assert_eq!(track.duration_seconds, Some(261));
     }
+
+    #[test]
+    fn normalize_flat_uploader_treats_na_as_unknown() {
+        assert_eq!(normalize_flat_uploader("NA"), "");
+        assert_eq!(normalize_flat_uploader("n/a"), "");
+        assert_eq!(normalize_flat_uploader("Radiohead - Topic"), "Radiohead");
+    }
+
+    #[test]
+    fn parse_flat_playlist_tracks_keeps_na_uploader_tracks() {
+        let raw = "nbCOAPR33ME|||Karma Police (Remastered)|||NA|||1\n";
+        let tracks = parse_flat_playlist_tracks(raw);
+        assert_eq!(tracks.len(), 1);
+        assert_eq!(tracks[0].title, "Karma Police (Remastered)");
+        assert_eq!(tracks[0].artist, "");
+        assert_eq!(tracks[0].video_id.as_deref(), Some("nbCOAPR33ME"));
+    }
+
+    #[test]
+    fn first_video_id_from_tracks_dump_reads_first_line() {
+        let raw = "nbCOAPR33ME|||Karma Police|||NA|||1\npqrUQrAcfo4|||Do I Wanna Know?|||NA|||2\n";
+        assert_eq!(
+            first_video_id_from_tracks_dump(raw).as_deref(),
+            Some("nbCOAPR33ME")
+        );
+    }
+
 }
 
 

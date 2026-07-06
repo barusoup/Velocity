@@ -80,18 +80,39 @@ if (existsSync(icoPath)) {
     if (buf.length < 6) {
       fail(`icon.ico is too small (${buf.length} bytes) to be a valid ICO`);
       blocked = true;
-    } else {
-      const count = buf[4] | (buf[5] << 8);
-      if (count < 3) {
-        fail(
-          `icon.ico has only ${count} frame(s). Windows taskbar will be ` +
-            `blurry. Re-run 'npx tauri icon src-tauri/icons/desktop-icon.png'.`,
-        );
-        blocked = true;
       } else {
-        info(`icon.ico has ${count} frames`);
+        const count = buf[4] | (buf[5] << 8);
+        if (count < 3) {
+          fail(
+            `icon.ico has only ${count} frame(s). Windows taskbar will be ` +
+              `blurry. Re-run 'npm run regen-icons'.`,
+          );
+          blocked = true;
+        } else {
+          let largestFirst = true;
+          let prevArea = Infinity;
+          for (let i = 0; i < count; i++) {
+            const off = 6 + i * 16;
+            const w = buf[off];
+            const h = buf[off + 1];
+            const fw = w === 0 ? 256 : w;
+            const fh = h === 0 ? 256 : h;
+            const area = fw * fh;
+            if (area > prevArea) largestFirst = false;
+            prevArea = area;
+          }
+          if (!largestFirst) {
+            fail(
+              `icon.ico frames are not ordered largest-first. Windows ` +
+                `desktop-shortcut rendering paths may upscale a small frame. ` +
+                `Re-run 'npm run regen-icons'.`,
+            );
+            blocked = true;
+          } else {
+            info(`icon.ico has ${count} frames, largest-first`);
+          }
+        }
       }
-    }
   } catch {
     /* ignore read errors */
   }

@@ -111,6 +111,11 @@ must perform every step below. This is the **only** supported release path.
    - `src-tauri/tauri.conf.json` → `"version"`
    - `src-tauri/Cargo.toml` → `[package] version`
 
+   Also update the **Settings page footer** (`src/components/SettingsPage.tsx`,
+   bottom-of-page "Velocity vX.Y.Z" string) so the in-app version matches the
+   new release. This footer is hardcoded and must be edited by hand each
+   release.
+
 2. **Clean the working tree.** Remove anything not fit for the source repo:
    - AI agent artifacts: `.claude/`, `.codex/`, `.commandcode/`, `.opencode/`
      (these should already be in `.gitignore` — verify and add missing entries)
@@ -173,7 +178,7 @@ must perform every step below. This is the **only** supported release path.
    - Runs `npm run verify-release` on every matrix build as a fail-fast
      gate. A non-zero exit there means a bad commit slipped past the local
      verify — cancel / drop the tag, fix, and re-push.
-   - Builds Windows + macOS arm64 with `tauri build`, signing the updater
+    - Builds Windows + macOS arm64 + Linux x86_64 with `tauri build`, signing the updater
      bundles (produces `.sig` sidecars and updater targets).
    - Stages every asset under its fixed name (see the fixed-asset-names table
      above).
@@ -341,9 +346,12 @@ create it; otherwise carry on with step 2.
    python -c "from PIL import Image; src = Image.open('velocity-logo.png').convert('RGBA'); w, h = src.size; s = max(w, h); canvas = Image.new('RGBA', (s, s), (0, 0, 0, 0)); canvas.paste(src, ((s - w) // 2, (s - h) // 2)); canvas.save('src-tauri/icons/desktop-icon.png')"
    ```
 3. Regenerate every Tauri derivative from the square wrapper (NOT from
-   `velocity-logo.png`):
+   `velocity-logo.png`), then reorder the `.ico` frames so the largest
+   frame is first. Some Windows shortcut-rendering paths load the first
+   frame they can decode and scale it; putting the 256×256 frame first
+   prevents those paths from upscaling a 32×32 frame:
    ```bash
-   npx tauri icon src-tauri/icons/desktop-icon.png
+   npm run regen-icons
    ```
 
 That is the full regen — stop here. `public/icon.png` and

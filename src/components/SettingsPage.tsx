@@ -434,6 +434,12 @@ export function SettingsPage() {
           handleKeepOfflineFiles();
         }}
       />
+
+      <div className="mt-10 border-t border-white/8 pt-4 text-center">
+        <p className="text-xs font-medium tracking-[0.04em] text-neutral-500">
+          Velocity v0.0.2
+        </p>
+      </div>
     </div>
   );
 }
