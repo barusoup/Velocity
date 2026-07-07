@@ -119,20 +119,26 @@ jobs:
         with:
           path: _assets
 
-      # Tag-triggered checkouts can land on the commit without the annotated
-      # tag ref locally, so `git tag -l --format=...` returns empty and the
-      # publish step falls back to a bare "Velocity X.Y.Z" title (missing
-      # "Experimental", attaching latest.json). Fetch the tag explicitly.
+      # Tag-triggered checkouts create a local `refs/tags/vX.Y.Z` ref
+      # pointing at the peeled commit object, not the annotated tag
+      # object, so a plain `git fetch origin "refs/tags/<TAG>:<TAG>"`
+      # refuses to overwrite it with the real annotated tag object
+      # (Git 2.20+ returns `! [rejected] (would clobber existing tag)`).
+      # Use `--force` on the fetch, and guard against the classic GitHub
+      # Actions trap of rendering an undefined `github.event.inputs.X`
+      # as the literal string "null" (which would otherwise build the
+      # refspec `refs/tags/vnull:refs/tags/vnull`).
       - name: Fetch annotated tag for release notes
         shell: bash
         run: |
           set -eu
-          if [ -n "${{ github.event.inputs.version }}" ]; then
-            TAG="v${{ github.event.inputs.version }}"
+          VERSION="${{ github.event.inputs.version }}"
+          if [ -n "$VERSION" ] && [ "$VERSION" != "null" ]; then
+            TAG="v${VERSION}"
           else
             TAG="${GITHUB_REF_NAME}"
           fi
-          git fetch origin "refs/tags/${TAG}:refs/tags/${TAG}"
+          git fetch --force origin "refs/tags/${TAG}:refs/tags/${TAG}"
 
       # Idempotent overwrite: drop any prior release + git tag at $TAG so
       # this run can recreate it cleanly.
@@ -143,8 +149,9 @@ jobs:
         run: |
           set -eu
           REPO="${{ github.repository }}"
-          if [ -n "${{ github.event.inputs.version }}" ]; then
-            TAG="v${{ github.event.inputs.version }}"
+          VERSION="${{ github.event.inputs.version }}"
+          if [ -n "$VERSION" ] && [ "$VERSION" != "null" ]; then
+            TAG="v${VERSION}"
           else
             TAG="${GITHUB_REF_NAME}"
           fi
@@ -159,8 +166,9 @@ jobs:
           REPO="${{ github.repository }}"
           BASE="https://github.com/${REPO}/releases/latest/download"
 
-          if [ -n "${{ github.event.inputs.version }}" ]; then
-            TAG="v${{ github.event.inputs.version }}"
+          VERSION="${{ github.event.inputs.version }}"
+          if [ -n "$VERSION" ] && [ "$VERSION" != "null" ]; then
+            TAG="v${VERSION}"
           else
             TAG="${GITHUB_REF_NAME}"
           fi
@@ -246,5 +254,11 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          TAG="${{ github.event.inputs.version && format('v{0}', github.event.inputs.version) || github.ref_name }}"
+          set -eu
+          VERSION="${{ github.event.inputs.version }}"
+          if [ -n "$VERSION" ] && [ "$VERSION" != "null" ]; then
+            TAG="v${VERSION}"
+          else
+            TAG="${GITHUB_REF_NAME}"
+          fi
           gh release view "$TAG" --repo ${{ github.repository }} --json tagName,assets --jq '{tag:.tagName, assets:[.assets[].name]}'
