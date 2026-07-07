@@ -712,9 +712,19 @@ export function Marquee({
   };
 
   const dragCursor = isDragging ? "cursor-grabbing" : "cursor-grab";
+  // `overflow-hidden` lives on the container in BOTH branches. When
+  // animating, the `marquee-mask` keyframes fade-gradient the clip for
+  // a soft edge; when culled (the text already fits, the overflow
+  // measurement transiently fell under threshold, or we're between
+  // marquee re-installs), the same `overflow-hidden` provides a hard
+  // clip so the inner `whitespace-nowrap` text can't bleed past the
+  // container's right edge into sibling content (e.g. overflowing
+  // track titles into the next card column, or section headings into
+  // neighbour rows). Without the unconditional clip, culling the
+  // animation dropped the only thing stopping the text from bleeding.
   const containerClassName = isAnimating
     ? `relative block w-full overflow-hidden marquee-mask ${fadeClass} ${dragCursor} ${className ?? ""}`
-    : `relative block w-full ${className ?? ""}`;
+    : `relative block w-full overflow-hidden ${className ?? ""}`;
 
   const containerStyle = userStyle
     ? (isAnimating ? { ...marqueeContainerStyle, ...userStyle } : userStyle)

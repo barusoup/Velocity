@@ -3658,13 +3658,20 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const finishSeekScrub = useCallback((seconds: number | null, resume: boolean) => {
-    writeSeekScrub(null);
+    // Apply the seek first so audio.currentTime reflects the new position
+    // before we clear the live scrub preview. Seek internally unpauses via
+    // tryResumeAfterSeekScrub, so audio is already resumed when downstream
+    // subscribers react to the cleared preview. If we cleared the preview
+    // first, listeners (e.g. LyricsPage’s `displayProgress`) would briefly
+    // see the pre-scrub timestamp and react-scroll the lyrics back to the
+    // previously active line.
     resumeAfterSeekRef.current = resume;
     if (seconds !== null) {
       seek(seconds);
-      return;
+    } else {
+      tryResumeAfterSeekScrub();
     }
-    tryResumeAfterSeekScrub();
+    writeSeekScrub(null);
   }, [seek, tryResumeAfterSeekScrub]);
 
   const setVolume = useCallback((value: number) => {

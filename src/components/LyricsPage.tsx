@@ -401,16 +401,68 @@ export function LyricsPage({
     }
   }, [lyrics]);
 
+  // Upper bound for any smooth-scroll animation we might trigger. Used as
+  // a safety fallback for `scrollend` so the programmatic flag can never
+  // strand itself in the "programmatic" state when the browser doesn't
+  // dispatch `scrollend` (e.g. instant scrolls or no-op scrollIntoView
+  // calls on already-centered elements). Generous enough to cover slow
+  // smooth scrolls but short enough that genuine user input isn't
+  // mistakenly treated as programmatic if scrollend misfires.
+  const PROGRAMMATIC_SCROLL_SAFETY_TIMEOUT_MS = 1500;
+
+  // Wrap a programmatic scroll (scrollTo / scrollIntoView) so the user-vs-
+  // programmatic discrimination in `onUserScroll` correctly excludes every
+  // scroll event fired WHILE the smooth animation runs — not just the
+  // ones fired before the animation starts.
+  //
+  // The previous pattern used `setTimeout(() => { isProgrammaticScrollRef
+  // .current = false; }, 0)`, which runs synchronously after the scroll
+  // call but well before the smooth-scroll animation's own `scroll`
+  // events are dispatched. Those in-flight scroll events were misread by
+  // `onUserScroll` as user input, scheduling a 2-second recenter timer
+  // on every event. Once the animation finished, the last timer
+  // eventually fired, kicked off a fresh smooth-scroll animation, and
+  // the cycle repeated roughly every ~2.5s — the periodic "jump/stutter"
+  // while listening.
+  //
+  // The fix is to flip the flag to true and keep it true until either
+  // `scrollend` fires (the well-defined end of a smooth-scroll
+  // animation, shipped in WebKit 17 and Chromium 114) or a generous
+  // timeout elapses as a fallback. `scrollend` is registered with
+  // `{ once: true }` so even a single late-firing event tears the
+  // listener down.
+  const runProgrammaticScroll = useCallback((action: () => void) => {
+    const container = scrollContainerRef.current ?? resolveLyricsScrollContainer();
+    if (!container) {
+      isProgrammaticScrollRef.current = false;
+      action();
+      return;
+    }
+    scrollContainerRef.current = container;
+    isProgrammaticScrollRef.current = true;
+
+    let cleared = false;
+    const clear = () => {
+      if (cleared) return;
+      cleared = true;
+      isProgrammaticScrollRef.current = false;
+      container.removeEventListener("scrollend", clear);
+      window.clearTimeout(safetyTimer);
+    };
+    container.addEventListener("scrollend", clear, { once: true, passive: true });
+    const safetyTimer = window.setTimeout(clear, PROGRAMMATIC_SCROLL_SAFETY_TIMEOUT_MS);
+
+    action();
+  }, []);
+
   const scrollLyricsToTop = useCallback((behavior: ScrollBehavior = "instant") => {
     const container = scrollContainerRef.current ?? resolveLyricsScrollContainer();
     if (!container) return;
     scrollContainerRef.current = container;
-    isProgrammaticScrollRef.current = true;
-    container.scrollTo({ top: 0, behavior });
-    setTimeout(() => {
-      isProgrammaticScrollRef.current = false;
-    }, 0);
-  }, []);
+    runProgrammaticScroll(() => {
+      container.scrollTo({ top: 0, behavior });
+    });
+  }, [runProgrammaticScroll]);
 
   const recenterActiveLyric = useCallback((behavior: ScrollBehavior = "instant") => {
     if (holdTopAfterTrackChangeRef.current) return;
@@ -418,12 +470,10 @@ export function LyricsPage({
     if (index < 0) return;
     const el = lyricLineRefs.current[index];
     if (!el) return;
-    isProgrammaticScrollRef.current = true;
-    el.scrollIntoView({ block: "center", behavior });
-    setTimeout(() => {
-      isProgrammaticScrollRef.current = false;
-    }, 0);
-  }, []);
+    runProgrammaticScroll(() => {
+      el.scrollIntoView({ block: "center", behavior });
+    });
+  }, [runProgrammaticScroll]);
 
   const handleLyricsLayoutChange = useCallback(() => {
     updateLyricsSpacers();
@@ -441,6 +491,28 @@ export function LyricsPage({
       (state) => state.seekScrubProgress,
       (scrub) => {
         seekScrubProgressRef.current = scrub;
+        // When the scrubber releases, `progressForLyrics` falls back to
+        // the local `displayProgress` state. That state is fed by the RAF
+        // sync loop, which only runs while the audio is playing — so for
+        // one render after `seekScrubProgress` goes null, the page would
+        // still see the pre-scrub timestamp. The auto-follow effect then
+        // computes an `activeLyricIndex` matching the old line and kicks
+        // off a smooth-scroll back to it (the “jumps back to your last
+        // lyric” behavior when rewinding to the start of a song on the
+        // lyrics page). Force-sync to the freshly-updated
+        // `audio.currentTime` right here, before React commits the
+        // next render, so the post-mouseup view already matches the new
+        // playhead position.
+        if (scrub === null) {
+          const audio = currentAudio.current;
+          const live = audio?.currentTime;
+          const next = Number.isFinite(live)
+            ? (live as number)
+            : playerProgressRef.current;
+          displayProgressRef.current = next;
+          playerProgressRef.current = next;
+          setDisplayProgress(next);
+        }
       },
     );
     seekScrubProgressRef.current = usePlayerUiStore.getState().seekScrubProgress;
@@ -477,13 +549,13 @@ export function LyricsPage({
     const audio = currentAudio.current;
     if (!audio) return;
     const onEnded = () => {
-      isProgrammaticScrollRef.current = true;
-      lyricLineRefs.current[0]?.scrollIntoView({ block: "center", behavior: "smooth" });
-      setTimeout(() => { isProgrammaticScrollRef.current = false; }, 0);
+      runProgrammaticScroll(() => {
+        lyricLineRefs.current[0]?.scrollIntoView({ block: "center", behavior: "smooth" });
+      });
     };
     audio.addEventListener("ended", onEnded);
     return () => audio.removeEventListener("ended", onEnded);
-  }, [track?.id]);
+  }, [track?.id, runProgrammaticScroll]);
 
   useEffect(() => {
     if (!track) return;
@@ -571,9 +643,13 @@ export function LyricsPage({
         if (index < 0) return;
         const el = lyricLineRefs.current[index];
         if (!el) return;
-        isProgrammaticScrollRef.current = true;
-        el.scrollIntoView({ block: "center", behavior: "smooth" });
-        setTimeout(() => { isProgrammaticScrollRef.current = false; }, 0);
+        // Recentering is itself a programmatic scroll, so run it through
+        // the same flag manager — otherwise the smooth-scroll animation
+        // here would feed back into this listener and schedule another
+        // 2-second timer, repeating forever.
+        runProgrammaticScroll(() => {
+          el.scrollIntoView({ block: "center", behavior: "smooth" });
+        });
       }, 2000);
     };
 
@@ -582,7 +658,7 @@ export function LyricsPage({
       container.removeEventListener('scroll', onUserScroll);
       if (autoScrollTimeoutRef.current) clearTimeout(autoScrollTimeoutRef.current);
     };
-  }, []);
+  }, [runProgrammaticScroll]);
 
   useEffect(() => {
     if (!track) {
@@ -703,10 +779,10 @@ export function LyricsPage({
       trackChangeLyricBaselineRef.current = null;
     }
     lastScrolledIndexRef.current = activeLyricIndex;
-    isProgrammaticScrollRef.current = true;
-    lyricLineRefs.current[activeLyricIndex]?.scrollIntoView({ block: "center", behavior: "smooth" });
-    setTimeout(() => { isProgrammaticScrollRef.current = false; }, 0);
-  }, [activeLyricIndex]);
+    runProgrammaticScroll(() => {
+      lyricLineRefs.current[activeLyricIndex]?.scrollIntoView({ block: "center", behavior: "smooth" });
+    });
+  }, [activeLyricIndex, runProgrammaticScroll]);
 
   const prevLyricsRef = useRef<SyncedLyrics | null>(null);
   // When lyrics load or change for a new track, size spacers and keep the
@@ -728,10 +804,10 @@ export function LyricsPage({
     }
     lastScrolledIndexRef.current = index;
     if (index < 0) return;
-    isProgrammaticScrollRef.current = true;
-    lyricLineRefs.current[index]?.scrollIntoView({ block: "center", behavior: "instant" });
-    setTimeout(() => { isProgrammaticScrollRef.current = false; }, 0);
-  }, [lyrics, updateLyricsSpacers, scrollLyricsToTop]);
+    runProgrammaticScroll(() => {
+      lyricLineRefs.current[index]?.scrollIntoView({ block: "center", behavior: "instant" });
+    });
+  }, [lyrics, updateLyricsSpacers, scrollLyricsToTop, runProgrammaticScroll]);
 
   // Keep the active lyric centered when the scrollport changes size (window
   // resize, monitor move, DPI change, or --app-height refresh). A fixed
