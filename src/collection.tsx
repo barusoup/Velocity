@@ -22,6 +22,7 @@ import {
   mergeTrackListMetadataBatch,
   type TrackMetadataUpdates,
 } from "./utils/track-metadata-backfill";
+import { getSearchItemArtist } from "./utils/search";
 
 // ---------------------------------------------------------------------------
 // Saved-collection state
@@ -88,7 +89,7 @@ function coerceSavedSong(input: SavedSongInput): MediaTrack {
   return {
     id,
     title: item.title,
-    artist: item.artist ?? "Unknown artist",
+    artist: getSearchItemArtist(item),
     album: item.album ?? null,
     albumBrowseId: item.albumBrowseId ?? null,
     artistBrowseId: item.artistBrowseId ?? null,

@@ -1,7 +1,7 @@
 import { useShallow } from "zustand/react/shallow";
 import { usePlayerUiStore } from "../store/playerUiStore";
 import type { MediaTrack, SearchItem } from "../types";
-import { isSameSongTrack } from "../utils/media";
+import { isSameSongTrack, isSameStreamPlayback } from "../utils/media";
 
 /** Re-renders only when a track is loaded or unloaded. */
 export function usePlayerHasTrack(): boolean {
@@ -32,7 +32,7 @@ export function useTrackPlaybackState(track: MediaTrack): PlaybackFlags {
   return usePlayerUiStore(
     useShallow((state) =>
       toPlaybackFlags(
-        isSameSongTrack(state.currentTrack, track),
+        isSameStreamPlayback(state.currentTrack, track),
         state.isPlaying,
         state.isBuffering,
       ),
@@ -93,6 +93,8 @@ function isSearchItemActive(
     return isSameSongTrack(state.currentTrack, {
       id: item.id,
       videoId: item.videoId,
+      artist: item.artist,
+      title: item.title,
       source: "stream",
     });
   }

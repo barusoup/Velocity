@@ -29,6 +29,13 @@ export function cardHoverPlayRevealClass(visible = false): string {
     : "translate-y-2 opacity-0 group-hover:translate-y-0 group-hover:opacity-100";
 }
 
+/** Row save buttons stay visible when saved; unsaved buttons reveal on row hover. */
+export function rowSaveButtonRevealClass(isSaved: boolean): string {
+  return isSaved
+    ? "shrink-0"
+    : "shrink-0 invisible group-hover:visible opacity-0 group-hover:opacity-100 transition-all";
+}
+
 export function cardPlayButtonSizing(size: "sm" | "md" | "lg" = "md") {
   if (size === "lg") return { buttonClass: "h-14 w-14", iconSize: 24 };
   if (size === "sm") return { buttonClass: "h-10 w-10", iconSize: 16 };
@@ -432,7 +439,7 @@ export const TrackRow = memo(function TrackRow({
           )}
         </div>
         {track.source !== "upload" && (
-          <div className="shrink-0 invisible group-hover:visible opacity-0 group-hover:opacity-100 transition-all" onClick={(e) => e.stopPropagation()}>
+          <div className={rowSaveButtonRevealClass(isSaved)} onClick={(e) => e.stopPropagation()}>
             <SaveButton
               isSaved={isSaved}
               size="sm"

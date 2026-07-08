@@ -15,7 +15,7 @@ import {
   useToggleTrackSave,
 } from "../hooks/useCollectionSelectors";
 import type { MediaTrack, SearchItem, SearchResponse } from "../types";
-import { ArtworkImage, getArtworkRoundedClass } from "./Shared";
+import { ArtworkImage, getArtworkRoundedClass, rowSaveButtonRevealClass } from "./Shared";
 import { SaveButton } from "./SaveButton";
 import type { View } from "./Sidebar";
 import { DEFAULT_SEARCH_FILTERS, type SearchFilters, type SearchSort } from "./SearchFilters";
@@ -212,6 +212,7 @@ export function SearchPage({
           <VirtualList
             items={filteredResults}
             estimateSize={64}
+            overscan={20}
             getItemKey={(item) => item.id}
             className="space-y-1"
             renderItem={(item) => (
@@ -572,17 +573,18 @@ function SearchItemSaveButtons({
     savedArtist ?? { browseId: "", title: "" },
   );
 
-  const revealClass = hoverReveal
-    ? "shrink-0 invisible group-hover:visible opacity-0 group-hover:opacity-100 transition-all"
-    : titleInline
-      ? "flex shrink-0 items-center"
-      : "shrink-0";
+  const revealClass = (isSaved: boolean) =>
+    hoverReveal
+      ? rowSaveButtonRevealClass(isSaved)
+      : titleInline
+        ? "flex shrink-0 items-center"
+        : "shrink-0";
   const buttonSize = hoverReveal ? "sm" : titleInline ? "md" : undefined;
 
   return (
     <>
       {saveTrack && saveTrack.source !== "upload" && (
-        <div className={revealClass} onClick={(event) => event.stopPropagation()}>
+        <div className={revealClass(trackSaved)} onClick={(event) => event.stopPropagation()}>
           <SaveButton
             isSaved={trackSaved}
             size={buttonSize}
@@ -593,7 +595,7 @@ function SearchItemSaveButtons({
       )}
 
       {savedAlbum && (
-        <div className={revealClass} onClick={(event) => event.stopPropagation()}>
+        <div className={revealClass(albumSaved)} onClick={(event) => event.stopPropagation()}>
           <SaveButton
             isSaved={albumSaved}
             size={buttonSize}
@@ -604,7 +606,10 @@ function SearchItemSaveButtons({
       )}
 
       {savedArtist && (
-        <div className={revealClass} onClick={(event) => event.stopPropagation()}>
+        <div
+          className={revealClass(artistSaved)}
+          onClick={(event) => event.stopPropagation()}
+        >
           <SaveButton
             isSaved={artistSaved}
             size={buttonSize}

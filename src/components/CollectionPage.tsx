@@ -56,6 +56,7 @@ import {
   cardHoverPlayTransitionClass,
   DefaultArtwork,
   getArtworkRoundedClass,
+  rowSaveButtonRevealClass,
 } from "./Shared";
 import { SaveButton } from "./SaveButton";
 import { ArtistCreditText } from "./PagesShared";
@@ -1365,7 +1366,7 @@ function CollectionRowShell({
           </div>
           {withContextTarget && onToggleSave && track.source !== "upload" && (
             <div
-              className="shrink-0 invisible group-hover:visible opacity-0 group-hover:opacity-100 transition-all"
+              className={rowSaveButtonRevealClass(isSaved ?? true)}
               onClick={(e) => e.stopPropagation()}
             >
               <SaveButton

@@ -393,7 +393,7 @@ export function SettingsPage() {
           ))}
         </div>
         <p className="shrink-0 text-xs font-medium tracking-[0.04em] text-neutral-500">
-          Velocity v0.1.3 Experimental
+          Velocity v0.1.4 Experimental
         </p>
       </div>
 

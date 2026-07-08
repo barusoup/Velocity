@@ -306,6 +306,8 @@ export function isItemPlaying(
     return isSameSongTrack(currentTrack, {
       id: item.id,
       videoId: item.videoId,
+      artist: item.artist,
+      title: item.title,
       source: "stream",
     });
   }

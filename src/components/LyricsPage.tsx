@@ -5,7 +5,13 @@ import {
   isLyricsExhaustedForTrack,
   lyricsCacheVideoId,
 } from "../api";
-import { fetchSyncedLyrics, fetchSyncedLyricsByMeta, findActiveLyricIndex, type SyncedLyrics } from "../lyrics";
+import {
+  fetchSyncedLyrics,
+  fetchSyncedLyricsByMeta,
+  findActiveLyricIndex,
+  hasValidLyricSync,
+  type SyncedLyrics,
+} from "../lyrics";
 import { useAccent } from "../accent-context";
 import { useSetting } from "../settings";
 import { currentAudio, usePlayer } from "../player";
@@ -46,6 +52,16 @@ function sampleLogFrequencyAt(
 /** Bars ease to flat at full opacity, then the visualizer fades out. */
 const PAUSE_SETTLE_MS = 300;
 const PAUSE_FADE_MS = 200;
+
+function currentLyricsProgress(): number {
+  const state = usePlayerUiStore.getState();
+  return state.seekScrubProgress ?? state.progress;
+}
+
+function acceptSyncedLyrics(candidate: SyncedLyrics | null): SyncedLyrics | null {
+  if (!candidate || !hasValidLyricSync(candidate.lines)) return null;
+  return candidate;
+}
 
 function resolveLyricsScrollContainer(): HTMLElement | null {
   const lyricsScrollArea = document.querySelector(".lyrics-scroll-area");
@@ -267,23 +283,26 @@ export function LyricsPage({
   const player = usePlayer();
   const track = player.currentTrack;
   const [lyrics, setLyrics] = useState<SyncedLyrics | null>(() =>
-    track?.source === "stream" && track ? hydratePersistedLyricsForTrack(track) : null,
+    track?.source === "stream" && track
+      ? acceptSyncedLyrics(hydratePersistedLyricsForTrack(track))
+      : null,
   );
   const [loading, setLoading] = useState(() => {
     if (!track) return false;
     if (track.source === "upload") return Boolean(track.findLyrics);
-    return track.source === "stream"
-      ? hydratePersistedLyricsForTrack(track) === null
-      : false;
+    if (track.source === "stream") {
+      const cached = hydratePersistedLyricsForTrack(track);
+      return acceptSyncedLyrics(cached) === null;
+    }
+    return false;
   });
   const [timedOut, setTimedOut] = useState(false);
   const accent = useAccent();
-  const [displayProgress, setDisplayProgress] = useState(0);
+  const storedProgress = usePlayerUiStore((state) => state.progress);
+  const seekScrubProgress = usePlayerUiStore((state) => state.seekScrubProgress);
   const lyricLineRefs = useRef<Array<HTMLButtonElement | null>>([]);
   const lastScrolledIndexRef = useRef(-1);
-  const displayProgressRef = useRef(0);
-  const playerProgressRef = useRef(0);
-  const seekScrubProgressRef = useRef<number | null>(null);
+  const prevTrackIdRef = useRef<string | null>(null);
   const isProgrammaticScrollRef = useRef(false);
   const holdTopAfterTrackChangeRef = useRef(false);
   /** Active line index when the new track's lyrics first appear; auto-follow stays at top until this advances. */
@@ -486,55 +505,26 @@ export function LyricsPage({
     return () => cancelAnimationFrame(id);
   }, [lyrics, updateLineOpacities]);
 
-  useEffect(() => {
-    const unsub = usePlayerUiStore.subscribe(
-      (state) => state.seekScrubProgress,
-      (scrub) => {
-        seekScrubProgressRef.current = scrub;
-        // When the scrubber releases, `progressForLyrics` falls back to
-        // the local `displayProgress` state. That state is fed by the RAF
-        // sync loop, which only runs while the audio is playing — so for
-        // one render after `seekScrubProgress` goes null, the page would
-        // still see the pre-scrub timestamp. The auto-follow effect then
-        // computes an `activeLyricIndex` matching the old line and kicks
-        // off a smooth-scroll back to it (the “jumps back to your last
-        // lyric” behavior when rewinding to the start of a song on the
-        // lyrics page). Force-sync to the freshly-updated
-        // `audio.currentTime` right here, before React commits the
-        // next render, so the post-mouseup view already matches the new
-        // playhead position.
-        if (scrub === null) {
-          const audio = currentAudio.current;
-          const live = audio?.currentTime;
-          const next = Number.isFinite(live)
-            ? (live as number)
-            : playerProgressRef.current;
-          displayProgressRef.current = next;
-          playerProgressRef.current = next;
-          setDisplayProgress(next);
-        }
-      },
-    );
-    seekScrubProgressRef.current = usePlayerUiStore.getState().seekScrubProgress;
-    return unsub;
-  }, []);
-
-  // Reset scroll position and display progress when the track changes.
+  // Reset scroll position when the track actually changes (not on mount).
   // Jump to the top immediately so we are not still scrolled to the
   // previous song's active line while the new track's lyrics load.
   // Auto-follow resumes once the active line advances (or when playback
   // reaches the first timed line on a fresh start).
   useLayoutEffect(() => {
+    const trackId = track?.id ?? null;
+    const isActualTrackChange =
+      prevTrackIdRef.current !== null && prevTrackIdRef.current !== trackId;
+    prevTrackIdRef.current = trackId;
+
     lyricLineRefs.current = [];
     lastScrolledIndexRef.current = -1;
-    holdTopAfterTrackChangeRef.current = true;
     trackChangeLyricBaselineRef.current = null;
     if (autoScrollTimeoutRef.current) clearTimeout(autoScrollTimeoutRef.current);
-    scrollLyricsToTop("instant");
 
-    const initial = playerProgressRef.current;
-    displayProgressRef.current = initial;
-    setDisplayProgress(initial);
+    if (!isActualTrackChange) return;
+
+    holdTopAfterTrackChangeRef.current = true;
+    scrollLyricsToTop("instant");
   }, [track?.id, scrollLyricsToTop]);
 
   // When the underlying audio element fires its `ended` event (track
@@ -557,68 +547,7 @@ export function LyricsPage({
     return () => audio.removeEventListener("ended", onEnded);
   }, [track?.id, runProgrammaticScroll]);
 
-  useEffect(() => {
-    if (!track) return;
-    const audio = currentAudio.current;
-    if (!audio) return;
-
-    let frameId = 0;
-    let running = true;
-
-    const syncProgress = () => {
-      if (!running) return;
-
-      const scrubbing = seekScrubProgressRef.current !== null;
-      if (audio.paused && !scrubbing) return;
-
-      frameId = window.requestAnimationFrame(syncProgress);
-      if (scrubbing) return;
-
-      const liveProgress = audio.currentTime;
-      const nextProgress = Number.isFinite(liveProgress)
-        ? liveProgress
-        : playerProgressRef.current;
-      if (Math.abs(nextProgress - displayProgressRef.current) >= 0.01) {
-        displayProgressRef.current = nextProgress;
-        playerProgressRef.current = nextProgress;
-        setDisplayProgress(nextProgress);
-      }
-    };
-
-    const schedule = () => {
-      if (!running) return;
-      window.cancelAnimationFrame(frameId);
-      frameId = window.requestAnimationFrame(syncProgress);
-    };
-
-    const onWake = () => schedule();
-    audio.addEventListener("play", onWake);
-    audio.addEventListener("seeking", onWake);
-    audio.addEventListener("seeked", onWake);
-
-    const unsubScrub = usePlayerUiStore.subscribe(
-      (state) => state.seekScrubProgress,
-      (scrub) => {
-        if (scrub !== null) schedule();
-      },
-    );
-
-    if (!audio.paused || seekScrubProgressRef.current !== null) {
-      schedule();
-    }
-
-    return () => {
-      running = false;
-      window.cancelAnimationFrame(frameId);
-      audio.removeEventListener("play", onWake);
-      audio.removeEventListener("seeking", onWake);
-      audio.removeEventListener("seeked", onWake);
-      unsubScrub();
-    };
-  }, [track?.id]);
-
-  const seekScrubProgress = usePlayerUiStore((state) => state.seekScrubProgress);
-  const progressForLyrics = seekScrubProgress ?? displayProgress;
+  const progressForLyrics = seekScrubProgress ?? storedProgress;
 
   const activeLyricIndex = useMemo(() => {
     if (!lyrics || !track) return -1;
@@ -698,7 +627,9 @@ export function LyricsPage({
     const MAX_ERROR_RETRIES = 2;
     const ERROR_RETRY_DELAY_MS = 800;
 
-    const cachedStreamLyrics = isStream ? hydratePersistedLyricsForTrack(track) : null;
+    const cachedStreamLyrics = isStream
+      ? acceptSyncedLyrics(hydratePersistedLyricsForTrack(track))
+      : null;
 
     setLyrics(cachedStreamLyrics);
     setLoading(!cachedStreamLyrics);
@@ -712,8 +643,9 @@ export function LyricsPage({
       void request
         .then((nextLyrics) => {
           if (cancelled || player.currentTrack?.id !== track.id) return;
-          if (nextLyrics) {
-            setLyrics(nextLyrics);
+          const accepted = acceptSyncedLyrics(nextLyrics);
+          if (accepted) {
+            setLyrics(accepted);
             setLoading(false);
             setTimedOut(false);
             return;
@@ -795,7 +727,7 @@ export function LyricsPage({
     prevLyricsRef.current = lyrics;
     if (!lyrics || lyrics.lines.length === 0 || lyrics === previousLyrics) return;
     updateLyricsSpacers();
-    const index = findActiveLyricIndex(lyrics.lines, displayProgressRef.current);
+    const index = findActiveLyricIndex(lyrics.lines, currentLyricsProgress());
     if (holdTopAfterTrackChangeRef.current) {
       trackChangeLyricBaselineRef.current = index;
       lastScrolledIndexRef.current = index;

@@ -25,7 +25,7 @@ import {
   PLAYLIST_TRACK_GRID,
   TrackListHeader,
 } from "./TrackList";
-import { DefaultArtwork, ConfirmDialog } from "./Shared";
+import { DefaultArtwork, ConfirmDialog, rowSaveButtonRevealClass } from "./Shared";
 import { PlaylistContextMenu } from "./PlaylistContextMenu";
 import { SaveButton } from "./SaveButton";
 import { useIsTrackSaved, useToggleTrackSave } from "../hooks/useCollectionSelectors";
@@ -35,7 +35,7 @@ import { usePlayer, usePlayerActions, type QueueOrigin } from "../player";
 import { useContextTrackTarget } from "../hooks/useContextTrackTarget";
 import type { MediaTrack } from "../types";
 import { ArtistCreditText, useArtworkAccent } from "./PagesShared";
-import { formatOptionalDuration, isSameSongTrack, withResolvedAudioSrc } from "../utils/media";
+import { formatOptionalDuration, isSameStreamPlayback, withResolvedAudioSrc } from "../utils/media";
 import { mixRgb, rgbToCss } from "../utils/artwork-color";
 import type { View } from "./Sidebar";
 import { getDirectArtistBrowseId, resolveArtistBrowseId } from "../utils/navigation";
@@ -266,7 +266,7 @@ export function UserPlaylistPage({
   const firstTrackActive = useMemo(() => {
     const first = tracks[0];
     if (!first) return false;
-    return isSameSongTrack(player.currentTrack, first);
+    return isSameStreamPlayback(player.currentTrack, first);
   }, [player.currentTrack, tracks]);
 
   if (!playlist) {
@@ -789,7 +789,7 @@ function AlbumTrackRow({
         </div>
         {track.source !== "upload" && (
           <div
-            className="shrink-0 invisible group-hover:visible opacity-0 group-hover:opacity-100 transition-all"
+            className={rowSaveButtonRevealClass(isSaved)}
             onClick={(event) => event.stopPropagation()}
           >
             <SaveButton

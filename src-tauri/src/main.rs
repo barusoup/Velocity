@@ -2632,9 +2632,11 @@ fn parse_playlist_panel_video(value: &Value) -> Option<MediaTrack> {
     if normalized_kind == "unknown" {
         return None;
     }
-    let artist = parsed_runs.artist_text.unwrap_or_else(|| {
-        infer_artist_from_text(&byline, true).unwrap_or_else(|| "Unknown artist".to_string())
-    });
+    let has_type_label = kind_label
+        .as_ref()
+        .map(|label| is_type_label(&label.to_ascii_lowercase()))
+        .unwrap_or(false);
+    let artist = resolve_track_artist(&parsed_runs, &meta_parts, has_type_label, None);
     let album = parsed_runs.album_text.filter(|value| parse_duration(value).is_none()).or_else(|| {
         let parts = &meta_parts;
         // Reject any bullet-segment that looks like a duration ("3:45", "12:30:01")
@@ -6031,6 +6033,40 @@ fn parse_search_suggestions(value: &Value) -> Vec<SearchSuggestion> {
     suggestions
 }
 
+fn is_search_row_entry(entry: &Value) -> bool {
+    entry.get("musicResponsiveListItemRenderer").is_some()
+}
+
+fn push_unique_search_result(
+    results: &mut Vec<SearchItem>,
+    seen: &mut HashMap<String, bool>,
+    parsed: SearchItem,
+) {
+    if !should_include_search_item(&parsed) {
+        return;
+    }
+    if seen.contains_key(&parsed.id) {
+        return;
+    }
+    seen.insert(parsed.id.clone(), true);
+    results.push(parsed);
+}
+
+fn collect_search_rows_from_entries(
+    entries: &[Value],
+    results: &mut Vec<SearchItem>,
+    seen: &mut HashMap<String, bool>,
+) {
+    for entry in entries {
+        if entry.get("messageRenderer").is_some() {
+            continue;
+        }
+        if let Some(parsed) = parse_search_row(entry) {
+            push_unique_search_result(results, seen, parsed);
+        }
+    }
+}
+
 fn parse_search_response(query: &str, value: &Value) -> SearchResponse {
     let contents = value
         .get("contents")
@@ -6059,22 +6095,33 @@ fn parse_search_response(query: &str, value: &Value) -> SearchResponse {
     }
 
     let mut results = Vec::new();
-    for item in contents {
+    for item in &contents {
+        if let Some(card) = item.get("musicCardShelfRenderer") {
+            if let Some(shelf_contents) = card.get("contents").and_then(Value::as_array) {
+                collect_search_rows_from_entries(shelf_contents, &mut results, &mut seen);
+            }
+            continue;
+        }
+
+        if let Some(shelf_contents) = item
+            .get("musicShelfRenderer")
+            .and_then(|value| value.get("contents"))
+            .and_then(Value::as_array)
+        {
+            collect_search_rows_from_entries(shelf_contents, &mut results, &mut seen);
+            continue;
+        }
+
         if let Some(section_items) = item
             .get("itemSectionRenderer")
             .and_then(|value| value.get("contents"))
             .and_then(Value::as_array)
         {
-            for entry in section_items {
-                if let Some(parsed) = parse_search_row(entry) {
-                    if !should_include_search_item(&parsed) {
-                        continue;
-                    }
-                    if !seen.contains_key(&parsed.id) {
-                        seen.insert(parsed.id.clone(), true);
-                        results.push(parsed);
-                    }
-                }
+            if section_items
+                .first()
+                .is_some_and(is_search_row_entry)
+            {
+                collect_search_rows_from_entries(section_items, &mut results, &mut seen);
             }
         }
     }
@@ -6147,10 +6194,7 @@ fn parse_top_result(value: &Value) -> Option<SearchItem> {
         .map(|value| is_type_label(&value.to_ascii_lowercase()))
         .unwrap_or(false);
 
-    let artist = parsed_runs
-        .artist_text
-        .clone()
-        .or_else(|| fallback_artist_from_meta(&meta, has_type_label));
+    let artist = resolve_search_artist(&parsed_runs, &meta, has_type_label);
 
     let album = if kind == "song" || kind == "video" {
         parsed_runs.album_text.clone().filter(|value| parse_duration(value).is_none()).or_else(|| {
@@ -6288,10 +6332,7 @@ fn parse_search_row(value: &Value) -> Option<SearchItem> {
         .map(|value| is_type_label(&value.to_ascii_lowercase()))
         .unwrap_or(false);
 
-    let artist = parsed_runs
-        .artist_text
-        .clone()
-        .or_else(|| fallback_artist_from_meta(&meta_parts, has_type_label));
+    let artist = resolve_search_artist(&parsed_runs, &meta_parts, has_type_label);
 
     let album = if kind == "song" || kind == "video" {
         parsed_runs.album_text.clone().filter(|value| parse_duration(value).is_none()).or_else(|| {
@@ -7424,17 +7465,13 @@ fn parse_track(
     {
         return None;
     }
-    let artist = parsed_runs.artist_text.unwrap_or_else(|| {
-        let meta = flex.get(1).cloned().unwrap_or_default();
-        let parts = split_bullets_fixed(&meta);
-        let has_type_label = parts
-            .first()
-            .map(|part| is_type_label(&part.to_ascii_lowercase()))
-            .unwrap_or(false);
-        fallback_artist_from_meta(&parts, has_type_label)
-            .or_else(|| fallback_artist.map(str::to_string))
-            .unwrap_or_else(|| "Unknown artist".to_string())
-    });
+    let meta = flex.get(1).cloned().unwrap_or_default();
+    let parts = split_bullets_fixed(&meta);
+    let has_type_label = parts
+        .first()
+        .map(|part| is_type_label(&part.to_ascii_lowercase()))
+        .unwrap_or(false);
+    let artist = resolve_track_artist(&parsed_runs, &parts, has_type_label, fallback_artist);
     let artist_browse_id = parsed_runs
         .artist_browse_id
         .clone()
@@ -7673,6 +7710,47 @@ fn fallback_artist_from_meta(meta_parts: &[String], has_type_label: bool) -> Opt
         .skip(usize::from(has_type_label))
         .find(|part| !looks_like_non_artist_meta(part))
         .cloned()
+}
+
+fn artist_line_from_credits(credits: &[ArtistCredit]) -> Option<String> {
+    let names: Vec<String> = credits
+        .iter()
+        .map(|credit| credit.name.trim())
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .collect();
+    if names.is_empty() {
+        None
+    } else {
+        Some(names.join(", "))
+    }
+}
+
+fn resolve_search_artist(
+    parsed_runs: &ParsedRunMeta,
+    meta_parts: &[String],
+    has_type_label: bool,
+) -> Option<String> {
+    parsed_runs
+        .artist_text
+        .clone()
+        .or_else(|| fallback_artist_from_meta(meta_parts, has_type_label))
+        .or_else(|| artist_line_from_credits(&parsed_runs.artist_credits))
+}
+
+fn resolve_track_artist(
+    parsed_runs: &ParsedRunMeta,
+    meta_parts: &[String],
+    has_type_label: bool,
+    fallback_artist: Option<&str>,
+) -> String {
+    parsed_runs
+        .artist_text
+        .clone()
+        .or_else(|| fallback_artist_from_meta(meta_parts, has_type_label))
+        .or_else(|| artist_line_from_credits(&parsed_runs.artist_credits))
+        .or_else(|| fallback_artist.map(str::to_string))
+        .unwrap_or_else(|| "Unknown artist".to_string())
 }
 
 fn infer_artist_from_text(value: &str, has_type_label: bool) -> Option<String> {
@@ -8471,6 +8549,159 @@ mod tests {
         );
     }
     #[test]
+    fn parse_search_response_reads_music_shelf_and_card_shelf_rows() {
+        let value = json!({
+            "contents": {
+                "tabbedSearchResultsRenderer": {
+                    "tabs": [{
+                        "tabRenderer": {
+                            "content": {
+                                "sectionListRenderer": {
+                                    "contents": [
+                                        {
+                                            "musicCardShelfRenderer": {
+                                                "title": {
+                                                    "runs": [{
+                                                        "text": "Let Down",
+                                                        "navigationEndpoint": {
+                                                            "browseEndpoint": { "browseId": "top1" }
+                                                        }
+                                                    }]
+                                                },
+                                                "subtitle": { "runs": [{ "text": "Song \u{2022} Radiohead" }] },
+                                                "thumbnailOverlay": {
+                                                    "musicItemThumbnailOverlayRenderer": {
+                                                        "content": {
+                                                            "musicPlayButtonRenderer": {
+                                                                "playNavigationEndpoint": {
+                                                                    "watchEndpoint": { "videoId": "topvid" }
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                },
+                                                "contents": [
+                                                    {
+                                                        "messageRenderer": {
+                                                            "text": { "runs": [{ "text": "Songs" }] }
+                                                        }
+                                                    },
+                                                    {
+                                                        "musicResponsiveListItemRenderer": {
+                                                            "flexColumns": [
+                                                                {
+                                                                    "musicResponsiveListItemFlexColumnRenderer": {
+                                                                        "text": { "runs": [{ "text": "Karma Police" }] }
+                                                                    }
+                                                                },
+                                                                {
+                                                                    "musicResponsiveListItemFlexColumnRenderer": {
+                                                                        "text": { "runs": [{ "text": "Song \u{2022} Radiohead" }] }
+                                                                    }
+                                                                }
+                                                            ],
+                                                            "playlistItemData": { "videoId": "karma" }
+                                                        }
+                                                    }
+                                                ]
+                                            }
+                                        },
+                                        {
+                                            "musicShelfRenderer": {
+                                                "header": {
+                                                    "musicShelfHeaderRenderer": {
+                                                        "title": { "runs": [{ "text": "Songs" }] }
+                                                    }
+                                                },
+                                                "contents": [
+                                                    {
+                                                        "musicResponsiveListItemRenderer": {
+                                                            "flexColumns": [
+                                                                {
+                                                                    "musicResponsiveListItemFlexColumnRenderer": {
+                                                                        "text": { "runs": [{ "text": "Creep" }] }
+                                                                    }
+                                                                },
+                                                                {
+                                                                    "musicResponsiveListItemFlexColumnRenderer": {
+                                                                        "text": { "runs": [{ "text": "Song \u{2022} Radiohead" }] }
+                                                                    }
+                                                                }
+                                                            ],
+                                                            "playlistItemData": { "videoId": "creep" }
+                                                        }
+                                                    },
+                                                    {
+                                                        "musicResponsiveListItemRenderer": {
+                                                            "flexColumns": [
+                                                                {
+                                                                    "musicResponsiveListItemFlexColumnRenderer": {
+                                                                        "text": { "runs": [{ "text": "Paranoid Android" }] }
+                                                                    }
+                                                                },
+                                                                {
+                                                                    "musicResponsiveListItemFlexColumnRenderer": {
+                                                                        "text": { "runs": [{ "text": "Song \u{2022} Radiohead" }] }
+                                                                    }
+                                                                }
+                                                            ],
+                                                            "playlistItemData": { "videoId": "paranoid" }
+                                                        }
+                                                    }
+                                                ]
+                                            }
+                                        },
+                                        {
+                                            "musicShelfRenderer": {
+                                                "header": {
+                                                    "musicShelfHeaderRenderer": {
+                                                        "title": { "runs": [{ "text": "Albums" }] }
+                                                    }
+                                                },
+                                                "contents": [
+                                                    {
+                                                        "musicResponsiveListItemRenderer": {
+                                                            "flexColumns": [
+                                                                {
+                                                                    "musicResponsiveListItemFlexColumnRenderer": {
+                                                                        "text": { "runs": [{ "text": "OK Computer" }] }
+                                                                    }
+                                                                },
+                                                                {
+                                                                    "musicResponsiveListItemFlexColumnRenderer": {
+                                                                        "text": { "runs": [{ "text": "Album \u{2022} Radiohead \u{2022} 1997" }] }
+                                                                    }
+                                                                }
+                                                            ],
+                                                            "navigationEndpoint": {
+                                                                "browseEndpoint": { "browseId": "MPREb_okcomputer" }
+                                                            }
+                                                        }
+                                                    }
+                                                ]
+                                            }
+                                        }
+                                    ]
+                                }
+                            }
+                        }
+                    }]
+                }
+            }
+        });
+
+        let response = parse_search_response("radiohead", &value);
+        assert!(response.top_result.is_some());
+        assert_eq!(response.top_result.as_ref().unwrap().title, "Let Down");
+        assert_eq!(response.results.len(), 4);
+        let titles: Vec<_> = response.results.iter().map(|item| item.title.as_str()).collect();
+        assert!(titles.contains(&"Karma Police"));
+        assert!(titles.contains(&"Creep"));
+        assert!(titles.contains(&"Paranoid Android"));
+        assert!(titles.contains(&"OK Computer"));
+    }
+
+    #[test]
     fn parse_search_row_reads_duration_and_plays_from_flex_columns() {
         let value = json!({
             "musicResponsiveListItemRenderer": {
@@ -8952,6 +9183,37 @@ mod tests {
         assert_eq!(track.title, "Karma Police");
         assert_eq!(track.artist, "Radiohead");
         assert_eq!(track.duration_seconds, Some(261));
+    }
+
+    #[test]
+    fn parse_playlist_panel_video_reads_plain_artist_byline_without_type_label() {
+        let value = json!({
+            "playlistPanelVideoRenderer": {
+                "videoId": "vid123",
+                "title": { "runs": [{ "text": "Karma Police" }] },
+                "longBylineText": { "runs": [{ "text": "Radiohead" }] },
+                "lengthText": { "runs": [{ "text": "4:21" }] }
+            }
+        });
+
+        let track = parse_playlist_panel_video(&value).expect("playlist panel track");
+        assert_eq!(track.artist, "Radiohead");
+    }
+
+    #[test]
+    fn parse_playlist_panel_video_reads_artist_before_album_in_plain_byline() {
+        let value = json!({
+            "playlistPanelVideoRenderer": {
+                "videoId": "vid123",
+                "title": { "runs": [{ "text": "Karma Police" }] },
+                "longBylineText": { "runs": [{ "text": "Radiohead \u{2022} OK Computer" }] },
+                "lengthText": { "runs": [{ "text": "4:21" }] }
+            }
+        });
+
+        let track = parse_playlist_panel_video(&value).expect("playlist panel track");
+        assert_eq!(track.artist, "Radiohead");
+        assert_eq!(track.album.as_deref(), Some("OK Computer"));
     }
 
     #[test]

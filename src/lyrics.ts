@@ -44,6 +44,21 @@ export function fetchSyncedLyricsByMeta(
   );
 }
 
+/** Reject lyrics whose timestamps cannot track playback (mirrors backend scoring). */
+export function hasValidLyricSync(lines: SyncedLyricLine[]): boolean {
+  if (lines.length < 2) return false;
+
+  const uniqueStarts = new Set(lines.map((line) => line.startTimeMs)).size;
+  if (uniqueStarts <= 1) return false;
+  if (uniqueStarts < lines.length / 3) return false;
+
+  for (let index = 1; index < lines.length; index += 1) {
+    if (lines[index].startTimeMs < lines[index - 1].startTimeMs) return false;
+  }
+
+  return true;
+}
+
 export function findActiveLyricIndex(lines: SyncedLyricLine[], progress: number) {
   const progressMs = progress * 1000;
 
