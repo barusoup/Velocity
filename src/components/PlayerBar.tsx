@@ -831,6 +831,9 @@ export default function PlayerBar({
   const canNavigateToAlbum = Boolean(directAlbumBrowseId || track?.videoId || track?.album?.trim());
   const hasLyrics = lyricsAvailable && viewName !== "lyrics";
 
+  const seekScrubProgress = usePlayerUiStore((state) => state.seekScrubProgress);
+  const storedProgress = usePlayerUiStore((state) => state.progress);
+
   if (!track) return null;
   if (onLyricsPage && hidePlayerOnLyrics) return null;
 
@@ -838,8 +841,6 @@ export default function PlayerBar({
     player.duration ||
     track.durationSeconds ||
     0;
-  const seekScrubProgress = usePlayerUiStore((state) => state.seekScrubProgress);
-  const storedProgress = usePlayerUiStore((state) => state.progress);
   const displayProgress = seekScrubProgress ?? storedProgress;
   const remaining = Math.max(0, duration - displayProgress);
   const progressPct = duration ? (displayProgress / duration) * 100 : 0;

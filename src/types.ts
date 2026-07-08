@@ -67,7 +67,7 @@ export type MediaTrack = {
    *
    * Crucially, `videoId` and `id` are NOT changed — they preserve the
    * track's release-scoped id so list rows keep a stable row identity.
-   * Play-button active-state checks (`isSameSongTrack`, `isItemPlaying`)
+   * Play-button active-state checks (`isSameStreamPlayback`, `isItemPlaying`)
    * match by underlying video id across search, album, playlist, and
    * artist views. The load effect and prefetch logic use
    * `resolvedVideoId ?? videoId` for actual stream resolution.

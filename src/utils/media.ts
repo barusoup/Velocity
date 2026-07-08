@@ -196,12 +196,35 @@ export function streamIdentityVideoIds(
 }
 
 /**
- * Whether two tracks are the same underlying song, regardless of
- * release-scoped id or where playback was started (search, album, playlist).
+ * Minimal shape needed to recognize a track as the underlying song.
+ * `artist`/`title` are optional because callers rebuilding a candidate
+ * from a `SearchItem` or other partial source may not have them — when
+ * missing, only the video-id / id match path applies.
  */
-export function isSameSongTrack(
-  current: Pick<MediaTrack, "id" | "videoId" | "resolvedVideoId" | "source"> | null,
-  candidate: Pick<MediaTrack, "id" | "videoId" | "resolvedVideoId" | "source">,
+export type SongIdentityInput = Pick<
+  MediaTrack,
+  "id" | "videoId" | "resolvedVideoId" | "source"
+> & {
+  artist?: string | null;
+  title?: string | null;
+};
+
+function songIdentityLabel(track: SongIdentityInput): string | null {
+  if (track.source === "upload") return null;
+  const artist = track.artist?.trim() ?? "";
+  const title = track.title?.trim() ?? "";
+  if (!artist || !title) return null;
+  return `${artist.toLowerCase()}\0${title.toLowerCase()}`;
+}
+
+/**
+ * Whether two tracks are the same stream playback target (shared video id).
+ * Used for row active-state and play/pause toggles — must not treat distinct
+ * queue rows (e.g. music-video vs studio uploads of one song) as the same row.
+ */
+export function isSameStreamPlayback(
+  current: SongIdentityInput | null,
+  candidate: SongIdentityInput,
 ): boolean {
   if (!current) return false;
   if (current.source === "upload" || candidate.source === "upload") {
@@ -213,6 +236,77 @@ export function isSameSongTrack(
     return current.id === candidate.id;
   }
   return currentIds.some((id) => candidateIds.includes(id));
+}
+
+/**
+ * Whether two tracks are the same underlying song, regardless of
+ * release-scoped id or where playback was started (search, album, playlist).
+ * Falls back to artist+title when video ids do not overlap (dedupe, search).
+ */
+export function isSameSongTrack(
+  current: SongIdentityInput | null,
+  candidate: SongIdentityInput,
+): boolean {
+  if (isSameStreamPlayback(current, candidate)) return true;
+
+  const currentLabel = songIdentityLabel(current);
+  const candidateLabel = songIdentityLabel(candidate);
+  return Boolean(currentLabel && candidateLabel && currentLabel === candidateLabel);
+}
+
+const MUSIC_VIDEO_TITLE_MARKERS =
+  /\b(official\s+)?music\s+video\b|\bofficial\s+video\b|\(mv\)|\[mv\]/i;
+
+/** Whether a stream row likely points at a music video rather than studio audio. */
+export function isLikelyMusicVideoTrack(
+  track: Pick<MediaTrack, "kind" | "title" | "videoId" | "resolvedVideoId">,
+): boolean {
+  if (track.kind === "video") return true;
+  if (MUSIC_VIDEO_TITLE_MARKERS.test(track.title)) return true;
+  const resolvedVideoId = track.resolvedVideoId?.trim();
+  const videoId = track.videoId?.trim();
+  if (resolvedVideoId && videoId && resolvedVideoId !== videoId) return false;
+  return false;
+}
+
+/** Higher rank means a better playback/display target for the same underlying song. */
+export function trackPlaybackPreferenceRank(
+  track: Pick<MediaTrack, "kind" | "title" | "videoId" | "resolvedVideoId" | "source">,
+): number {
+  if (track.source === "upload") return 0;
+  let rank = 0;
+  const resolvedVideoId = track.resolvedVideoId?.trim();
+  const videoId = track.videoId?.trim();
+  if (resolvedVideoId && videoId && resolvedVideoId !== videoId) rank += 100;
+  if (track.kind !== "video") rank += 50;
+  if (!MUSIC_VIDEO_TITLE_MARKERS.test(track.title)) rank += 25;
+  if (isQueueableTrack(track as MediaTrack)) rank += 10;
+  return rank;
+}
+
+/** Pick the studio-audio row when two tracks represent the same song. */
+export function preferStudioSongTrack(current: MediaTrack, candidate: MediaTrack): MediaTrack {
+  const currentRank = trackPlaybackPreferenceRank(current);
+  const candidateRank = trackPlaybackPreferenceRank(candidate);
+  if (candidateRank !== currentRank) {
+    return candidateRank > currentRank ? candidate : current;
+  }
+  // Later rows are usually from resolution passes and tend to be studio audio.
+  return candidate;
+}
+
+/** Keep one row per underlying song, preferring studio audio over music videos. */
+export function dedupeTracksBySong(tracks: MediaTrack[]): MediaTrack[] {
+  const unique: MediaTrack[] = [];
+  for (const track of tracks) {
+    const existingIndex = unique.findIndex((row) => isSameSongTrack(row, track));
+    if (existingIndex < 0) {
+      unique.push(track);
+      continue;
+    }
+    unique[existingIndex] = preferStudioSongTrack(unique[existingIndex]!, track);
+  }
+  return unique;
 }
 
 export function readDuration(src: string): Promise<number | null> {

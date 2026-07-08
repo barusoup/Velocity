@@ -35,9 +35,16 @@ import {
 } from "../utils/navigation";
 import { displayAlbumName } from "../utils/upload-enrichment";
 import { cn } from "../utils/cn";
+import { streamIdentityVideoIds } from "../utils/media";
 import { Card } from "./Shared";
 import { ArtistCreditText } from "./PagesShared";
 import type { View } from "./Sidebar";
+
+function homeTrackRailKey(track: MediaTrack): string {
+  const identityIds = streamIdentityVideoIds(track);
+  if (identityIds.length > 0) return identityIds.sort().join(":");
+  return track.id;
+}
 
 const PERIOD_OPTIONS: Array<{ value: TopSongsPeriod; label: string }> = [
   { value: "weekly", label: "Weekly" },
@@ -182,7 +189,7 @@ function HomeTrackCardRail({
       onClickCapture={onClickCapture}
     >
       {tracks.map((track) => (
-        <div key={track.id} className="w-[var(--ui-home-card-width)] shrink-0">
+        <div key={homeTrackRailKey(track)} className="w-[var(--ui-home-card-width)] shrink-0">
           <HomeTrackCard
             track={track}
             onPlayTrack={onPlayTrack}

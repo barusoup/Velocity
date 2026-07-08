@@ -54,6 +54,7 @@ import {
   exportStreamVideoId,
   filterQueueableTracks,
   isAutoplayWatchPlaylistCandidate,
+  isLikelyMusicVideoTrack,
   isQueueableTrack,
   readLiveMediaDuration,
   readDuration,
@@ -1246,8 +1247,13 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
     const audio = audioRef.current;
     if (!audio) return;
     if (options?.capturePlayIntent) {
-      if (playWhenReadyRef.current === null) {
-        playWhenReadyRef.current = !audio.paused;
+      // Always continue playback on queue navigation when audio is actively
+      // playing. A stale `false` left over from pause-during-load must not
+      // force the next track to load paused.
+      if (!audio.paused) {
+        playWhenReadyRef.current = true;
+      } else if (playWhenReadyRef.current === null) {
+        playWhenReadyRef.current = false;
       }
       if (options.forceReload) {
         pendingForceReloadRef.current = true;
@@ -2878,9 +2884,9 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
 
       const transformed = await resolveAutoplayEntries(incoming);
       if (abortIfStale()) return;
-      const candidates = transformed.filter(
-        (entry): entry is MediaTrack => entry !== null,
-      );
+      const candidates = transformed
+        .filter((entry): entry is MediaTrack => entry !== null)
+        .filter((track) => !isLikelyMusicVideoTrack(track));
 
       if (!autoplayRef.current || autoplaySeedRef.current?.videoId !== seed.videoId) return;
 
@@ -2949,9 +2955,9 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
                 isAutoplayWatchPlaylistCandidate,
               );
               const secondTransformed = await resolveAutoplayEntries(secondIncoming);
-              const secondCandidates = secondTransformed.filter(
-                (entry): entry is MediaTrack => entry !== null,
-              );
+              const secondCandidates = secondTransformed
+                .filter((entry): entry is MediaTrack => entry !== null)
+                .filter((track) => !isLikelyMusicVideoTrack(track));
               for (const entry of secondCandidates) {
                 if (isDuplicate(entry)) continue;
                 if (secondAdditions.some((c) => c.id === entry.id)) continue;
@@ -2994,9 +3000,9 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
                 isAutoplayWatchPlaylistCandidate,
               );
               const compTransformed = await resolveAutoplayEntries(compIncoming);
-              const compCandidates = compTransformed.filter(
-                (e): e is MediaTrack => e !== null,
-              );
+              const compCandidates = compTransformed
+                .filter((e): e is MediaTrack => e !== null)
+                .filter((track) => !isLikelyMusicVideoTrack(track));
               const compAdditions: MediaTrack[] = [];
               for (const entry of compCandidates) {
                 if (isDuplicate(entry)) continue;
@@ -3223,8 +3229,11 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
     if (currentQueue.length === 0) return;
     let nextIndex = Math.max(0, Math.min(index, currentQueue.length - 1));
     if (trackId) {
-      const byId = currentQueue.findIndex((track) => track.id === trackId);
-      if (byId >= 0) nextIndex = byId;
+      const atIndex = currentQueue[nextIndex];
+      if (atIndex?.id !== trackId) {
+        const byId = currentQueue.findIndex((track) => track.id === trackId);
+        if (byId >= 0) nextIndex = byId;
+      }
     }
     if (nextIndex === queueIndexRef.current) {
       togglePlay();

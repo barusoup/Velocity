@@ -109,6 +109,105 @@ describe("taste profile", () => {
     expect(getTopSongs("allTime", 5)).toHaveLength(0);
   });
 
+  it("merges qualified listens for the same song under different video ids", () => {
+    const now = Date.UTC(2026, 0, 10, 12, 0, 0);
+    recordQualifiedListen(sampleTrack("yt:catalog"), now);
+    recordQualifiedListen(
+      {
+        ...sampleTrack("yt:audio"),
+        videoId: "catalog",
+        resolvedVideoId: "audio",
+      },
+      now + 1_000,
+    );
+
+    const state = loadTasteProfile();
+    expect(Object.keys(state.entries)).toHaveLength(1);
+    expect(Object.values(state.entries)[0]?.playCount).toBe(2);
+  });
+
+  it("does not overwrite a known artist with Unknown artist when merging listens", () => {
+    const now = Date.UTC(2026, 0, 10, 12, 0, 0);
+    recordQualifiedListen(sampleTrack("yt:catalog"), now);
+    recordQualifiedListen(
+      {
+        ...sampleTrack("yt:audio"),
+        videoId: "catalog",
+        resolvedVideoId: "audio",
+        artist: "Unknown artist",
+      },
+      now + 1_000,
+    );
+
+    expect(Object.values(loadTasteProfile().entries)[0]?.artist).toBe("Test Artist");
+  });
+
+  it("dedupes top songs when the same song was tracked under multiple video ids", () => {
+    const now = Date.UTC(2026, 0, 10, 12, 0, 0);
+
+    saveTasteProfile({
+      entries: {
+        catalog: {
+          videoId: "catalog",
+          trackId: "yt:catalog",
+          title: "Same Song",
+          artist: "Artist",
+          playCount: 2,
+          firstPlayedAt: now,
+          lastPlayedAt: now,
+          qualifiedPlays: [now, now - 1_000],
+        },
+        audio: {
+          videoId: "audio",
+          trackId: "yt:audio",
+          title: "Same Song",
+          artist: "Artist",
+          playCount: 3,
+          firstPlayedAt: now,
+          lastPlayedAt: now + 2_000,
+          qualifiedPlays: [now + 2_000, now + 1_000, now + 500],
+        },
+      },
+      lastProfileChangeAt: now,
+      rediscoveryPool: [],
+      recommendationHistory: [],
+      dailyRecommendations: null,
+      lastRecommendationRefreshAt: null,
+    });
+
+    const topSongs = getTopSongs("weekly", 10, now + 3_000);
+    expect(topSongs).toHaveLength(1);
+    expect(topSongs[0]?.title).toBe("Same Song");
+    expect(topSongs[0]?.videoId).toBe("audio");
+  });
+
+  it("migrates taste profile storage to the resolved studio video id", () => {
+    const now = Date.UTC(2026, 0, 10, 12, 0, 0);
+    recordQualifiedListen(
+      {
+        ...sampleTrack("yt:catalog"),
+        videoId: "catalog",
+        kind: "video",
+        title: "Song (Official Music Video)",
+      },
+      now,
+    );
+    recordQualifiedListen(
+      {
+        ...sampleTrack("yt:audio"),
+        videoId: "catalog",
+        resolvedVideoId: "audio",
+      },
+      now + 1_000,
+    );
+
+    const state = loadTasteProfile();
+    expect(Object.keys(state.entries)).toHaveLength(1);
+    expect(state.entries.audio?.videoId).toBe("audio");
+    expect(state.entries.audio?.resolvedVideoId).toBe("audio");
+    expect(state.entries.catalog).toBeUndefined();
+  });
+
   it("returns yesterday's daily recommendation video ids only for the prior day", () => {
     const today = Date.UTC(2026, 0, 12, 12, 0, 0);
     const yesterday = todayDateKey(today - 24 * 60 * 60 * 1000);

@@ -31,9 +31,9 @@ import {
   formatDuration,
   formatOptionalDuration,
   formatPlayCount,
-  isSameSongTrack,
+  isSameStreamPlayback,
 } from "../utils/media";
-import { ArtworkImage, MoreButton, TrackRow } from "./Shared";
+import { ArtworkImage, MoreButton, rowSaveButtonRevealClass, TrackRow } from "./Shared";
 import { Marquee } from "./Marquee";
 import {
   ALBUM_TRACK_GRID_WITH_PLAYS,
@@ -395,7 +395,7 @@ function AlbumPage({
     }
   }
   const [firstTrackHovered, setFirstTrackHovered] = useState(false);
-  const firstTrackActive = displayAlbumTracks[0] ? isSameSongTrack(player.currentTrack, displayAlbumTracks[0]) : false;
+  const firstTrackActive = displayAlbumTracks[0] ? isSameStreamPlayback(player.currentTrack, displayAlbumTracks[0]) : false;
   const viewMode = useSetting("viewModeAlbum");
   const [viewMenuOpen, setViewMenuOpen] = useState(false);
   const [ellipsisOpen, setEllipsisOpen] = useState(false);
@@ -772,7 +772,7 @@ function AlbumTrackRow({
         </div>
         {track.source !== "upload" && (
           <div
-            className="shrink-0 invisible group-hover:visible opacity-0 group-hover:opacity-100 transition-all"
+            className={rowSaveButtonRevealClass(isSaved)}
             onClick={(event) => event.stopPropagation()}
           >
             <SaveButton

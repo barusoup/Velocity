@@ -10,8 +10,11 @@ import {
   tasteProfileVideoId,
 } from "../taste-profile";
 import {
+  dedupeTracksBySong,
   filterQueueableTracks,
   isAutoplayWatchPlaylistCandidate,
+  isLikelyMusicVideoTrack,
+  isSameSongTrack,
 } from "./media";
 import { resolveAutoplayEntries } from "./song-resolution";
 
@@ -29,18 +32,7 @@ function shuffleInPlace<T>(items: T[]): T[] {
 }
 
 function dedupeTracks(tracks: MediaTrack[]): MediaTrack[] {
-  const seenIds = new Set<string>();
-  const seenVideoIds = new Set<string>();
-  const unique: MediaTrack[] = [];
-  for (const track of tracks) {
-    const videoId = tasteProfileVideoId(track);
-    if (seenIds.has(track.id)) continue;
-    if (videoId && seenVideoIds.has(videoId)) continue;
-    seenIds.add(track.id);
-    if (videoId) seenVideoIds.add(videoId);
-    unique.push(track);
-  }
-  return unique;
+  return dedupeTracksBySong(tracks);
 }
 
 function isEligibleRecommendation(
@@ -67,9 +59,8 @@ function isNewCandidate(
 }
 
 function canAddToPicked(track: MediaTrack, picked: MediaTrack[], excludedVideoIds: Set<string>): boolean {
-  const videoId = tasteProfileVideoId(track);
-  if (!videoId || !isEligibleRecommendation(track, excludedVideoIds)) return false;
-  return !picked.some((row) => tasteProfileVideoId(row) === videoId);
+  if (!isEligibleRecommendation(track, excludedVideoIds)) return false;
+  return !picked.some((row) => isSameSongTrack(row, track));
 }
 
 async function fetchSeedCandidates(seedVideoId: string): Promise<MediaTrack[]> {
@@ -81,7 +72,9 @@ async function fetchSeedCandidates(seedVideoId: string): Promise<MediaTrack[]> {
       return Boolean(videoId) && videoId !== seedVideoId;
     });
     const resolved = await resolveAutoplayEntries(queueable);
-    return resolved.filter((track): track is MediaTrack => track !== null);
+    return resolved
+      .filter((track): track is MediaTrack => track !== null)
+      .filter((track) => !isLikelyMusicVideoTrack(track));
   } catch {
     return [];
   }

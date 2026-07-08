@@ -1,5 +1,13 @@
 import type { MediaTrack } from "./types";
 import { getItem, setItem } from "./storage";
+import {
+  dedupeTracksBySong,
+  isLikelyMusicVideoTrack,
+  isSameSongTrack,
+  preferStudioSongTrack,
+  streamIdentityVideoIds,
+} from "./utils/media";
+import { isPlaceholderArtist } from "./utils/search";
 
 export const TASTE_PROFILE_KEY = "velocity-taste-profile";
 
@@ -37,6 +45,7 @@ export type TasteProfileEntry = {
   artistCredits?: MediaTrack["artistCredits"];
   kind?: MediaTrack["kind"];
   source?: MediaTrack["source"];
+  resolvedVideoId?: string | null;
   durationSeconds?: number | null;
   playCount: number;
   lastPlayedAt: number;
@@ -133,6 +142,15 @@ export function tasteProfileVideoId(track: MediaTrack): string | null {
   return track.resolvedVideoId ?? track.videoId ?? (track.source === "upload" ? track.id : null);
 }
 
+function preferTrackMetadata(current: MediaTrack, candidate: MediaTrack): MediaTrack {
+  let preferred = preferStudioSongTrack(current, candidate);
+  const fallback = preferred === current ? candidate : current;
+  if (isPlaceholderArtist(preferred.artist) && !isPlaceholderArtist(fallback.artist)) {
+    preferred = { ...preferred, artist: fallback.artist };
+  }
+  return preferred;
+}
+
 function entryToTrack(entry: TasteProfileEntry): MediaTrack {
   return {
     id: entry.trackId,
@@ -146,6 +164,7 @@ function entryToTrack(entry: TasteProfileEntry): MediaTrack {
     durationSeconds: entry.durationSeconds ?? null,
     cover: entry.cover ?? null,
     videoId: entry.source === "upload" ? null : entry.videoId,
+    resolvedVideoId: entry.resolvedVideoId ?? null,
     source: entry.source ?? "stream",
     filePath: null,
   };
@@ -187,45 +206,83 @@ function rebuildRediscoveryPool(
   return candidates;
 }
 
+function findTasteProfileEntryForTrack(
+  entries: Record<string, TasteProfileEntry>,
+  track: MediaTrack,
+  videoId: string,
+): { key: string; entry: TasteProfileEntry } | null {
+  const direct = entries[videoId];
+  if (direct) return { key: videoId, entry: direct };
+
+  for (const [key, entry] of Object.entries(entries)) {
+    if (isSameSongTrack(entryToTrack(entry), track)) {
+      return { key, entry };
+    }
+
+    const entryTitle = entry.title.trim().toLowerCase();
+    const trackTitle = track.title.trim().toLowerCase();
+    const entryIsPlaceholder = isPlaceholderArtist(entry.artist);
+    const trackIsPlaceholder = isPlaceholderArtist(track.artist);
+    if (
+      entryTitle &&
+      entryTitle === trackTitle &&
+      entryIsPlaceholder !== trackIsPlaceholder
+    ) {
+      return { key, entry };
+    }
+  }
+  return null;
+}
+
 export function recordQualifiedListen(track: MediaTrack, now = Date.now()): TasteProfileState {
-  const videoId = tasteProfileVideoId(track);
-  if (!videoId) return loadTasteProfile();
+  const playbackVideoId = tasteProfileVideoId(track);
+  if (!playbackVideoId) return loadTasteProfile();
 
   const state = loadTasteProfile();
-  const existing = state.entries[videoId];
+  const found = findTasteProfileEntryForTrack(state.entries, track, playbackVideoId);
+  const existing = found?.entry;
+  const mergedTrack = existing
+    ? preferTrackMetadata(entryToTrack(existing), track)
+    : track;
+  const storageKey = tasteProfileVideoId(mergedTrack) ?? playbackVideoId;
   const qualifiedPlays = trimQualifiedPlays([...(existing?.qualifiedPlays ?? []), now], now);
 
   const nextEntry: TasteProfileEntry = {
-    videoId,
-    trackId: track.id,
-    title: track.title,
-    artist: track.artist,
-    album: track.album ?? null,
-    cover: track.cover ?? null,
-    albumBrowseId: track.albumBrowseId ?? null,
-    artistBrowseId: track.artistBrowseId ?? null,
-    artistCredits: track.artistCredits ?? null,
-    kind: track.kind ?? "song",
-    source: track.source,
-    durationSeconds: track.durationSeconds ?? null,
+    videoId: storageKey,
+    trackId: mergedTrack.id,
+    title: mergedTrack.title,
+    artist: mergedTrack.artist,
+    album: mergedTrack.album ?? null,
+    cover: mergedTrack.cover ?? null,
+    albumBrowseId: mergedTrack.albumBrowseId ?? null,
+    artistBrowseId: mergedTrack.artistBrowseId ?? null,
+    artistCredits: mergedTrack.artistCredits ?? null,
+    kind: mergedTrack.kind ?? "song",
+    source: mergedTrack.source,
+    resolvedVideoId: mergedTrack.resolvedVideoId ?? null,
+    durationSeconds: mergedTrack.durationSeconds ?? null,
     playCount: (existing?.playCount ?? 0) + 1,
     firstPlayedAt: existing?.firstPlayedAt ?? now,
     lastPlayedAt: now,
     qualifiedPlays,
   };
 
-  const entries = trimEntries({ ...state.entries, [videoId]: nextEntry }, now);
-  const rediscoveryPool = isProfileStale({ ...state, entries, lastProfileChangeAt: now }, now)
+  const entries = { ...state.entries };
+  if (found && found.key !== storageKey) {
+    delete entries[found.key];
+  }
+  const trimmedEntries = trimEntries({ ...entries, [storageKey]: nextEntry }, now);
+  const rediscoveryPool = isProfileStale({ ...state, entries: trimmedEntries, lastProfileChangeAt: now }, now)
     ? rebuildRediscoveryPool(entries, now)
     : state.rediscoveryPool;
 
-  const hasEnoughDistinctTracks = Object.keys(entries).length >= FIRST_DAILY_RECOMMENDATION_THRESHOLD;
+  const hasEnoughDistinctTracks = Object.keys(trimmedEntries).length >= FIRST_DAILY_RECOMMENDATION_THRESHOLD;
   const hasNoRealRecommendations =
     !state.dailyRecommendations || state.dailyRecommendations.tracks.length === 0;
 
   const next: TasteProfileState = {
     ...state,
-    entries,
+    entries: trimmedEntries,
     lastProfileChangeAt: now,
     rediscoveryPool,
     recommendationHistory: state.recommendationHistory.slice(-500),
@@ -256,78 +313,64 @@ function compareRankedTopSongRows(a: RankedTopSongRow, b: RankedTopSongRow): num
   return b.lastPlayedAt - a.lastPlayedAt;
 }
 
-export function getTopSongRows(period: TopSongsPeriod, limit = 10, now = Date.now()): TopSongRow[] {
-  const state = loadTasteProfile();
-  const effectiveLimit = Math.min(limit, TOP_SONGS_PERIOD_LIMITS[period]);
+function rankEntriesForPeriod(
+  entries: Record<string, TasteProfileEntry>,
+  period: TopSongsPeriod,
+  now: number,
+): RankedTopSongRow[] {
   const ranked: RankedTopSongRow[] = [];
 
-  for (const entry of Object.values(state.entries)) {
+  for (const entry of Object.values(entries)) {
     const plays = countPlaysInPeriod(entry, period, now);
     if (plays <= 0) continue;
 
-    const row: RankedTopSongRow = {
-      track: entryToTrack(entry),
+    const track = entryToTrack(entry);
+    const existingIndex = ranked.findIndex((row) => isSameSongTrack(row.track, track));
+    if (existingIndex >= 0) {
+      const existing = ranked[existingIndex]!;
+      const preferredTrack = preferTrackMetadata(existing.track, track);
+      ranked[existingIndex] = {
+        track: preferredTrack,
+        plays: existing.plays + plays,
+        lastPlayedAt: Math.max(existing.lastPlayedAt, entry.lastPlayedAt),
+      };
+      continue;
+    }
+
+    ranked.push({
+      track,
       plays,
       lastPlayedAt: entry.lastPlayedAt,
-    };
-
-    insertRankedTopSongRow(ranked, row, effectiveLimit);
+    });
   }
 
-  if (ranked.length > 1 && ranked.length < effectiveLimit) {
-    ranked.sort(compareRankedTopSongRows);
-  }
-
-  return ranked.map(({ track, plays }) => ({ track, plays }));
+  ranked.sort(compareRankedTopSongRows);
+  return ranked;
 }
 
-function insertRankedTopSongRow(
-  ranked: RankedTopSongRow[],
-  row: RankedTopSongRow,
-  limit: number,
-): void {
-  if (ranked.length < limit) {
-    ranked.push(row);
-    if (ranked.length === limit) {
-      ranked.sort(compareRankedTopSongRows);
-    }
-    return;
-  }
-  if (compareRankedTopSongRows(row, ranked[limit - 1]!) >= 0) return;
-  ranked[limit - 1] = row;
-  ranked.sort(compareRankedTopSongRows);
+export function getTopSongRows(period: TopSongsPeriod, limit = 10, now = Date.now()): TopSongRow[] {
+  const state = loadTasteProfile();
+  const effectiveLimit = Math.min(limit, TOP_SONGS_PERIOD_LIMITS[period]);
+  return rankEntriesForPeriod(state.entries, period, now)
+    .slice(0, effectiveLimit)
+    .map(({ track, plays }) => ({ track, plays }));
 }
 
 /** Video ids for every song that appears in any Top Songs period shelf. */
 export function getTopSongExclusionVideoIds(now = Date.now()): Set<string> {
   const state = loadTasteProfile();
   const periods = Object.keys(TOP_SONGS_PERIOD_LIMITS) as TopSongsPeriod[];
-  const rankedByPeriod = Object.fromEntries(
-    periods.map((period) => [period, [] as RankedTopSongRow[]]),
-  ) as Record<TopSongsPeriod, RankedTopSongRow[]>;
-
-  for (const entry of Object.values(state.entries)) {
-    const track = entryToTrack(entry);
-    for (const period of periods) {
-      const plays = countPlaysInPeriod(entry, period, now);
-      if (plays <= 0) continue;
-      insertRankedTopSongRow(
-        rankedByPeriod[period],
-        { track, plays, lastPlayedAt: entry.lastPlayedAt },
-        TOP_SONGS_PERIOD_LIMITS[period],
-      );
-    }
-  }
-
   const excluded = new Set<string>();
+
   for (const period of periods) {
-    const ranked = rankedByPeriod[period];
-    if (ranked.length > 1 && ranked.length < TOP_SONGS_PERIOD_LIMITS[period]) {
-      ranked.sort(compareRankedTopSongRows);
-    }
+    const ranked = rankEntriesForPeriod(state.entries, period, now).slice(
+      0,
+      TOP_SONGS_PERIOD_LIMITS[period],
+    );
     for (const row of ranked) {
-      const videoId = tasteProfileVideoId(row.track);
-      if (videoId) excluded.add(videoId);
+      for (const videoId of streamIdentityVideoIds(row.track)) {
+        excluded.add(videoId);
+      }
     }
   }
   return excluded;
@@ -371,7 +414,8 @@ export function needsDailyRecommendationRefresh(now = Date.now()): boolean {
 
 export function storeDailyRecommendations(tracks: MediaTrack[], now = Date.now()): TasteProfileState {
   const state = loadTasteProfile();
-  const videoIds = tracks
+  const dedupedTracks = dedupeTracksBySong(tracks);
+  const videoIds = dedupedTracks
     .map((track) => tasteProfileVideoId(track))
     .filter((id): id is string => Boolean(id));
 
@@ -379,7 +423,7 @@ export function storeDailyRecommendations(tracks: MediaTrack[], now = Date.now()
     ...state,
     dailyRecommendations: {
       date: todayDateKey(now),
-      tracks,
+      tracks: dedupedTracks,
     },
     lastRecommendationRefreshAt: now,
     recommendationHistory: [...state.recommendationHistory, ...videoIds].slice(-400),
@@ -391,7 +435,9 @@ export function storeDailyRecommendations(tracks: MediaTrack[], now = Date.now()
 export function getCachedDailyRecommendations(now = Date.now()): MediaTrack[] | null {
   const state = loadTasteProfile();
   if (state.dailyRecommendations?.date !== todayDateKey(now)) return null;
-  return state.dailyRecommendations.tracks;
+  return dedupeTracksBySong(state.dailyRecommendations.tracks).filter(
+    (track) => !isLikelyMusicVideoTrack(track),
+  );
 }
 
 /** Video ids from the immediately previous day's Today's Picks shelf, if any. */
@@ -411,7 +457,11 @@ export function getYesterdayDailyRecommendationVideoIds(now = Date.now()): Set<s
 
 export function isKnownTasteSong(videoId: string | null | undefined): boolean {
   if (!videoId) return false;
-  return Boolean(loadTasteProfile().entries[videoId]);
+  const entries = loadTasteProfile().entries;
+  if (entries[videoId]) return true;
+  return Object.values(entries).some((entry) =>
+    streamIdentityVideoIds(entryToTrack(entry)).includes(videoId),
+  );
 }
 
 export function getRecentRecommendationVideoIds(days = 7, now = Date.now()): Set<string> {

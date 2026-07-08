@@ -47,13 +47,14 @@ import {
   filterQueueableTracks,
   formatOptionalDuration,
   formatPlayCount,
-  isSameSongTrack,
+  isSameStreamPlayback,
 } from "../utils/media";
 import {
   ArtworkImage,
   cardHoverPlayRevealClass,
   cardHoverPlayTransitionClass,
   getArtworkRoundedClass,
+  rowSaveButtonRevealClass,
   useResolvedArtworkSource,
 } from "./Shared";
 import { SaveButton } from "./SaveButton";
@@ -537,7 +538,7 @@ function ArtistOverview({
   const toggleArtistSave = useToggleArtistSave(savedArtist);
   const [topTrackHovered, setTopTrackHovered] = useState(false);
   const firstTopTrackActive = topSongs[0]
-    ? isSameSongTrack(player.currentTrack, topSongs[0])
+    ? isSameStreamPlayback(player.currentTrack, topSongs[0])
     : false;
   const handlePlayRelease = useCallback((item: ReleaseItem) => {
     const browseId = item.browseId;
@@ -987,7 +988,7 @@ function PopularTrackRow({
         </div>
         {track.source !== "upload" && (
           <div
-            className="shrink-0 invisible group-hover:visible opacity-0 group-hover:opacity-100 transition-all"
+            className={rowSaveButtonRevealClass(isSaved)}
             onClick={(event) => event.stopPropagation()}
           >
             <SaveButton
@@ -2300,7 +2301,7 @@ function DiscographyTrackRow({
         </div>
         {track.source !== "upload" && (
           <div
-            className="shrink-0 invisible group-hover:visible opacity-0 group-hover:opacity-100 transition-all"
+            className={rowSaveButtonRevealClass(isSaved)}
             onClick={(event) => event.stopPropagation()}
           >
             <SaveButton

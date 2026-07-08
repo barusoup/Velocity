@@ -1,6 +1,7 @@
 import { getEntityDetail, searchMusic } from "../api";
 import type { MediaTrack, SearchItem } from "../types";
 import { isExcludedNonMusicStreamKind } from "./media";
+import { getSearchItemArtist, isPlaceholderArtist } from "./search";
 
 const SEARCH_MATCH_TIMEOUT_MS = 4_000;
 const AUTOPLAY_MIN_ARTIST_OVERLAP = 0.25;
@@ -482,12 +483,20 @@ export function findStudioSongForTrack(
   return null;
 }
 
+function artistFromMetadataSource(matched: MetadataSource): string {
+  const artist = matched.artist?.trim();
+  if (artist) return artist;
+  if ("source" in matched) return "";
+  return getSearchItemArtist(matched);
+}
+
 export function songMetadataFromMatch(
   matched: MediaTrack | SearchItem,
 ): Partial<MediaTrack> {
+  const artist = artistFromMetadataSource(matched);
   return {
     title: matched.title,
-    artist: matched.artist ?? undefined,
+    artist: artist && !isPlaceholderArtist(artist) ? artist : artist || undefined,
     album: matched.album ?? undefined,
     albumBrowseId: matched.albumBrowseId ?? undefined,
     artistBrowseId: matched.artistBrowseId ?? undefined,
@@ -512,7 +521,7 @@ function buildResolvedAutoplayTrack(entry: MediaTrack, matched: MetadataSource):
     id: `yt:${matchedVideoId}`,
     videoId: matchedVideoId,
     title: matched.title,
-    artist: matched.artist ?? "",
+    artist: artistFromMetadataSource(matched),
     album: matched.album ?? null,
     albumBrowseId: matched.albumBrowseId ?? null,
     artistBrowseId: matched.artistBrowseId ?? null,
