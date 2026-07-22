@@ -80,8 +80,6 @@ npm run tauri build
 npm run verify-release
 ```
 
-See [Agents.md](Agents.md) for the full release workflow, icon regeneration chain, and agent notes.
-
 ## Feedback
 
 Found a bug or have a suggestion? [Open an issue](https://github.com/barusoup/Velocity/issues).
