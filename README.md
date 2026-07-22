@@ -22,7 +22,7 @@
 
 ---
 
-Velocity is a native desktop music player built with [Tauri](https://tauri.app/) and React. It streams from YouTube Music, keeps a personal collection of saved songs and albums, and wraps playback in a clean, responsive interface designed for long listening sessions.
+Velocity is a native desktop music player built with [Tauri](https://tauri.app/) and [React](https://react.dev/). It streams from YouTube Music, lets you save your favorite content, and wraps playback in a clean, distraction-free interface.
 
 ## Download
 
@@ -33,17 +33,17 @@ Installers for **Windows** and **macOS (Apple Silicon)** are on the [Releases](h
 | Windows (x64) | `Velocity-Setup-x64.exe` |
 | macOS (arm64) | `Velocity-macOS-arm64.dmg` |
 
-Stable installs update automatically on launch — no prompts, no manual downloads.
+Stable installs update automatically on launch when available.
 
 > **Experimental builds** (pre-releases tagged *Experimental*) are early-access snapshots. They may be unstable and are not offered through the auto-updater on stable installs.
 
 ## Features
 
 - **Home** — personalized recommendations and daily picks based on your taste profile
-- **Collection** — save songs, albums, and artists; browse local uploads
-- **Search** — inline suggestions as you type, with filters
+- **Collection** — save songs, albums, and artists; upload and browse local content
+- **Search** — inline suggestions and search filters
 - **Queue & playback** — autoplay, listening history, loudness normalization, and gapless preloading
-- **Lyrics** — synced lyrics with smooth follow-along and an optional fullscreen view
+- **Lyrics** — synced lyrics with smooth follow-along
 - **Discord Rich Presence** — show what you're playing
 - **Imports** — bring in playlists from Spotify, Apple Music, and YT Music
 
@@ -88,4 +88,4 @@ Found a bug or have a suggestion? [Open an issue](https://github.com/barusoup/Ve
 
 ## License
 
-Source is available in this repository. Velocity is a personal project by [barusoup](https://github.com/barusoup).
+Velocity is licensed under the [GNU GPL v3.0](LICENSE) by [barusoup](https://github.com/barusoup).
