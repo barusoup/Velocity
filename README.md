@@ -42,10 +42,10 @@ Stable installs update automatically on launch — no prompts, no manual downloa
 - **Home** — personalized recommendations and daily picks based on your taste profile
 - **Collection** — save songs, albums, and artists; browse local uploads
 - **Search** — inline suggestions as you type, with filters
-- **Queue & playback** — smart autoplay, listening history, loudness normalization, and gapless preloading
+- **Queue & playback** — autoplay, listening history, loudness normalization, and gapless preloading
 - **Lyrics** — synced lyrics with smooth follow-along and an optional fullscreen view
 - **Discord Rich Presence** — show what you're playing
-- **Imports** — bring in Spotify playlists
+- **Imports** — bring in playlists from Spotify, Apple Music, and YT Music
 
 ## Screenshots
 
