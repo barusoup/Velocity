@@ -34,9 +34,11 @@ pub fn decode_html_entities(value: &str) -> String {
             continue;
         }
         let mut entity = String::new();
+        let mut terminated = false;
         while let Some(&next) = chars.peek() {
             if next == ';' {
                 chars.next();
+                terminated = true;
                 break;
             }
             if entity.len() >= 8 {
@@ -71,6 +73,9 @@ pub fn decode_html_entities(value: &str) -> String {
         } else {
             result.push('&');
             result.push_str(&entity);
+            if terminated {
+                result.push(';');
+            }
         }
     }
     result

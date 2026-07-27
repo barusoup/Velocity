@@ -840,14 +840,21 @@ function Shell() {
     }, []),
   });
 
-  // App root has no `bg-black` here on purpose. body's `#000000`
-  // background provides the base black backdrop for every page, and each
-  // page renders its own (opaque or semi-transparent) bg on the nearest
-  // container. The lyrics page's waveform canvas is fixed at z-0 above
-  // body's background — an opaque bg on this root would cover it.
+  // The sidebar overlays the workspace instead of consuming a flex column.
+  // That makes its rounded edge reveal the actual page underneath it (hero
+  // artwork, gradients, and scrolling content), rather than a separately
+  // maintained approximation of whichever page happens to be open.
   return (
     <div className="flex h-[var(--app-height)] w-full flex-col overflow-hidden text-neutral-100">
-      <div className="relative flex min-h-0 flex-1 overflow-hidden">
+      <div
+        className="relative flex min-h-0 flex-1 overflow-hidden"
+        style={{
+          "--ui-sidebar-current": sidebarOpen
+            ? "var(--ui-sidebar-open)"
+            : "var(--ui-sidebar-closed)",
+          "--ui-page-left-pad": "calc(var(--ui-sidebar-current) + var(--ui-page-pad))",
+        } as React.CSSProperties}
+      >
         <Sidebar
           view={view}
           expanded={sidebarOpen}
@@ -863,9 +870,7 @@ function Shell() {
           onTogglePinPlaylist={playlistsCtx.togglePlaylistPinned}
         />
 
-        <main
-          className="relative flex min-w-0 flex-1 flex-col overflow-hidden"
-        >
+        <main className="relative flex min-w-0 flex-1 flex-col overflow-hidden bg-black">
           <TopBar
             canBack={canBack}
             canForward={canForward}
@@ -904,7 +909,9 @@ function Shell() {
             className={cn(
               "nice-scroll main-scrollport min-h-0 flex-1 overflow-y-auto",
               isFullBleedView ? "pt-0" : "pt-[var(--ui-topbar-height)]",
-              isFullBleedView ? "px-0" : "px-[var(--ui-page-pad)]",
+              isFullBleedView
+                ? "px-0"
+                : "pl-[var(--ui-page-left-pad)] pr-[var(--ui-page-pad)]",
               hasActiveTrack && !lyricsPlayerHidden
                 ? "pb-[clamp(5rem,8vw,7.5rem)]"
                 : "pb-[clamp(1.5rem,2vw,2.5rem)]",

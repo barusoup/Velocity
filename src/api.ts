@@ -55,6 +55,8 @@ type CacheEntry<T> = {
   value: T | undefined;
   error: unknown | undefined;
   insertedAt: number;
+  resolvedAt: number | undefined;
+  lastAccessAt: number;
 };
 
 class MemoCache<T> {
@@ -65,16 +67,15 @@ class MemoCache<T> {
     private readonly ttlMs?: number,
   ) {}
 
-  // A cache with a configured TTL evicts resolved entries past the
-  // wall-clock window from `insertedAt`. In-flight promises are
-  // never TTL'd — only the resolved value ages out. The combination
-  // of TTL eviction on read AND inline eviction in `peek` keeps TTL'd
-  // caches from ever serving a stale value to the player, while
-  // non-TTL'd caches behave exactly as before.
   private isExpired(entry: CacheEntry<T>): boolean {
     if (this.ttlMs === undefined) return false;
     if (!entry.resolved) return false;
-    return Date.now() - entry.insertedAt > this.ttlMs;
+    // Use resolvedAt when available (the TTL should start when the
+    // underlying request completes, not when it starts).  Fall back
+    // to insertedAt for backward compat with `prime` which sets
+    // resolved=true synchronously.
+    const age = Date.now() - (entry.resolvedAt ?? entry.insertedAt);
+    return age > this.ttlMs;
   }
 
   has(key: string): boolean {
@@ -94,6 +95,7 @@ class MemoCache<T> {
       this.entries.delete(key);
       return null;
     }
+    entry.lastAccessAt = Date.now();
     return entry.value ?? null;
   }
 
@@ -116,24 +118,28 @@ class MemoCache<T> {
   ): Promise<T> {
     const existing = this.entries.get(key);
     if (existing) {
-      // LRU touch: re-insert at the most-recently-used position.
-      this.entries.delete(key);
-      this.entries.set(key, existing);
-      return existing.promise;
+      // If the resolved entry has expired, delete it and fall through
+      // to the factory path instead of returning stale data.
+      if (this.isExpired(existing)) {
+        this.entries.delete(key);
+      } else {
+        // Record recency without delete/reinsert churn. The old approach
+        // mutated the Map on every hit, creating avoidable iterator/GC work
+        // for hot caches such as artwork and stream resolution.
+        existing.lastAccessAt = Date.now();
+        return existing.promise;
+      }
     }
 
     const promise = factory();
-    // Stamp the entry's creation time so `peek` and `getOrCreate`
-    // can confidently age it out by the configured TTL. Using
-    // wall-clock time means the TTL window remains accurate even
-    // across the page being backgrounded; the entry is also
-    // bounded by `maxSize`'s LRU eviction policy.
     const entry: CacheEntry<T> = {
       promise,
       resolved: false,
       value: undefined,
       error: undefined,
       insertedAt: Date.now(),
+      resolvedAt: undefined,
+      lastAccessAt: Date.now(),
     };
     promise
       .then((value) => {
@@ -142,6 +148,7 @@ class MemoCache<T> {
         // it) must not back-fill a value onto the new entry.
         if (this.entries.get(key) !== entry) return;
         entry.resolved = true;
+        entry.resolvedAt = Date.now();
         entry.value = value;
         if (shouldCache && !shouldCache(value)) {
           this.entries.delete(key);
@@ -150,6 +157,7 @@ class MemoCache<T> {
       .catch((error) => {
         if (this.entries.get(key) !== entry) return;
         entry.resolved = true;
+        entry.resolvedAt = Date.now();
         entry.error = error;
         // Always evict failures so the next call retries from the backend.
         this.entries.delete(key);
@@ -181,6 +189,8 @@ class MemoCache<T> {
       value,
       error: undefined,
       insertedAt: Date.now(),
+      resolvedAt: Date.now(),
+      lastAccessAt: Date.now(),
     };
     this.entries.set(key, entry);
     this.evictIfNeeded();
@@ -188,7 +198,14 @@ class MemoCache<T> {
 
   private evictIfNeeded(): void {
     if (this.entries.size <= this.maxSize) return;
-    const oldestKey = this.entries.keys().next().value;
+    let oldestKey: string | undefined;
+    let oldestAccess = Number.POSITIVE_INFINITY;
+    for (const [key, entry] of this.entries) {
+      if (entry.lastAccessAt < oldestAccess) {
+        oldestAccess = entry.lastAccessAt;
+        oldestKey = key;
+      }
+    }
     if (oldestKey !== undefined) this.entries.delete(oldestKey);
   }
 }
@@ -222,8 +239,42 @@ const LYRICS_EXHAUSTION_THRESHOLD = 3;
 // Session-scoped; without a cap this grows with every unique track the user
 // explores that lacks lyrics — unbounded in long listening sessions.
 const LYRICS_EXHAUSTION_MAX_KEYS = 500;
+const LYRICS_FAILURE_COUNTS_MAX_KEYS = 500;
 const lyricsFailureCounts = new Map<string, number>();
 const lyricsExhaustedKeys = new Set<string>();
+
+// Background lyrics warming is intentionally isolated from active-track
+// requests. A queue can contain several upcoming tracks, but allowing every
+// prefetch to resolve/parse at once competes with playback and can create a
+// burst of provider requests. Keep at most two warmups active and deduplicate
+// work that is waiting for a cache entry to be created.
+const LYRICS_PREFETCH_CONCURRENCY = 2;
+let lyricsPrefetchActive = 0;
+const lyricsPrefetchQueue: Array<{ key: string; task: () => Promise<unknown> }> = [];
+const lyricsPrefetchQueued = new Set<string>();
+
+function drainLyricsPrefetchQueue(): void {
+  while (lyricsPrefetchActive < LYRICS_PREFETCH_CONCURRENCY && lyricsPrefetchQueue.length > 0) {
+    const next = lyricsPrefetchQueue.shift()!;
+    lyricsPrefetchActive += 1;
+    void next.task()
+      .catch(() => {
+        // Prefetch is best-effort; the active-track path owns user-visible errors.
+      })
+      .finally(() => {
+        lyricsPrefetchActive -= 1;
+        lyricsPrefetchQueued.delete(next.key);
+        drainLyricsPrefetchQueue();
+      });
+  }
+}
+
+function enqueueLyricsPrefetch(key: string, task: () => Promise<unknown>): void {
+  if (lyricsPrefetchQueued.has(key)) return;
+  lyricsPrefetchQueued.add(key);
+  lyricsPrefetchQueue.push({ key, task });
+  drainLyricsPrefetchQueue();
+}
 
 // Cross-session persistence for synced lyrics.
 //
@@ -504,7 +555,7 @@ function recordLyricsFailureForTrack(track: LyricsPrefetchTrack): void {
     touchBoundedSet(lyricsExhaustedKeys, key, LYRICS_EXHAUSTION_MAX_KEYS);
     return;
   }
-  setBoundedMapValue(lyricsFailureCounts, key, nextCount, LYRICS_EXHAUSTION_MAX_KEYS);
+  setBoundedMapValue(lyricsFailureCounts, key, nextCount, LYRICS_FAILURE_COUNTS_MAX_KEYS);
 }
 
 function clearLyricsExhaustionForTrack(track: LyricsPrefetchTrack): void {
@@ -844,20 +895,23 @@ export function prefetchSyncedLyricsForTrack(track: LyricsPrefetchTrack): void {
       const metaFields = lyricsPrefetchMetaFields(track);
       const metaKey = syncedLyricsMetaCacheKey(metaFields);
       if (syncedLyricsCache.isPending(metaKey)) return;
-      void getSyncedLyricsByMeta(metaFields, { exhaustionTrack: track });
+      enqueueLyricsPrefetch(`meta:${metaKey}`, () =>
+        getSyncedLyricsByMeta(metaFields, { exhaustionTrack: track }),
+      );
       return;
     }
 
     const videoId = lyricsCacheVideoId(track) ?? identityIds[0];
     if (videoId) {
-      void getSyncedLyrics(videoId)
-        .then((result) => {
+      enqueueLyricsPrefetch(`video:${videoId}`, async () => {
+        try {
+          const result = await getSyncedLyrics(videoId);
           if (result === null) recordLyricsFailureForTrack(track);
           else clearLyricsExhaustionForTrack(track);
-        })
-        .catch(() => {
+        } catch {
           recordLyricsFailureForTrack(track);
-        });
+        }
+      });
     }
     return;
   }
@@ -866,7 +920,9 @@ export function prefetchSyncedLyricsForTrack(track: LyricsPrefetchTrack): void {
     const metaFields = lyricsPrefetchMetaFields(track);
     const metaKey = syncedLyricsMetaCacheKey(metaFields);
     if (syncedLyricsCache.isPending(metaKey)) return;
-    void getSyncedLyricsByMeta(metaFields, { exhaustionTrack: track });
+    enqueueLyricsPrefetch(`meta:${metaKey}`, () =>
+      getSyncedLyricsByMeta(metaFields, { exhaustionTrack: track }),
+    );
   }
 }
 

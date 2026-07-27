@@ -51,6 +51,7 @@ function muteForOverlay(c: { r: number; g: number; b: number }): { r: number; g:
 export function QueuePanel({ open, onNavigate }: { open: boolean; onNavigate: (view: View) => void }) {
   const player = usePlayerState();
   const playerActions = usePlayerActions();
+
   const [tab, setTab] = useState<QueueTab>("queued");
   const scrollRef = useRef<HTMLDivElement>(null);
   const listRef = useRef<HTMLDivElement>(null);

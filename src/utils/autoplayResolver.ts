@@ -1,14 +1,13 @@
 import type { MediaTrack } from "../types";
-import { isAutoplayWatchPlaylistCandidate } from "./media";
+import { isAutoplayWatchPlaylistCandidate, isLikelyMusicVideoTrack } from "./media";
 
 /**
  * Pure resolver for the autoplay queue refill.
  *
  * Carved out of `player.tsx`'s `fetchAndAppendAutoplay`. Returns the
- * full set of `{ initial, second, compensatory }` additions + the
- * `playlistId` from the second-candidate response (if any) and the
- * next seed the orchestrator should commit. The wrapper that hands the
- * additions to React state, mutates the seed, and runs the
+ * full set of additions plus the playlist id discovered from the primary
+ * seed and the seed the caller should advance to. The wrapper that hands
+ * the additions to React state, mutates the seed, and runs the
  * retry/backoff timer logic stays in `player.tsx`.
  *
  * The helper depends on injected `getWatchPlaylist` and the
@@ -31,7 +30,7 @@ export type AutoplaySeed = {
  */
 type WatchPlaylistResponse = {
   tracks: MediaTrack[];
-  playlistId: string | null;
+  playlistId?: string | null;
 };
 
 export interface AutoplayResolverDeps {
@@ -62,225 +61,104 @@ export interface AutoplayResolverInput {
 }
 
 export interface AutoplayResolverResult {
-  initialAdditions: MediaTrack[];
-  secondAdditions: MediaTrack[];
-  compensatoryAdditions: MediaTrack[];
-  playlistId: string | null;
-  primaryPlaylistId: string | null;
+  additions: MediaTrack[];
   nextSeed: AutoplaySeed | null;
-  primaryExhausted: boolean;
-  secondExhausted: boolean;
+  playlistId: string | null;
 }
 
-/**
- * Step 1 — fetch the watch playlist for the current seed and dedup
- * against the queue snapshot.
- */
-async function fetchInitialAdditions(
+type SeenIndex = {
+  ids: Set<string>;
+  videoIds: Set<string>;
+  artistTitles: Set<string>;
+};
+
+const RESOLVE_CONCURRENCY = 4;
+
+function isAcceptableAutoplayEntry(
+  entry: MediaTrack,
+  seen: SeenIndex,
+  deps: AutoplayResolverDeps,
+): boolean {
+  if (isLikelyMusicVideoTrack(entry)) return false;
+  if (seen.ids.has(entry.id)) return false;
+  if (entry.videoId != null && seen.videoIds.has(entry.videoId)) return false;
+  if (seen.artistTitles.has(`${entry.artist}\0${entry.title}`.toLowerCase())) return false;
+  if (deps.isInRecentlyPlayed(entry)) return false;
+  return true;
+}
+
+async function resolveEntriesWithConcurrency(
+  entries: MediaTrack[],
+  resolve: (entry: MediaTrack) => Promise<MediaTrack | null>,
+): Promise<Array<MediaTrack | null>> {
+  const results: Array<MediaTrack | null> = new Array(entries.length).fill(null);
+  let nextIndex = 0;
+
+  async function worker(): Promise<void> {
+    while (nextIndex < entries.length) {
+      const index = nextIndex;
+      nextIndex += 1;
+      results[index] = await resolve(entries[index]!);
+    }
+  }
+
+  const workerCount = Math.min(RESOLVE_CONCURRENCY, entries.length);
+  await Promise.all(Array.from({ length: workerCount }, () => worker()));
+  return results;
+}
+
+async function fetchAdditionsFromSeed(
+  seed: AutoplaySeed,
   input: AutoplayResolverInput,
   deps: AutoplayResolverDeps,
-  seen: {
-    ids: Set<string>;
-    videoIds: Set<string>;
-    artistTitles: Set<string>;
-  },
-): Promise<{ additions: MediaTrack[]; playlistId: string | null; exhausted: boolean }> {
-  const rawResponse = await deps.getWatchPlaylist(
-    input.seed.videoId,
-    input.seed.playlistId,
-  );
-  const response: WatchPlaylistResponse = {
-    tracks: rawResponse.tracks,
-    playlistId: rawResponse.playlistId ?? null,
-  };
+  seen: SeenIndex,
+  limit: number,
+): Promise<{ tracks: MediaTrack[]; playlistId: string | null }> {
+  const response = await deps.getWatchPlaylist(seed.videoId, seed.playlistId);
+
   if (!input.autoplayEnabled() || !input.seedStillCurrent()) {
-    return { additions: [], playlistId: response.playlistId, exhausted: true };
+    return { tracks: [], playlistId: response.playlistId ?? null };
   }
+
   const incoming = response.tracks.filter(isAutoplayWatchPlaylistCandidate);
-  const transformed: Array<MediaTrack | null> = [];
-  for (const entry of incoming) {
-    transformed.push(await deps.resolveAutoplayEntryToSong(entry));
-  }
-  const candidates = transformed.filter(
-    (entry): entry is MediaTrack => entry !== null,
+  const transformed = await resolveEntriesWithConcurrency(
+    incoming,
+    deps.resolveAutoplayEntryToSong,
   );
-  const additions: MediaTrack[] = [];
+
+  const candidates = transformed.filter((entry): entry is MediaTrack => entry !== null);
+  const tracks: MediaTrack[] = [];
+
   for (const entry of candidates) {
-    const isDuplicate =
-      seen.ids.has(entry.id) ||
-      (entry.videoId != null && seen.videoIds.has(entry.videoId)) ||
-      seen.artistTitles.has(`${entry.artist}\0${entry.title}`.toLowerCase());
-    if (isDuplicate) continue;
-    if (additions.some((existing) => existing.id === entry.id)) continue;
+    if (!isAcceptableAutoplayEntry(entry, seen, deps)) continue;
     seen.ids.add(entry.id);
     if (entry.videoId) seen.videoIds.add(entry.videoId);
     seen.artistTitles.add(`${entry.artist}\0${entry.title}`.toLowerCase());
-    additions.push(entry);
+    tracks.push(entry);
+    if (tracks.length >= limit) break;
   }
+
   return {
-    additions: additions.slice(0, Math.min(input.batchLimit, input.queueTarget)),
-    playlistId: response.playlistId,
-    exhausted: additions.length === 0,
+    tracks,
+    playlistId: response.playlistId ?? null,
   };
-}
-
-/**
- * Step 2 — if the primary fetch fell under the queue target, seed
- * another fetch from the last manually-queued song.
- */
-async function fetchSecondAdditions(
-  input: AutoplayResolverInput,
-  deps: AutoplayResolverDeps,
-  seen: {
-    ids: Set<string>;
-    videoIds: Set<string>;
-    artistTitles: Set<string>;
-  },
-  remaining: number,
-): Promise<{ additions: MediaTrack[]; playlistId: string | null; exhausted: boolean }> {
-  if (remaining <= 0 || input.queue.length === 0) {
-    return { additions: [], playlistId: null, exhausted: true };
-  }
-  const manualSongs = input.queue.filter(
-    (track) => !input.autoplayIds.has(track.id) && track.kind !== "video",
-  );
-  const secondCandidate =
-    manualSongs[manualSongs.length - 1] ?? input.queue[input.queue.length - 1];
-  // Pull the seed video id into a local so TypeScript can narrow once
-  // and propagate the narrow through the rest of the function.
-  const seedVideoId: string | null = secondCandidate?.videoId ?? null;
-  if (seedVideoId === null) {
-    return { additions: [], playlistId: null, exhausted: true };
-  }
-  if (seedVideoId === input.seed.videoId) {
-    return { additions: [], playlistId: null, exhausted: true };
-  }
-  try {
-    const rawResponse = await deps.getWatchPlaylist(seedVideoId);
-    const response: WatchPlaylistResponse = {
-      tracks: rawResponse.tracks,
-      playlistId: rawResponse.playlistId ?? null,
-    };
-    if (!input.autoplayEnabled() || !input.seedStillCurrent()) {
-      return { additions: [], playlistId: response.playlistId, exhausted: true };
-    }
-    const incoming = response.tracks.filter(isAutoplayWatchPlaylistCandidate);
-    const transformed: Array<MediaTrack | null> = [];
-    for (const entry of incoming) {
-      transformed.push(await deps.resolveAutoplayEntryToSong(entry));
-    }
-    const candidates = transformed.filter(
-      (entry): entry is MediaTrack => entry !== null,
-    );
-    const additions: MediaTrack[] = [];
-    for (const entry of candidates) {
-      const isDuplicate =
-        seen.ids.has(entry.id) ||
-        (entry.videoId != null && seen.videoIds.has(entry.videoId)) ||
-        seen.artistTitles.has(`${entry.artist}\0${entry.title}`.toLowerCase());
-      if (isDuplicate) continue;
-      if (additions.some((existing) => existing.id === entry.id)) continue;
-      seen.ids.add(entry.id);
-      if (entry.videoId) seen.videoIds.add(entry.videoId);
-      seen.artistTitles.add(`${entry.artist}\0${entry.title}`.toLowerCase());
-      additions.push(entry);
-      if (additions.length >= remaining) break;
-    }
-    return {
-      additions,
-      playlistId: response.playlistId,
-      exhausted: additions.length === 0,
-    };
-  } catch {
-    return { additions: [], playlistId: null, exhausted: true };
-  }
-}
-
-/**
- * Step 3 — if additions from steps 1+2 are filtered out by the
- * recently-played set, fetch once more from the next manually-queued
- * song after the current index, so the radio compensates without the
- * listener noticing the gap.
- */
-async function fetchCompensatoryAdditions(
-  input: AutoplayResolverInput,
-  deps: AutoplayResolverDeps,
-  seen: {
-    ids: Set<string>;
-    videoIds: Set<string>;
-    artistTitles: Set<string>;
-  },
-  filteredCount: number,
-): Promise<MediaTrack[]> {
-  if (filteredCount <= 0 || input.queue.length === 0) return [];
-  const sliceAfterCurrent = input.queue.slice(input.currentIndex + 1);
-  const afterCurrent =
-    sliceAfterCurrent.find((t) => !input.autoplayIds.has(t.id)) ??
-    sliceAfterCurrent[0];
-  const seedVideoId: string | null = afterCurrent?.videoId ?? null;
-  if (seedVideoId === null || seedVideoId === input.seed.videoId) {
-    return [];
-  }
-  try {
-    const rawResponse = await deps.getWatchPlaylist(seedVideoId);
-    const response: WatchPlaylistResponse = {
-      tracks: rawResponse.tracks,
-      playlistId: rawResponse.playlistId ?? null,
-    };
-    if (!input.autoplayEnabled() || !input.seedStillCurrent()) return [];
-    const incoming = response.tracks.filter(isAutoplayWatchPlaylistCandidate);
-    const transformed: Array<MediaTrack | null> = [];
-    for (const entry of incoming) {
-      transformed.push(await deps.resolveAutoplayEntryToSong(entry));
-    }
-    const candidates = transformed.filter(
-      (e): e is MediaTrack => e !== null,
-    );
-    const additions: MediaTrack[] = [];
-    for (const entry of candidates) {
-      const isDuplicate =
-        seen.ids.has(entry.id) ||
-        (entry.videoId != null && seen.videoIds.has(entry.videoId)) ||
-        seen.artistTitles.has(`${entry.artist}\0${entry.title}`.toLowerCase());
-      if (isDuplicate) continue;
-      if (deps.isInRecentlyPlayed(entry)) continue;
-      if (additions.some((existing) => existing.id === entry.id)) continue;
-      seen.ids.add(entry.id);
-      if (entry.videoId) seen.videoIds.add(entry.videoId);
-      seen.artistTitles.add(`${entry.artist}\0${entry.title}`.toLowerCase());
-      additions.push(entry);
-      if (additions.length >= filteredCount) break;
-    }
-    return additions;
-  } catch {
-    return [];
-  }
 }
 
 /**
  * Resolve the autoplay queue refill.
  *
  * Compute the gap (queue target − autoplay tracks currently AFTER the
- * playhead), run the 3-phase fetch (primary seed, second-candidate,
- * compensatory for recently-played filters), filter out recently-played
- * from the merged additions, and compensate from the next manually-
- * queued song if the filter dropped any.
+ * playhead), run the primary fetch, then compensate for any dropped
+ * music videos / duplicates / recently-played tracks by fetching from
+ * upcoming manually-queued songs until the target is met or the queue
+ * is exhausted.
  */
 export async function resolveAutoplayAdditions(
   input: AutoplayResolverInput,
   deps: AutoplayResolverDeps,
 ): Promise<AutoplayResolverResult> {
   if (!input.autoplayEnabled()) {
-    return {
-      initialAdditions: [],
-      secondAdditions: [],
-      compensatoryAdditions: [],
-      playlistId: null,
-      primaryPlaylistId: null,
-      nextSeed: null,
-      primaryExhausted: true,
-      secondExhausted: true,
-    };
+    return { additions: [], nextSeed: null, playlistId: null };
   }
 
   const seen = deps.buildSeenIndex(input.queue);
@@ -297,96 +175,80 @@ export async function resolveAutoplayAdditions(
     .filter((track) => input.autoplayIds.has(track.id)).length;
   const missingTracks = Math.max(0, input.queueTarget - autoplayAhead);
   if (missingTracks === 0) {
-    return {
-      initialAdditions: [],
-      secondAdditions: [],
-      compensatoryAdditions: [],
-      playlistId: null,
-      primaryPlaylistId: null,
-      nextSeed: null,
-      primaryExhausted: true,
-      secondExhausted: true,
-    };
+    return { additions: [], nextSeed: null, playlistId: null };
   }
 
-  const initial = await fetchInitialAdditions(input, deps, seen);
-  if (!input.autoplayEnabled() || !input.seedStillCurrent()) {
-    return {
-      initialAdditions: [],
-      secondAdditions: [],
-      compensatoryAdditions: [],
-      playlistId: initial.playlistId,
-      primaryPlaylistId: initial.playlistId,
-      nextSeed: null,
-      primaryExhausted: initial.exhausted,
-      secondExhausted: true,
-    };
-  }
-
-  const remainingAfterInitial = missingTracks - initial.additions.length;
-  const second =
-    remainingAfterInitial > 0
-      ? await fetchSecondAdditions(input, deps, seen, remainingAfterInitial)
-      : { additions: [] as MediaTrack[], playlistId: null, exhausted: true };
-  if (!input.autoplayEnabled() || !input.seedStillCurrent()) {
-    return {
-      initialAdditions: initial.additions,
-      secondAdditions: second.additions,
-      compensatoryAdditions: [],
-      playlistId: second.playlistId,
-      primaryPlaylistId: initial.playlistId,
-      nextSeed: null,
-      primaryExhausted: initial.exhausted,
-      secondExhausted: second.exhausted,
-    };
-  }
-
-  const merged = [...initial.additions, ...second.additions].slice(
-    0,
-    missingTracks,
+  const primary = await fetchAdditionsFromSeed(
+    input.seed,
+    input,
+    deps,
+    seen,
+    Math.min(input.batchLimit, missingTracks),
   );
-  const beforeFilter = merged.length;
-  const filtered = merged.filter((t) => !deps.isInRecentlyPlayed(t));
-  const filteredCount = beforeFilter - filtered.length;
 
-  const compensatory =
-    filteredCount > 0
-      ? await fetchCompensatoryAdditions(input, deps, seen, filteredCount)
-      : [];
+  const additions: MediaTrack[] = primary.tracks.slice();
+  // Track which fetch's playlistId produced the last addition. When the
+  // final addition comes from a compensatory/secondary fetch we must pair
+  // the next seed with that response's playlist context — not the primary
+  // fetch's.
+  let lastAdditionPlaylistId: string | null = primary.playlistId;
+
   if (!input.autoplayEnabled() || !input.seedStillCurrent()) {
-    return {
-      initialAdditions: initial.additions,
-      secondAdditions: second.additions,
-      compensatoryAdditions: [],
-      playlistId: second.playlistId,
-      primaryPlaylistId: initial.playlistId,
-      nextSeed: null,
-      primaryExhausted: initial.exhausted,
-      secondExhausted: second.exhausted,
-    };
+    return { additions: [], nextSeed: null, playlistId: null };
   }
 
-  const finalAdditions = [...filtered, ...compensatory];
-  const songAdditionsOnly = finalAdditions.filter((t) => t.kind !== "video");
-  const seedAdvance =
-    songAdditionsOnly[songAdditionsOnly.length - 1] ??
-    finalAdditions[finalAdditions.length - 1];
-  const nextSeed: AutoplaySeed | null = seedAdvance?.videoId
+  // If the primary fetch fell short, try to compensate by seeding from
+  // upcoming manually-queued songs. This covers music videos that were
+  // dropped because they have no studio match, duplicates, or recently
+  // played tracks.
+  if (additions.length < missingTracks) {
+    const upcomingManual = input.queue
+      .slice(input.currentIndex + 1)
+      .filter((track) => !input.autoplayIds.has(track.id) && track.videoId);
+    const usedManualVideoIds = new Set<string>();
+
+    for (const candidate of upcomingManual) {
+      if (!candidate.videoId || candidate.videoId === input.seed.videoId) continue;
+      if (usedManualVideoIds.has(candidate.videoId)) continue;
+      usedManualVideoIds.add(candidate.videoId);
+      if (!input.autoplayEnabled() || !input.seedStillCurrent()) {
+        break;
+      }
+
+      const remaining = missingTracks - additions.length;
+      try {
+        const batch = await fetchAdditionsFromSeed(
+          { videoId: candidate.videoId, playlistId: null },
+          input,
+          deps,
+          seen,
+          remaining,
+        );
+        if (batch.tracks.length > 0) {
+          additions.push(...batch.tracks);
+          lastAdditionPlaylistId = batch.playlistId;
+        }
+      } catch (error) {
+        console.warn("Compensatory autoplay fetch failed:", error);
+      }
+      if (additions.length >= missingTracks) break;
+    }
+  }
+
+  const last = additions[additions.length - 1];
+  const nextSeed: AutoplaySeed | null = last
     ? {
-        videoId: seedAdvance.videoId,
-        playlistId:
-          second.playlistId ?? initial.playlistId ?? input.seed.playlistId ?? null,
+        videoId: last.resolvedVideoId ?? last.videoId ?? "",
+        playlistId: lastAdditionPlaylistId ?? input.seed.playlistId ?? null,
       }
     : null;
+  if (nextSeed && !nextSeed.videoId) {
+    return { additions: [], nextSeed: null, playlistId: null };
+  }
 
   return {
-    initialAdditions: initial.additions,
-    secondAdditions: second.additions,
-    compensatoryAdditions: compensatory,
-    playlistId: second.playlistId,
-    primaryPlaylistId: initial.playlistId,
+    additions: additions.slice(0, missingTracks),
     nextSeed,
-    primaryExhausted: initial.exhausted,
-    secondExhausted: second.exhausted,
+    playlistId: lastAdditionPlaylistId,
   };
 }

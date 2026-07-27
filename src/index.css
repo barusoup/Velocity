@@ -1184,22 +1184,16 @@ input[type="number"]::-webkit-inner-spin-button {
 /*
  * Save button saved-state motion. The visible green disc stays the same
  * pixel size as the unsaved plus-circle, then pops in with a compact black
- * check and a small Spotify-like sparkle burst. The pop only plays when
- * the JS toggles `.is-flashing` on the animated descendants (see the
- * modifier rules below) so initial mounts of an already-saved item,
- * unrelated parent re-renders, and external state syncs that flip
- * isSaved false → true all keep the saved glyph static.
+ * check. The pop only plays when the JS toggles `.is-flashing` on the
+ * animated descendants (see the modifier rules below) so initial mounts of
+ * an already-saved item, unrelated parent re-renders, and external state
+ * syncs that flip isSaved false → true all keep the saved glyph static.
  */
 
 .collection-save-disc {
-  --save-burst-scale: 1;
   overflow: visible;
   position: relative;
   transform-origin: center;
-}
-
-.collection-save-disc[data-size="sm"] {
-  --save-burst-scale: 0.62;
 }
 
 .collection-save-check {
@@ -1208,30 +1202,6 @@ input[type="number"]::-webkit-inner-spin-button {
      where the keyframes leave it after `.is-flashing` is removed. */
   opacity: 1;
   transform: scale(1) rotate(0deg);
-}
-
-.collection-save-burst {
-  position: absolute;
-  left: 50%;
-  top: 50%;
-  width: 3px;
-  height: 3px;
-  border-radius: 9999px;
-  pointer-events: none;
-  transform: translate(-50%, -50%) scale(calc(0.25 * var(--save-burst-scale)));
-  /* The burst keyframes are 0% and 100% opacity 0, so the resting state
-     should match — otherwise the sparkle dot would peek through whenever
-     the saved glyph is rendered without a recent click. */
-  opacity: 0;
-  box-shadow:
-    0 -18px 0 rgba(29, 215, 96, 0.95),
-    13px -13px 0 rgba(29, 215, 96, 0.75),
-    18px 0 0 rgba(29, 215, 96, 0.9),
-    13px 13px 0 rgba(29, 215, 96, 0.65),
-    0 18px 0 rgba(29, 215, 96, 0.85),
-    -13px 13px 0 rgba(29, 215, 96, 0.7),
-    -18px 0 0 rgba(29, 215, 96, 0.9),
-    -13px -13px 0 rgba(29, 215, 96, 0.65);
 }
 
 @keyframes collection-save-disc-pop {
@@ -1270,26 +1240,12 @@ input[type="number"]::-webkit-inner-spin-button {
   }
 }
 
-@keyframes collection-save-burst {
-  0% {
-    opacity: 0;
-    transform: translate(-50%, -50%) scale(calc(0.2 * var(--save-burst-scale)));
-  }
-  18% {
-    opacity: 0.95;
-  }
-  100% {
-    opacity: 0;
-    transform: translate(-50%, -50%) scale(calc(1.05 * var(--save-burst-scale)));
-  }
-}
-
 /*
  * Entrance pop is gated on a JS-applied `.is-flashing` modifier so it only
  * plays when the user just clicked to save. The component sets this on
- * unsaved → saved clicks and clears it ~460ms later (longest sub-animation
- * is the 460ms burst); see src/components/SaveButton.tsx. Without the
- * gate, every fresh mount of the saved subtree would replay the pop.
+ * unsaved → saved clicks and clears it ~360ms later (check-pop duration);
+ * see src/components/SaveButton.tsx. Without the gate, every fresh mount of
+ * the saved subtree would replay the pop.
  */
 
 .collection-save-disc.is-flashing {
@@ -1300,19 +1256,10 @@ input[type="number"]::-webkit-inner-spin-button {
   animation: collection-save-check-pop 360ms cubic-bezier(0.18, 0.9, 0.25, 1.25) both;
 }
 
-.collection-save-burst.is-flashing {
-  animation: collection-save-burst 460ms ease-out both;
-}
-
 @media (prefers-reduced-motion: reduce) {
   .collection-save-disc.is-flashing,
-  .collection-save-check.is-flashing,
-  .collection-save-burst.is-flashing {
+  .collection-save-check.is-flashing {
     animation: none;
-  }
-
-  .collection-save-burst {
-    display: none;
   }
 }
 

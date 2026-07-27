@@ -40,8 +40,7 @@ function looksLikePollutedArtistField(value: string): boolean {
   if (/^\d{1,2}:\d{2}(?::\d{2})?$/.test(trimmed)) return true;
   if (/^\d{4}$/.test(trimmed)) return true;
   if (/\bmonthly listeners?\b/i.test(trimmed)) return true;
-  if (!/\d/.test(trimmed)) return false;
-
+  if (/\bmonthly listeners?\b/i.test(trimmed)) return true;
   return /\b(plays?|views?|streams?|listeners?|subscribers?)\b/i.test(trimmed);
 }
 

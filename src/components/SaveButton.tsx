@@ -16,8 +16,8 @@ import { cn } from "../utils/cn";
 //   * "md" — album rows on the full discography page (~h-8 w-8).
 //   * "sm" — compact pill for track rows / queue rows / player bar (~h-7 w-7).
 //
-// The toggle uses a quick Spotify-like pop: the green disc blooms in, the
-// check settles into place, and a tiny sparkle burst fades out.
+// The toggle uses a quick Spotify-like pop: the green disc blooms in and
+// the check settles into place.
 // ---------------------------------------------------------------------------
 
 type SaveButtonSize = "lg" | "md" | "sm";
@@ -45,8 +45,8 @@ export const SaveButton = memo(function SaveButton({
   //   - any parent re-render that keeps the saved branch alive
   //   - an external sync that flips isSaved false → true without a click
   // We gate the animation on a transient `isFlashing` flag, set inside
-  // `handleClick` and cleared once the longest sub-animation (the 460ms
-  // burst) has had time to finish. Because the saved subtree is
+  // `handleClick` and cleared once the check-pop sub-animation (360ms) has
+  // had time to finish. Because the saved subtree is
   // conditionally rendered, every unsaved → saved transition mounts a
   // fresh `<span>` with the `.is-flashing` class applied to its base
   // classes — the CSS `animation` property triggers naturally on that
@@ -76,7 +76,7 @@ export const SaveButton = memo(function SaveButton({
       flashTimerRef.current = setTimeout(() => {
         setIsFlashing(false);
         flashTimerRef.current = null;
-      }, 460);
+      }, 360);
     }
     onToggle(!isSaved);
   };
@@ -122,7 +122,6 @@ export const SaveButton = memo(function SaveButton({
             iconDiscDimensions,
           )}
         >
-          <span className={cn("collection-save-burst", isFlashing && "is-flashing")} />
           <Icon
             className={cn("collection-save-check", savedIconDimensions, isFlashing && "is-flashing")}
             strokeWidth={strokeWidth}

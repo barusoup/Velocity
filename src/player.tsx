@@ -53,8 +53,6 @@ import { enrichUploadMetadataFromYtm } from "./utils/upload-enrichment";
 import {
   exportStreamVideoId,
   filterQueueableTracks,
-  isAutoplayWatchPlaylistCandidate,
-  isLikelyMusicVideoTrack,
   isQueueableTrack,
   readLiveMediaDuration,
   readDuration,
@@ -67,10 +65,11 @@ import {
 } from "./utils/track-metadata-backfill";
 import {
   isUnplayableStreamError,
-  resolveAutoplayEntries,
+  resolveAutoplayEntryToSong,
   resolveStreamTrackAudio,
   resolveStreamTrackAudioFallback,
 } from "./utils/song-resolution";
+import { resolveAutoplayAdditions } from "./utils/autoplayResolver";
 import {
   addVisitedQueueTrack,
   findPreviousVisitedQueueIndex,
@@ -145,6 +144,7 @@ type PlayerActions = {
   cycleRepeat: () => void;
   setAutoplay: (enabled: boolean) => void;
   reloadAutoplay: () => void;
+  ensureAutoplayTopUp: (waitForInFlight?: boolean) => void;
   clearError: () => void;
   retry: () => void;
   getAnalyser: () => AnalyserNode | null;
@@ -177,6 +177,10 @@ const LOUDNESS_PREVIEW_MIN_PEAK_DB = -35;
 const LOUDNESS_PREVIEW_MIN_LUFS = -45;
 const RECENTLY_PLAYED_LIMIT = 50;
 // Total attempts = 1 initial + (MAX_LOAD_ATTEMPTS - 1) retries, spaced by RETRY_DELAY_MS.
+// The retry budget must be generous enough for the Rust backend's yt-dlp to
+// finish and cache its result on a cold start (can take 10-15+ seconds).
+// Giving up too early causes the "first attempt fails, retry succeeds" pattern
+// because the backend's disk cache (45-min TTL) serves the retry instantly.
 const MAX_LOAD_ATTEMPTS = 3;
 const RETRY_DELAY_MS = [700, 1500, 3500];
 const STREAM_RESOLVE_TIMEOUT_MS = 12_000;
@@ -626,6 +630,18 @@ function isInRecentlyPlayed(track: MediaTrack, set: RecentlyPlayedSet): boolean 
   if (set.ids.has(track.id)) return true;
   if (track.videoId && set.videoIds.has(track.videoId)) return true;
   return set.artistTitles.has(`${track.artist}\0${track.title}`.toLowerCase());
+}
+
+function buildSeenIndex(queue: readonly MediaTrack[]) {
+  const ids = new Set<string>();
+  const videoIds = new Set<string>();
+  const artistTitles = new Set<string>();
+  for (const entry of queue) {
+    ids.add(entry.id);
+    if (entry.videoId) videoIds.add(entry.videoId);
+    artistTitles.add(`${entry.artist}\0${entry.title}`.toLowerCase());
+  }
+  return { ids, videoIds, artistTitles };
 }
 
 export function PlayerProvider({ children }: { children: ReactNode }) {
@@ -1084,6 +1100,16 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
     if (index < 0) return;
     activeQueue[index] = nextTrack;
     queueRef.current = activeQueue;
+    // Keep the React snapshot in sync as well. QueuePanel renders `queue`,
+    // while playback navigation reads `queueRef`; updating only the ref made
+    // durations resolved during autoplay prefetch invisible in the queue menu.
+    setQueue((currentQueue) => {
+      const currentIndex = currentQueue.findIndex((entry) => entry.id === trackId);
+      if (currentIndex < 0) return currentQueue;
+      const nextQueue = currentQueue.slice();
+      nextQueue[currentIndex] = nextTrack;
+      return nextQueue;
+    });
     if (index === queueIndexRef.current) {
       trackRef.current = nextTrack;
       setCurrentTrack(nextTrack);
@@ -1094,9 +1120,11 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
     const inFlight = streamPrefetchInFlightRef.current.get(track.id);
     if (inFlight) return inFlight;
 
-    const work = (async () => {
+    // Phase 1: resolve and download the stream (required for playback).
+    // We await this so the load effect can use the cached stream path.
+    const streamWork = (async () => {
       const catalogVideoId = exportStreamVideoId(track);
-      if (!catalogVideoId) return;
+      if (!catalogVideoId) return null;
 
       const trackForResolve =
         track.videoId != null ? track : { ...track, videoId: catalogVideoId };
@@ -1114,37 +1142,60 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
       }
 
       const effectiveVideoId = exportStreamVideoId(trackForStream);
-      if (!effectiveVideoId) return;
+      if (!effectiveVideoId) return null;
 
       const stream = await resolveStream(effectiveVideoId);
-      if (!stream.filePath) return;
+      if (!stream.filePath) return null;
 
-      const cacheKey = getAudioCacheKey(trackForStream);
-      if (!getCachedLoudness(cacheKey) && !hasAttemptedAnalysis(cacheKey)) {
-        try {
-          const data = await analyzeLoudness(stream.filePath);
-          setCachedLoudness(cacheKey, data);
-        } catch (error) {
-          console.warn("Prefetch loudness analysis failed:", error);
+      return { trackForStream, stream, effectiveVideoId };
+    })();
+
+    // Phase 2: background analysis (fire-and-forget, must not delay playback).
+    // The load effect picks up cached results if analysis finishes in time.
+    // This is a background observer of the same promise the load effect
+    // awaits below. It must handle the rejection itself: the load effect can
+    // recover from a yt-dlp 403, but an unhandled rejection from this
+    // fire-and-forget branch still replaces the whole webview with the fatal
+    // error page.
+    void streamWork
+      .then(async (result) => {
+        if (!result) return;
+        const { trackForStream, stream } = result;
+        if (!stream.filePath) return;
+        const cacheKey = getAudioCacheKey(trackForStream);
+        if (!getCachedLoudness(cacheKey) && !hasAttemptedAnalysis(cacheKey)) {
+          analyzeLoudness(stream.filePath)
+            .then((data) => setCachedLoudness(cacheKey, data))
+            .catch((error) => console.warn("Prefetch loudness analysis failed:", error));
         }
-      }
-
-      if (!hasAttemptedLeadingSilenceAnalysis(cacheKey)) {
-        try {
-          const data = await detectLeadingSilence(stream.filePath);
-          setCachedLeadingSilence(cacheKey, data);
-        } catch (error) {
-          console.warn("Prefetch leading silence detection failed:", error);
-          setCachedLeadingSilence(cacheKey, { skipSeconds: null });
+        if (!hasAttemptedLeadingSilenceAnalysis(cacheKey)) {
+          detectLeadingSilence(stream.filePath)
+            .then((data) => setCachedLeadingSilence(cacheKey, data))
+            .catch((error) => {
+              console.warn("Prefetch leading silence detection failed:", error);
+              setCachedLeadingSilence(cacheKey, { skipSeconds: null });
+            });
         }
-      }
-    })().catch((error) => {
-      console.warn("Prefetch stream resolve failed:", error);
-    });
+      })
+      .catch((error) => {
+        // Playback owns the user-facing error/retry handling. Prefetch is
+        // best-effort and must never create a second unhandled rejection.
+        console.warn("Stream prefetch failed:", error);
+      });
 
-    streamPrefetchInFlightRef.current.set(track.id, work);
+    // Store the resolved stream promise so the load effect can wait for it,
+    // but NOT for analysis.
+    const resolvedPromise = (async () => { await streamWork; })();
+    streamPrefetchInFlightRef.current.set(track.id, resolvedPromise);
     try {
-      await work;
+      await resolvedPromise;
+    } catch (error) {
+      // This helper is intentionally used as a fire-and-forget prefetch.  A
+      // failed yt-dlp request (403s are common for expiring YouTube URLs)
+      // must never reject the promise returned to the effect below: callers
+      // cannot recover from a prefetch failure and an unobserved rejection
+      // replaces the whole Tauri webview with its fatal error page.
+      console.warn("Stream prefetch failed:", error);
     } finally {
       streamPrefetchInFlightRef.current.delete(track.id);
     }
@@ -2018,10 +2069,14 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
       // Prefer the more specific MediaError description (e.g. NETWORK vs.
       // DECODE) when the audio element flagged one, otherwise surface the
       // raw error we captured during the last attempt.
-      setLastError(
-        describeMediaError(audio.error) ??
-          (lastAttemptError instanceof Error ? lastAttemptError.message : "Playback could not start."),
-      );
+      const mediaErrorDesc = describeMediaError(audio.error);
+      if (mediaErrorDesc !== "Playback failed for this track." && mediaErrorDesc !== "Playback could not start.") {
+        setLastError(mediaErrorDesc);
+      } else {
+        setLastError(
+          lastAttemptError instanceof Error ? lastAttemptError.message : "Playback could not start.",
+        );
+      }
     };
 
     const attempt = async () => {
@@ -2308,12 +2363,25 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
         retriesLeft--;
         activeRetryTimer = setTimeout(() => {
           if (cancelled) return;
-          void attempt();
+          void attempt().catch((error) => {
+            // Keep a rejected retry from reaching the browser/Tauri global
+            // unhandled-rejection handler. The normal attempt catch already
+            // reports ordinary load failures through the player state.
+            if (!cancelled) {
+              lastAttemptError = error;
+              finalize();
+            }
+          });
         }, delay);
       }
     };
 
-    void attempt();
+    void attempt().catch((error) => {
+      if (!cancelled) {
+        lastAttemptError = error;
+        finalize();
+      }
+    });
 
     return () => {
       cancelled = true;
@@ -2423,7 +2491,12 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
       .slice(queueIndex + 1, queueIndex + 1 + PREFETCH_AHEAD)
       .filter((track) => track.source === "stream" && exportStreamVideoId(track));
     for (const track of upcoming) {
-      void prefetchStreamTrack(track);
+      // Keep this guard at the call site as well as inside the helper. This
+      // protects this fire-and-forget effect if the helper gains a new
+      // rejection path in the future.
+      void prefetchStreamTrack(track).catch((error) => {
+        console.warn("Stream prefetch scheduling failed:", error);
+      });
     }
   }, [queueIndex, upcomingPrefetchKey, prefetchStreamTrack]);
 
@@ -2856,223 +2929,87 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
     }, AUTOPLAY_FETCH_TIMEOUT_MS);
 
     try {
-      const current = queueRef.current;
-      const currentIndex = queueIndexRef.current;
-      const autoplayIds = autoplayTrackIdsRef.current;
-      const autoplayAhead = current
-        .slice(currentIndex + 1)
-        .filter((track) => autoplayIds.has(track.id)).length;
-      const missingTracks = Math.max(0, AUTOPLAY_QUEUE_TARGET - autoplayAhead);
-      if (missingTracks === 0) {
-        // Queue already topped up — no point in scheduling a retry.
-        shouldRetry = false;
-        return;
-      }
+    // Capture the queue snapshot BEFORE the async resolve so we can detect
+    // stale-request writes after the await. The previous implementation
+    // captured `queueRef.current` after await and compared it against itself
+    // (always passing), which let old autoplay results leak into a replacement
+    // queue the user had already started.
+    const currentIndex = queueIndexRef.current;
+    const autoplayIds = autoplayTrackIdsRef.current;
+    const queueSnapshot = queueRef.current.slice();
+    const queueSnapshotOrigin = queueOriginRef.current;
+    const queueSnapshotSeed = autoplaySeedRef.current;
 
-      const response = await getWatchPlaylist(seed.videoId, seed.playlistId ?? undefined);
-      if (abortIfStale() || !autoplayRef.current || autoplaySeedRef.current?.videoId !== seed.videoId) return;
-      if (response.playlistId) {
-        const refreshedSeed = { videoId: seed.videoId, playlistId: response.playlistId ?? null };
-        autoplaySeedRef.current = refreshedSeed;
-        setAutoplaySeed(refreshedSeed);
-      }
-      if (response.tracks.length === 0) return;
+    const result = await resolveAutoplayAdditions(
+      {
+        seed: { videoId: seed.videoId, playlistId: seed.playlistId ?? null },
+        queue: queueSnapshot,
+        currentIndex,
+        autoplayIds,
+        autoplayEnabled: () => autoplayRef.current,
+        seedStillCurrent: () => generation === autoplayFetchGenerationRef.current,
+        batchLimit: AUTOPLAY_QUEUE_BATCH_LIMIT,
+        queueTarget: AUTOPLAY_QUEUE_TARGET,
+      },
+      {
+        getWatchPlaylist,
+        resolveAutoplayEntryToSong,
+        buildSeenIndex,
+        isInRecentlyPlayed: (entry) => {
+          const recentPlayedSet = buildRecentlyPlayedSet(
+            playbackHistoryRef.current.slice(0, 10),
+          );
+          return isInRecentlyPlayed(entry, recentPlayedSet);
+        },
+      },
+    );
 
-      const incoming = response.tracks.filter(
-        isAutoplayWatchPlaylistCandidate,
-      );
+    if (
+      abortIfStale() ||
+      !autoplayRef.current ||
+      autoplaySeedRef.current?.videoId !== seed.videoId
+    ) {
+      return;
+    }
 
-      const transformed = await resolveAutoplayEntries(incoming);
-      if (abortIfStale()) return;
-      const candidates = transformed
-        .filter((entry): entry is MediaTrack => entry !== null)
-        .filter((track) => !isLikelyMusicVideoTrack(track));
+    const additions = result.additions;
+    if (additions.length === 0) {
+      tryScheduleRetry();
+      return;
+    }
 
-      if (!autoplayRef.current || autoplaySeedRef.current?.videoId !== seed.videoId) return;
-
-      const latestQueue = queueRef.current;
-      const latestQueueIndex = queueIndexRef.current;
-      // Build a rich dedup index from the queue: same song can appear with
-      // different IDs (video vs song track), so we match on id, videoId,
-      // and artist+title.
-      const seenIds = new Set<string>();
-      const seenVideoIds = new Set<string>();
-      const seenArtistTitles = new Set<string>();
-      for (const entry of latestQueue) {
-        seenIds.add(entry.id);
-        if (entry.videoId) seenVideoIds.add(entry.videoId);
-        const key = `${entry.artist}\0${entry.title}`.toLowerCase();
-        seenArtistTitles.add(key);
-      }
-      // Also mark manually queued songs so they never appear in autoplay.
-      const manualVideoIds = new Set<string>();
-      const manualArtistTitles = new Set<string>();
-      for (const entry of latestQueue) {
-        if (autoplayIds.has(entry.id)) continue;
-        if (entry.videoId) manualVideoIds.add(entry.videoId);
-        const key = `${entry.artist}\0${entry.title}`.toLowerCase();
-        manualArtistTitles.add(key);
-      }
-      function isDuplicate(entry: MediaTrack): boolean {
-        if (seenIds.has(entry.id)) return true;
-        if (entry.videoId && (seenVideoIds.has(entry.videoId) || manualVideoIds.has(entry.videoId))) return true;
-        const key = `${entry.artist}\0${entry.title}`.toLowerCase();
-        if (seenArtistTitles.has(key) || manualArtistTitles.has(key)) return true;
-        return false;
-      }
-      // Deduplicate within candidates themselves (same song can appear twice in
-      // a watch playlist) before slicing.
-      const uniqueCandidates: MediaTrack[] = [];
-      for (const entry of candidates) {
-        if (isDuplicate(entry)) continue;
-        if (uniqueCandidates.some((c) => c.id === entry.id)) continue;
-        seenIds.add(entry.id);
-        if (entry.videoId) seenVideoIds.add(entry.videoId);
-        const key = `${entry.artist}\0${entry.title}`.toLowerCase();
-        seenArtistTitles.add(key);
-        uniqueCandidates.push(entry);
-      }
-      let additions = uniqueCandidates.slice(0, Math.min(AUTOPLAY_QUEUE_BATCH_LIMIT, missingTracks));
-
-      // If filtering left us under target, try a second fetch seeded from a
-      // different song in the queue — bias toward the last songs so the
-      // radio mood matches where the queue is heading.
-      let secondAdditions: MediaTrack[] = [];
-      let secondPlaylistId: string | null | undefined;
-      const remaining = missingTracks - additions.length;
-      if (remaining > 0 && latestQueue.length > 0) {
-        const manualSongs = latestQueue.filter(
-          (track) => !autoplayIds.has(track.id) && track.kind !== "video",
-        );
-        const secondCandidate = manualSongs[manualSongs.length - 1]
-          ?? latestQueue[latestQueue.length - 1];
-        if (secondCandidate?.videoId && secondCandidate.videoId !== seed.videoId) {
-          try {
-            const secondResponse = await getWatchPlaylist(secondCandidate.videoId);
-            if (autoplayRef.current) {
-              secondPlaylistId = secondResponse.playlistId;
-              const secondIncoming = secondResponse.tracks.filter(
-                isAutoplayWatchPlaylistCandidate,
-              );
-              const secondTransformed = await resolveAutoplayEntries(secondIncoming);
-              const secondCandidates = secondTransformed
-                .filter((entry): entry is MediaTrack => entry !== null)
-                .filter((track) => !isLikelyMusicVideoTrack(track));
-              for (const entry of secondCandidates) {
-                if (isDuplicate(entry)) continue;
-                if (secondAdditions.some((c) => c.id === entry.id)) continue;
-                seenIds.add(entry.id);
-                if (entry.videoId) seenVideoIds.add(entry.videoId);
-                const key = `${entry.artist}\0${entry.title}`.toLowerCase();
-                seenArtistTitles.add(key);
-                secondAdditions.push(entry);
-                if (secondAdditions.length >= remaining) break;
-              }
-            }
-          } catch {
-            // Second fetch is best-effort; continue with what we have.
-          }
-        }
-      }
-
-      const allAdditions = [...additions, ...secondAdditions].slice(0, missingTracks);
-      additions = allAdditions;
-      if (additions.length === 0) return;
-
-      // Exclude tracks found in the last 10 recently-played entries, then
-      // compensate for any removed by fetching from the next manually-queued
-      // song in the queue.
-      const recentPlayedSet = buildRecentlyPlayedSet(playbackHistoryRef.current.slice(0, 10));
-      const beforeFilter = additions.length;
-      additions = additions.filter((t) => !isInRecentlyPlayed(t, recentPlayedSet));
-      const filteredCount = beforeFilter - additions.length;
-
-      if (filteredCount > 0 && latestQueue.length > 0) {
-        const nextSeedTrack = latestQueue
-          .slice(currentIndex + 1)
-          .find((t) => !autoplayIds.has(t.id))
-          ?? latestQueue[currentIndex + 1];
-        if (nextSeedTrack?.videoId && nextSeedTrack.videoId !== seed.videoId) {
-          try {
-            const compResp = await getWatchPlaylist(nextSeedTrack.videoId);
-            if (autoplayRef.current) {
-              const compIncoming = compResp.tracks.filter(
-                isAutoplayWatchPlaylistCandidate,
-              );
-              const compTransformed = await resolveAutoplayEntries(compIncoming);
-              const compCandidates = compTransformed
-                .filter((e): e is MediaTrack => e !== null)
-                .filter((track) => !isLikelyMusicVideoTrack(track));
-              const compAdditions: MediaTrack[] = [];
-              for (const entry of compCandidates) {
-                if (isDuplicate(entry)) continue;
-                if (isInRecentlyPlayed(entry, recentPlayedSet)) continue;
-                if (compAdditions.some((c) => c.id === entry.id)) continue;
-                seenIds.add(entry.id);
-                if (entry.videoId) seenVideoIds.add(entry.videoId);
-                const key = `${entry.artist}\0${entry.title}`.toLowerCase();
-                seenArtistTitles.add(key);
-                compAdditions.push(entry);
-                if (compAdditions.length >= filteredCount) break;
-              }
-              if (compAdditions.length > 0) {
-                additions = [...additions, ...compAdditions];
-              }
-            }
-          } catch {
-            // Compensatory fetch is best-effort; continue with what we have.
-          }
-        }
-      }
-
-      // play()/playMany() can replace the queue while second/compensatory
-      // autoplay fetches are still in flight. Re-check the seed and that the
-      // queue head through the captured playhead is unchanged before commit;
-      // otherwise we'd restore the prior playlist and replay the old song.
-      if (abortIfStale() || !autoplayRef.current || autoplaySeedRef.current?.videoId !== seed.videoId) {
-        return;
-      }
-      for (let i = 0; i <= latestQueueIndex; i += 1) {
-        if (queueRef.current[i]?.id !== latestQueue[i]?.id) return;
-      }
+    // play()/playMany() can replace the queue while autoplay fetches are
+    // in flight. Re-check the snapshot vs. the current queue head through
+    // the captured playhead is unchanged before commit; otherwise we'd
+    // append stale results into a replacement queue.
+    const latestQueue = queueRef.current;
+    if (latestQueue.length < currentIndex + 1) return;
+    for (let i = 0; i <= currentIndex; i += 1) {
+      if (latestQueue[i]?.id !== queueSnapshot[i]?.id) return;
+    }
+    // Also verify the queue origin and seed haven't been replaced.
+    if (!queueOriginEquals(latestQueue.length > 0 ? queueOriginRef.current : null, queueSnapshotOrigin)) return;
+    if ((autoplaySeedRef.current?.videoId ?? null) !== (queueSnapshotSeed?.videoId ?? null)) return;
+    if ((autoplaySeedRef.current?.playlistId ?? null) !== (queueSnapshotSeed?.playlistId ?? null)) return;
 
       appended = true;
+      autoplayRetryCountRef.current = 0;
       const nextQueue = [...queueRef.current, ...additions];
       const nextAutoplayIds = new Set(autoplayIds);
       additions.forEach((track) => nextAutoplayIds.add(track.id));
 
-      const songAdditions = additions.filter((track) => track.kind !== "video");
-      const seedAdvance = songAdditions[songAdditions.length - 1] ?? additions[additions.length - 1];
-      if (seedAdvance?.videoId) {
-        const nextSeed = {
-          videoId: seedAdvance.videoId,
-          playlistId: secondPlaylistId ?? response.playlistId ?? seed.playlistId ?? null,
-        };
-        // Commit the queue members via setQueueState using the CURRENT
-        // autoplaySeed (so the seed-change cleanup branch doesn't fire and
-        // release `fetchingAutoplayRef` mid-execution, which would let the
-        // toppings useEffect kick off a parallel fetch on commit). Then
-        // bump the autoplaySeed directly through `autoplaySeedRef` +
-        // `setAutoplaySeed` — mirroring the response handler's playlist-id
-        // update path on the line above — which doesn't run cleanup, so
-        // the in-flight guard stays held throughout this body's success path.
-        setQueueState({
-          queue: nextQueue,
-          queueIndex: queueIndexRef.current,
-          queueOrigin: queueOriginRef.current,
-          autoplayTrackIds: nextAutoplayIds,
-          autoplaySeed: autoplaySeedRef.current,
-        });
+      const nextSeed = result.nextSeed;
+
+      setQueueState({
+        queue: nextQueue,
+        queueIndex: queueIndexRef.current,
+        queueOrigin: queueOriginRef.current,
+        autoplayTrackIds: nextAutoplayIds,
+        autoplaySeed: autoplaySeedRef.current,
+      });
+      if (nextSeed) {
         autoplaySeedRef.current = nextSeed;
         setAutoplaySeed(nextSeed);
-      } else {
-        setQueueState({
-          queue: nextQueue,
-          queueIndex: queueIndexRef.current,
-          queueOrigin: queueOriginRef.current,
-          autoplayTrackIds: nextAutoplayIds,
-          autoplaySeed: autoplaySeedRef.current,
-        });
       }
 
       if (autoplayAdvancePendingRef.current) {
@@ -3098,45 +3035,12 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
       }
     } catch (error) {
       console.warn("YT Music autoplay fetch failed:", error);
+      if (shouldRetry) {
+        tryScheduleRetry();
+      }
     } finally {
       clearTimeout(watchdog);
-      if (appended) {
-        // Success — clear retry state and release the in-flight flag so the
-        // toppings useEffect can re-fire if more additions are still needed.
-        autoplayRetryCountRef.current = 0;
-        autoplayAdvancePendingRef.current = false;
-        releaseFetchGuardIfCurrent();
-        if (autoplayRetryTimerRef.current) {
-          clearTimeout(autoplayRetryTimerRef.current);
-          autoplayRetryTimerRef.current = null;
-        }
-      } else if (retryScheduled) {
-        // Watchdog or a prior tryScheduleRetry call owns the next attempt.
-      } else if (shouldRetry) {
-        autoplayAdvancePendingRef.current = false;
-        // Fast-failure (response empty, all-dedup'd, network error from the
-        // watch-playlist backend) bypassed the AUTOPLAY_FETCH_TIMEOUT_MS
-        // watchdog — schedule the retry now.
-        tryScheduleRetry();
-        if (!retryScheduled) {
-          // Seed was replaced or autoplay was turned off mid-fetch — release
-          // the guard so the toppings effect can start a fresh attempt.
-          releaseFetchGuardIfCurrent();
-        }
-      } else {
-        autoplayAdvancePendingRef.current = false;
-        // Queue was already topped up, or retries are disabled — release the
-        // guard so later toppings passes are not permanently blocked.
-        releaseFetchGuardIfCurrent();
-      }
-
-      // If this attempt did not append and no retry timer owns the next
-      // pass, schedule a deferred top-up. The toppings effect will not
-      // re-fire when its deps are unchanged — a common startup failure
-      // mode when the restore load wins the race against the first fetch.
-      if (!appended && !retryScheduled && generation === autoplayFetchGenerationRef.current) {
-        ensureAutoplayTopUpRef.current(false);
-      }
+      releaseFetchGuardIfCurrent();
     }
   }, [setQueueState]);
 
@@ -3271,6 +3175,10 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
 
     autoplayAdvancePendingRef.current = false;
     stopCurrentPlayback({ capturePlayIntent: true });
+    // A fetch started for the queue we are leaving must not append into the
+    // restored snapshot. This is needed even when the seed is unchanged:
+    // setQueueState's seed comparison cannot detect that session boundary.
+    invalidateAutoplayFetch();
 
     let restoredEntry = entry;
     if (entry.queueOrigin) {
@@ -3295,7 +3203,7 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
     }
 
     applyPlaybackHistoryEntry(restoredEntry);
-  }, [stopCurrentPlayback, applyPlaybackHistoryEntry]);
+  }, [stopCurrentPlayback, applyPlaybackHistoryEntry, invalidateAutoplayFetch]);
 
   const moveQueueItem = useCallback((fromIndex: number, toIndex: number) => {
     const currentQueue = queueRef.current;
@@ -4004,6 +3912,7 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
       cycleRepeat,
       setAutoplay,
       reloadAutoplay,
+      ensureAutoplayTopUp,
       clearError,
       retry,
       getAnalyser,
@@ -4016,6 +3925,7 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
       clearPlaybackHistory,
       clearQueue,
       cycleRepeat,
+      ensureAutoplayTopUp,
       finishSeekScrub,
       getAnalyser,
       moveQueueItem,

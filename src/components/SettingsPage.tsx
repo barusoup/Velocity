@@ -99,7 +99,7 @@ function ToggleRow({
 function SectionHeader({ children }: { children: string }) {
   return (
     <div className="border-b border-white/8 pb-2">
-      <h2 className="text-xs font-bold tracking-[0.06em] text-neutral-500">
+      <h2 className="text-xs font-semibold tracking-[0.06em] text-neutral-500">
         {children}
       </h2>
     </div>
@@ -393,7 +393,7 @@ export function SettingsPage() {
           ))}
         </div>
         <p className="shrink-0 text-xs font-medium tracking-[0.04em] text-neutral-500">
-          Velocity v0.1.4 Experimental
+          Velocity v0.1.5 Experimental
         </p>
       </div>
 

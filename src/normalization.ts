@@ -46,9 +46,16 @@ function loadCache(): Record<string, LoudnessData> {
 }
 
 function trimLoudnessCache(cache: Record<string, LoudnessData>): Record<string, LoudnessData> {
-  const entries = Object.entries(cache);
-  if (entries.length <= LOUDNESS_CACHE_MAX_ENTRIES) return cache;
-  return Object.fromEntries(entries.slice(-LOUDNESS_CACHE_MAX_ENTRIES));
+  const keys = Object.keys(cache);
+  if (keys.length <= LOUDNESS_CACHE_MAX_ENTRIES) return cache;
+  // Evict the oldest entries in-place instead of rebuilding the entire
+  // object. `Object.keys` preserves insertion order, so the first N
+  // keys are the eldest.
+  const excess = keys.length - LOUDNESS_CACHE_MAX_ENTRIES;
+  for (let i = 0; i < excess; i += 1) {
+    delete cache[keys[i]!];
+  }
+  return cache;
 }
 
 function saveCache(cache: Record<string, LoudnessData>): void {

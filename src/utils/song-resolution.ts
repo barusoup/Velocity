@@ -210,6 +210,7 @@ function shouldTrustCataloguedUpload(
 function findClosestSongFromCandidates(
   video: Pick<MediaTrack, "artist" | "title" | "videoId" | "durationSeconds">,
   candidates: readonly SearchItem[],
+  options?: { skipCataloguedTrust?: boolean },
 ): SearchItem | null {
   const songs = songKindCandidates(candidates);
   if (songs.length === 0) return null;
@@ -234,7 +235,9 @@ function findClosestSongFromCandidates(
     })
     .sort((a, b) => b.score - a.score || a.index - b.index);
 
-  if (shouldTrustCataloguedUpload(video, candidates)) return null;
+  if (!options?.skipCataloguedTrust && shouldTrustCataloguedUpload(video, candidates)) {
+    return null;
+  }
 
   for (const entry of ranked) {
     const meetsArtist =
@@ -264,11 +267,12 @@ function findClosestSongFromCandidates(
 function findCanonicalSongFromCandidates(
   track: Pick<MediaTrack, "artist" | "title" | "videoId" | "durationSeconds">,
   candidates: readonly SearchItem[],
+  options?: { skipCataloguedTrust?: boolean },
 ): SearchItem | null {
   const songs = songKindCandidates(candidates);
   if (songs.length === 0) return null;
 
-  if (shouldTrustCataloguedUpload(track, candidates)) {
+  if (!options?.skipCataloguedTrust && shouldTrustCataloguedUpload(track, candidates)) {
     return null;
   }
 
@@ -379,7 +383,10 @@ export function isUnplayableStreamError(message: string): boolean {
     (lower.includes("confirm your age")) ||
     lower.includes("private video") ||
     lower.includes("video unavailable") ||
-    lower.includes("this video is not available")
+    lower.includes("this video is not available") ||
+    lower.includes("http error 403") ||
+    lower.includes("unable to download video data") ||
+    lower.includes("forbidden")
   );
 }
 
@@ -439,12 +446,12 @@ export function trackNeedsStudioSongResolution(
 export function findStudioSongForTrack(
   track: Pick<MediaTrack, "artist" | "title" | "videoId" | "durationSeconds">,
   candidates: readonly SearchItem[],
-  options?: { allowMissingCandidateDuration?: boolean },
+  options?: { allowMissingCandidateDuration?: boolean; skipCataloguedTrust?: boolean },
 ): SearchItem | null {
   const songs = candidates.filter((item) => item.kind === "song" && item.videoId);
   if (songs.length === 0) return null;
 
-  if (shouldTrustCataloguedUpload(track, candidates)) {
+  if (!options?.skipCataloguedTrust && shouldTrustCataloguedUpload(track, candidates)) {
     return null;
   }
 
@@ -496,7 +503,7 @@ export function songMetadataFromMatch(
   const artist = artistFromMetadataSource(matched);
   return {
     title: matched.title,
-    artist: artist && !isPlaceholderArtist(artist) ? artist : artist || undefined,
+    artist: artist && !isPlaceholderArtist(artist) ? artist : undefined,
     album: matched.album ?? undefined,
     albumBrowseId: matched.albumBrowseId ?? undefined,
     artistBrowseId: matched.artistBrowseId ?? undefined,
@@ -537,15 +544,12 @@ function buildResolvedAutoplayTrack(entry: MediaTrack, matched: MetadataSource):
 function trackWithResolvedVideoId(
   track: MediaTrack,
   resolvedVideoId: string,
-  matched?: MetadataSource | null,
 ): MediaTrack {
-  if (matched?.videoId) {
-    return {
-      ...track,
-      resolvedVideoId,
-      ...songMetadataFromMatch(matched),
-    };
-  }
+  // Normal playback is an audio lookup, not a metadata lookup. The selected
+  // row's release-scoped metadata is authoritative; copying fields from the
+  // playable search/album match can silently move a track to a different
+  // same-title album or soundtrack. Autoplay uses buildResolvedAutoplayTrack
+  // separately, where replacing metadata is intentional.
   return {
     ...track,
     resolvedVideoId,
@@ -587,11 +591,17 @@ async function resolveAutoplayEntryWithCandidates(
   cleanedQueryCandidates: SearchItem[],
   canonicalQueryCandidates: SearchItem[] | null,
 ): Promise<MediaTrack | null> {
+  const isExplicitMusicVideo = entry.kind === "video" || titleExplicitlyMusicVideo(entry.title);
+
   if (entry.kind === "video") {
     const matched =
-      findClosestSongFromCandidates(entry, cleanedQueryCandidates) ??
+      findClosestSongFromCandidates(entry, cleanedQueryCandidates, {
+        skipCataloguedTrust: true,
+      }) ??
       (canonicalQueryCandidates
-        ? findClosestSongFromCandidates(entry, canonicalQueryCandidates)
+        ? findClosestSongFromCandidates(entry, canonicalQueryCandidates, {
+            skipCataloguedTrust: true,
+          })
         : null);
     if (matched) return buildResolvedAutoplayTrack(entry, matched);
     const albumListingMatch = await findAlbumListingMatch(entry, cleanedQueryCandidates);
@@ -601,8 +611,12 @@ async function resolveAutoplayEntryWithCandidates(
 
   const canonicalCandidates = canonicalQueryCandidates ?? cleanedQueryCandidates;
   const canonical =
-    findCanonicalSongFromCandidates(entry, canonicalCandidates) ??
-    findCanonicalSongFromCandidates(entry, cleanedQueryCandidates);
+    findCanonicalSongFromCandidates(entry, canonicalCandidates, {
+      skipCataloguedTrust: isExplicitMusicVideo,
+    }) ??
+    findCanonicalSongFromCandidates(entry, cleanedQueryCandidates, {
+      skipCataloguedTrust: isExplicitMusicVideo,
+    });
   if (canonical?.videoId && canonical.videoId !== entry.videoId) {
     return buildResolvedAutoplayTrack(entry, canonical);
   }
@@ -610,17 +624,23 @@ async function resolveAutoplayEntryWithCandidates(
   const studioMatch =
     findStudioSongForTrack(entry, cleanedQueryCandidates, {
       allowMissingCandidateDuration: true,
+      skipCataloguedTrust: isExplicitMusicVideo,
     }) ??
     findStudioSongForTrack(entry, canonicalCandidates, {
       allowMissingCandidateDuration: true,
+      skipCataloguedTrust: isExplicitMusicVideo,
     });
   if (studioMatch?.videoId && studioMatch.videoId !== entry.videoId) {
     return buildResolvedAutoplayTrack(entry, studioMatch);
   }
 
   const relaxedMatch =
-    findClosestSongFromCandidates(entry, cleanedQueryCandidates) ??
-    findClosestSongFromCandidates(entry, canonicalCandidates);
+    findClosestSongFromCandidates(entry, cleanedQueryCandidates, {
+      skipCataloguedTrust: isExplicitMusicVideo,
+    }) ??
+    findClosestSongFromCandidates(entry, canonicalCandidates, {
+      skipCataloguedTrust: isExplicitMusicVideo,
+    });
   if (relaxedMatch) return buildResolvedAutoplayTrack(entry, relaxedMatch);
 
   const albumListingMatch = await findAlbumListingMatch(entry, cleanedQueryCandidates);
@@ -629,7 +649,7 @@ async function resolveAutoplayEntryWithCandidates(
   }
 
   if (
-    titleExplicitlyMusicVideo(entry.title) ||
+    isExplicitMusicVideo ||
     hasAutoplayVariantTitle(entry.title) ||
     trackNeedsStudioSongResolution(entry, cleanedQueryCandidates) ||
     !isCataloguedSongUpload(entry, cleanedQueryCandidates, canonicalCandidates)
@@ -716,7 +736,7 @@ export async function resolveStreamTrackAudio(track: MediaTrack): Promise<MediaT
     }
 
     if (resolvedVideoId && resolvedVideoId !== track.videoId) {
-      return trackWithResolvedVideoId(track, resolvedVideoId, matched);
+      return trackWithResolvedVideoId(track, resolvedVideoId);
     }
     return track;
   } catch (error) {
@@ -738,7 +758,7 @@ export async function resolveStreamTrackAudioFallback(track: MediaTrack): Promis
     const candidates = await searchCandidatesForTrack(track);
     const albumListingMatch = await findAlbumListingMatch(track, candidates);
     if (!albumListingMatch || albumListingMatch.videoId === track.videoId) return null;
-    return trackWithResolvedVideoId(track, albumListingMatch.videoId, albumListingMatch.row);
+    return trackWithResolvedVideoId(track, albumListingMatch.videoId);
   } catch (error) {
     console.warn("Stream playback fallback lookup failed:", error);
     return null;

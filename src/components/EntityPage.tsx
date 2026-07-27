@@ -198,7 +198,7 @@ function PlaylistPage({
   return (
     <div className="overflow-x-hidden bg-black pb-0">
       <section
-        className="relative flex min-h-[clamp(17.75rem,26vw,22rem)] items-end px-[var(--ui-page-pad)] pb-[clamp(1.35rem,2.2vw,1.9rem)] pt-[calc(var(--ui-topbar-height)+clamp(0.75rem,1.5vw,1.25rem))]"
+        className="relative flex min-h-[clamp(17.75rem,26vw,22rem)] items-end px-[var(--ui-page-pad)] pl-[var(--ui-page-left-pad)] pb-[clamp(1.35rem,2.2vw,1.9rem)] pt-[calc(var(--ui-topbar-height)+clamp(0.75rem,1.5vw,1.25rem))]"
         style={heroStyle}
       >
         <div className="flex min-w-0 flex-col gap-[clamp(1.25rem,2vw,1.75rem)] md:flex-row md:items-end">
@@ -238,7 +238,7 @@ function PlaylistPage({
       </section>
 
       <section
-        className="px-[var(--ui-page-pad)] pb-[clamp(1rem,2vw,1.4rem)] pt-[clamp(1.1rem,2.2vw,1.6rem)] transition-opacity duration-150"
+        className="px-[var(--ui-page-pad)] pl-[var(--ui-page-left-pad)] pb-[clamp(1rem,2vw,1.4rem)] pt-[clamp(1.1rem,2.2vw,1.6rem)] transition-opacity duration-150"
         style={controlStyle}
       >
         <div className="flex min-h-[3rem] flex-wrap items-center gap-4 sm:gap-5">
@@ -274,7 +274,7 @@ function PlaylistPage({
         </div>
       </section>
 
-      <section className="bg-black px-[var(--ui-page-pad)] pb-[clamp(2.5rem,3.125vw,4rem)] pt-[clamp(1.4rem,3vw,2.2rem)]">
+      <section className="bg-black px-[var(--ui-page-pad)] pl-[var(--ui-page-left-pad)] pb-[clamp(2.5rem,3.125vw,4rem)] pt-[clamp(1.4rem,3vw,2.2rem)]">
         <VirtualList
           items={displayPlaylistTracks}
           estimateSize={56}
@@ -442,7 +442,7 @@ function AlbumPage({
   return (
     <div className="overflow-x-hidden bg-black pb-0">
       <section
-        className="relative flex min-h-[clamp(17.75rem,26vw,22rem)] items-end px-[var(--ui-page-pad)] pb-[clamp(1.35rem,2.2vw,1.9rem)] pt-[calc(var(--ui-topbar-height)+clamp(0.75rem,1.5vw,1.25rem))]"
+        className="relative flex min-h-[clamp(17.75rem,26vw,22rem)] items-end px-[var(--ui-page-pad)] pl-[var(--ui-page-left-pad)] pb-[clamp(1.35rem,2.2vw,1.9rem)] pt-[calc(var(--ui-topbar-height)+clamp(0.75rem,1.5vw,1.25rem))]"
         style={heroStyle}
       >
         <div className="flex min-w-0 flex-col gap-[clamp(1.25rem,2vw,1.75rem)] md:flex-row md:items-end">
@@ -503,7 +503,7 @@ function AlbumPage({
       </section>
 
       <section
-        className="px-[var(--ui-page-pad)] pb-[clamp(1rem,2vw,1.4rem)] pt-[clamp(1.1rem,2.2vw,1.6rem)] transition-opacity duration-150"
+        className="px-[var(--ui-page-pad)] pl-[var(--ui-page-left-pad)] pb-[clamp(1rem,2vw,1.4rem)] pt-[clamp(1.1rem,2.2vw,1.6rem)] transition-opacity duration-150"
         style={controlStyle}
       >
         <div className="flex min-h-[3rem] flex-wrap items-center gap-4 sm:gap-5">
@@ -620,7 +620,7 @@ function AlbumPage({
         resolvePlaylists={resolvePlaylists}
       />
 
-      <section className="bg-black px-[var(--ui-page-pad)] pb-[clamp(2.5rem,3.125vw,4rem)] pt-[clamp(1.4rem,3vw,2.2rem)]">
+      <section className="bg-black px-[var(--ui-page-pad)] pl-[var(--ui-page-left-pad)] pb-[clamp(2.5rem,3.125vw,4rem)] pt-[clamp(1.4rem,3vw,2.2rem)]">
         {viewMode === "compact" ? (
           <TrackListHeader showPlays gridClassName={COMPACT_TRACK_GRID} dividerHidden={firstTrackHovered || firstTrackActive} />
         ) : (

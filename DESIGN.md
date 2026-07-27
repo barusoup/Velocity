@@ -310,7 +310,7 @@ Every animation has a `@media (prefers-reduced-motion)` counterpart that neutral
 - **Lucide React** (`lucide-react`) for standard UI icons
 - Custom SVG components in `src/icons.tsx` for music-service-specific logos
 - Animated wrapper components for shuffle, repeat, and volume (crossfade between states)
-- Save button has a bespoke animation sequence: disc pop → check mark pop → sparkle burst (360ms total, spring-like easing)
+- Save button has a bespoke animation sequence: disc pop → check mark pop (360ms total, spring-like easing)
 
 ---
 

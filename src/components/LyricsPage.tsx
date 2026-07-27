@@ -523,6 +523,21 @@ export function LyricsPage({
 
     if (!isActualTrackChange) return;
 
+    // Reset lyrics state synchronously before paint to prevent flashing
+    // the previous song's lyrics while the new track's lyrics load.
+    if (track?.source === "stream") {
+      const cached = acceptSyncedLyrics(hydratePersistedLyricsForTrack(track));
+      setLyrics(cached);
+      setLoading(!cached);
+    } else if (track?.source === "upload") {
+      setLyrics(null);
+      setLoading(track.findLyrics);
+    } else {
+      setLyrics(null);
+      setLoading(false);
+    }
+    setTimedOut(false);
+
     holdTopAfterTrackChangeRef.current = true;
     scrollLyricsToTop("instant");
   }, [track?.id, scrollLyricsToTop]);

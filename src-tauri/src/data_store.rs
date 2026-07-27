@@ -17,6 +17,7 @@ const COALESCE_WINDOW: Duration = Duration::from_millis(250);
 // checking the dirty flag. Prevents ticker.set_missed_tick_behavior
 // from snowballing coalesce windows after a long pause (e.g. when
 // the Tauri runtime yields the worker thread during a long sync call).
+#[allow(dead_code)]
 const COALESCE_MAX_WINDOW: Duration = Duration::from_secs(2);
 // Spin interval for `flush_blocking`'s "wait for the background
 // flush to finish" loop. Tuned to be short enough that a shutdown
@@ -135,11 +136,18 @@ impl DataStore {
                         eprintln!(
                             "[data_store] user-data.json could not be parsed; treating as empty ({e})"
                         );
+                        // Rename the corrupt file so it isn't silently lost
+                        // — users who need to recover data can find it.
+                        let backup = path.with_extension("json.corrupt");
+                        let _ = tokio::fs::rename(&path, &backup).await;
                         HashMap::new()
                     }
                 },
                 Err(e) => {
                     eprintln!("[data_store] user-data.json could not be read; treating as empty ({e})");
+                    // Put the unreadable file aside.
+                    let backup = path.with_extension("json.unreadable");
+                    let _ = tokio::fs::rename(&path, &backup).await;
                     HashMap::new()
                 }
             }
@@ -181,13 +189,34 @@ impl DataStore {
 
     /// Write a single key. Updates the in-memory map immediately and
     /// flips the dirty flag; the background flush task takes care of
-    /// reaching disk on the next coalesce boundary. Per-write fsync
-    /// is gone, which is the whole point of the optimization.
+    /// reaching disk on the next coalesce boundary.
     pub async fn write(&self, key: &str, data: &str) -> Result<(), String> {
         let parsed: Value =
             serde_json::from_str(data).unwrap_or_else(|_| Value::String(data.to_string()));
         let mut map = self.map.write().await;
         map.insert(key.to_string(), parsed);
+        drop(map);
+        self.dirty.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    /// Apply a coalesced frontend batch under one lock acquisition. The
+    /// frontend sends `None` for deletes; all mutations still share the same
+    /// atomic dirty transition and are persisted by the existing flush loop.
+    pub async fn write_batch(&self, entries: Vec<(String, Option<String>)>) -> Result<(), String> {
+        let mut map = self.map.write().await;
+        for (key, data) in entries {
+            match data {
+                Some(data) => {
+                    let parsed: Value = serde_json::from_str(&data)
+                        .unwrap_or_else(|_| Value::String(data));
+                    map.insert(key, parsed);
+                }
+                None => {
+                    map.remove(&key);
+                }
+            }
+        }
         drop(map);
         self.dirty.store(true, Ordering::Release);
         Ok(())
@@ -267,20 +296,19 @@ impl DataStore {
             // write so a re-entrant `flush_blocking` (e.g. a second
             // `ExitRequested`) can also wait on us rather than racing.
             self.writing.store(true, Ordering::Release);
-            let write_result = async {
-                let bytes = {
-                    let guard = self.map.read().await;
-                    serde_json::to_vec(&*guard).map_err(|e| format!("encode: {e}"))
-                };
-                let bytes = bytes?;
-                tokio::fs::write(&self.path, &bytes)
-                    .await
-                    .map_err(|e| format!("write: {e}"))
-            }
+            let committed = flush_json_snapshot(
+                &self.path,
+                &self.map,
+                &self.dirty,
+                &self.syncs,
+            )
             .await;
             self.writing.store(false, Ordering::Release);
-            write_result?;
-            self.syncs.fetch_add(1, Ordering::Relaxed);
+            if !committed && iteration + 1 < 16_384 {
+                // Encode failed — dirty was restored by flush_json_snapshot,
+                // so the next iteration will retry.
+                continue;
+            }
             if iteration == 16_383 {
                 eprintln!(
                     "[data_store] flush_blocking hit iteration bound; remaining dirty state will be lost"
@@ -289,6 +317,63 @@ impl DataStore {
         }
         Ok(())
     }
+}
+
+/// Try to encode the in-memory map and write it atomically to `path` via a
+/// temp file + rename.  On encode failure we restore the dirty flag so the
+/// write is retried on the next attempt; on write/rename failure we also
+/// restore dirty.
+///
+/// Returns `true` if the write was committed (syncs incremented), `false`
+/// if it failed (and dirty has been restored for a retry).
+async fn flush_json_snapshot(
+    path: &PathBuf,
+    map: &Arc<RwLock<HashMap<String, Value>>>,
+    dirty: &Arc<AtomicBool>,
+    syncs: &Arc<AtomicU64>,
+) -> bool {
+    let bytes = {
+        let guard = map.read().await;
+        match serde_json::to_vec(&*guard) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("[data_store] encode failed during flush: {e}");
+                dirty.store(true, Ordering::Release);
+                return false;
+            }
+        }
+    };
+
+    let tmp_path = path.with_extension("json.tmp");
+    if let Err(e) = tokio::fs::write(&tmp_path, &bytes).await {
+        eprintln!("[data_store] flush temp-write failed: {e}");
+        dirty.store(true, Ordering::Release);
+        return false;
+    }
+
+    // Sync the temp file to disk before the rename.
+    if let Ok(file) = tokio::fs::File::open(&tmp_path).await {
+        let _ = file.sync_all().await;
+        drop(file);
+    }
+
+    // Atomic rename (POSIX rename / Windows ReplaceExisting).
+    if let Err(e) = tokio::fs::rename(&tmp_path, path).await {
+        eprintln!("[data_store] flush rename failed: {e}");
+        let _ = tokio::fs::remove_file(&tmp_path).await;
+        dirty.store(true, Ordering::Release);
+        return false;
+    }
+
+    // Sync the parent directory so the rename survives a crash.
+    if let Some(parent) = path.parent() {
+        if let Ok(dir) = tokio::fs::File::open(parent).await {
+            let _ = dir.sync_all().await;
+        }
+    }
+
+    syncs.fetch_add(1, Ordering::Relaxed);
+    true
 }
 
 // Background flush loop. Runs once per DataStore instance, owned by
@@ -331,36 +416,8 @@ async fn coalesce_flush_loop(
             continue;
         }
         writing.store(true, Ordering::Release);
-        let write_result = async {
-            let bytes = {
-                let guard = map.read().await;
-                serde_json::to_vec(&*guard)
-            };
-            let bytes = match bytes {
-                Ok(b) => b,
-                Err(e) => {
-                    eprintln!("[data_store] encode failed during flush: {e}");
-                    return;
-                }
-            };
-            if let Err(e) = tokio::fs::write(&path, &bytes).await {
-                eprintln!("[data_store] flush write failed: {e}");
-                return;
-            }
-            syncs.fetch_add(1, Ordering::Relaxed);
-        }
-        .await;
-        // Always clear `writing`, even if the encode/write failed,
-        // so flush_blocking isn't blocked forever by a single bad
-        // write. The dirty flag remains as-is (false after the
-        // initial swap); failed writes get re-flushed on the next
-        // tick if another writer re-sets dirty.
+        flush_json_snapshot(&path, &map, &dirty, &syncs).await;
         writing.store(false, Ordering::Release);
-        let _ = write_result; // suppress unused-assignment warning
-        // Touch the unused ceiling constant so rustc doesn't
-        // complain. Keep it in scope for future tuning — bumping
-        // it doesn't require a code change elsewhere, only here.
-        let _ = COALESCE_MAX_WINDOW;
     }
 }
 
@@ -380,6 +437,14 @@ pub async fn load_all(_app: &AppHandle) -> Result<HashMap<String, String>, Strin
 pub async fn write(_app: &AppHandle, key: &str, data: &str) -> Result<(), String> {
     let store = current_store()?;
     store.write(key, data).await
+}
+
+pub async fn write_batch(
+    _app: &AppHandle,
+    entries: Vec<(String, Option<String>)>,
+) -> Result<(), String> {
+    let store = current_store()?;
+    store.write_batch(entries).await
 }
 
 pub async fn delete(_app: &AppHandle, key: &str) -> Result<(), String> {

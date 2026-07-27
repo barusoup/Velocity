@@ -314,7 +314,7 @@ export function UserPlaylistsPage({
 
   return (
     <div className="overflow-x-hidden bg-black pb-0">
-      <div className="pt-[var(--ui-topbar-height)] px-[var(--ui-page-pad)] pb-[clamp(1.5rem,2vw,2.5rem)]">
+      <div className="pt-[var(--ui-topbar-height)] px-[var(--ui-page-pad)] pl-[var(--ui-page-left-pad)] pb-[clamp(1.5rem,2vw,2.5rem)]">
         <div className="mx-auto max-w-[var(--ui-content-max)]">
           <div className="mb-6 flex flex-wrap items-center gap-4 pt-6">
             <h1 className="text-3xl font-bold text-white">Playlists</h1>

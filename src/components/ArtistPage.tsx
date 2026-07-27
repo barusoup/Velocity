@@ -24,6 +24,7 @@ import {
 } from "../api";
 import { AnimatedShuffle } from "./PlayerButtonIcons";
 import { convertFileSrc } from "@tauri-apps/api/core";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { type SavedAlbum } from "../collection";
 import {
   useIsAlbumSaved,
@@ -40,7 +41,6 @@ import {
   useReleasePlaybackState,
   useTrackPlaybackState,
 } from "../hooks/usePlayerSelectors";
-import { VirtualList } from "./VirtualList";
 import type { ArtistDetail, EntityDetail, MediaTrack, SearchItem } from "../types";
 import { extractInterestingArtworkColor, mixRgb, peekArtworkAccent, rgbToCss } from "../utils/artwork-color";
 import {
@@ -651,6 +651,9 @@ function ArtistOverview({
   const resolvedHeroArtwork = useResolvedArtworkSource([displayBanner, displayCover]);
   const accent = useArtworkAccent(resolvedHeroArtwork.src, browseId);
   const hasBanner = Boolean(resolvedHeroArtwork.src);
+  // The hero is part of the normal page layer. The overlaid sidebar simply
+  // reveals it through its rounded edge, so there is no duplicate background
+  // image or global state to keep in sync while the page scrolls.
   const playButtonBg = hasBanner
     ? rgbToCss(mixRgb(accent, { r: 255, g: 255, b: 255 }, 0.22))
     : "#ffffff";
@@ -663,7 +666,7 @@ function ArtistOverview({
 
   return (
     <div className="artist-pane w-1/2 shrink-0 min-w-0">
-      <section className="relative isolate h-[var(--ui-artist-hero)] overflow-hidden px-[var(--ui-page-pad)] pb-[clamp(1.75rem,2.5vw,2.75rem)] pt-[calc(var(--ui-topbar-height)+1rem)]" style={heroStyle}>
+      <section className="relative isolate h-[var(--ui-artist-hero)] overflow-hidden px-[var(--ui-page-pad)] pl-[var(--ui-page-left-pad)] pb-[clamp(1.75rem,2.5vw,2.75rem)] pt-[calc(var(--ui-topbar-height)+1rem)]" style={heroStyle}>
         {resolvedHeroArtwork.src && (
           <>
             <img
@@ -690,7 +693,7 @@ function ArtistOverview({
         </div>
       </section>
 
-      <section className="bg-black px-[var(--ui-page-pad)] pb-0 pt-[clamp(1.15rem,2.6vw,1.8rem)]">
+      <section className="bg-black px-[var(--ui-page-pad)] pl-[var(--ui-page-left-pad)] pb-0 pt-[clamp(1.15rem,2.6vw,1.8rem)]">
         <div className="mb-7 flex items-center gap-6 transition-opacity duration-150">
           {topSongs.length > 0 && (
             <button
@@ -1322,6 +1325,11 @@ function FullDiscographyView({
   const safeWindowControlsWidth =
     `var(${DISCOGRAPHY_WINDOW_CONTROLS_WIDTH_PROPERTY}, ${DISCOGRAPHY_WINDOW_CONTROLS_FALLBACK_WIDTH})`;
 
+  const handleStickyDrag = useCallback((e: React.MouseEvent) => {
+    if (e.target instanceof HTMLElement && e.target.closest("button, a, input, [role=\"button\"], select, textarea, [data-discography-menu-scope]")) return;
+    getCurrentWindow().startDragging();
+  }, []);
+
   const measureStickyMetrics = useCallback(() => {
     const scrollContainer = scrollContainerRef.current;
     if (!(scrollContainer instanceof HTMLElement)) return;
@@ -1406,19 +1414,24 @@ function FullDiscographyView({
     // showing any track list meant one slow request blanked the entire
     // view. Progressive updates let the visible releases fill in as soon
     // as their data is ready.
+    // Keep a large artist page from opening dozens of backend requests at
+    // once. Apart from wasting work for releases below the fold, that can
+    // make the individual entity requests appear to hang indefinitely.
     const active = new Set(targets.map((release) => release.browseId!));
-    targets.forEach((release) => {
-      const browseId = release.browseId!;
-      void getEntityDetail(browseId)
-        .then((data) => {
+    const pending = targets.map((release) => release.browseId!);
+    const loadNext = async (): Promise<void> => {
+      while (!cancelled) {
+        const browseId = pending.shift();
+        if (!browseId || !active.has(browseId)) return;
+        try {
+          const data = await getEntityDetail(browseId);
           if (cancelled || !active.has(browseId)) return;
           rememberBounded(releaseDetailMemory, browseId, data, RELEASE_DETAIL_MEMORY_MAX);
           setDetails((current) => ({
             ...current,
             [browseId]: { status: "ready", data },
           }));
-        })
-        .catch((error) => {
+        } catch (error) {
           if (cancelled || !active.has(browseId)) return;
           setDetails((current) => ({
             ...current,
@@ -1427,8 +1440,10 @@ function FullDiscographyView({
               message: error instanceof Error ? error.message : "Could not load this release.",
             },
           }));
-        });
-    });
+        }
+      }
+    };
+    void Promise.all(Array.from({ length: Math.min(6, pending.length) }, () => loadNext()));
 
     return () => {
       cancelled = true;
@@ -1453,12 +1468,19 @@ function FullDiscographyView({
     // retakes ownership of that space.
     nextHeaderHost?.setAttribute(DISCOGRAPHY_INITIALIZING_ATTRIBUTE, "");
 
+    const RESIZE_DEBOUNCE_MS = 150;
+    let resizeTimer: ReturnType<typeof setTimeout> | null = null;
     const handleResize = () => {
-      setLayoutRevision((current) => current + 1);
+      if (resizeTimer) clearTimeout(resizeTimer);
+      resizeTimer = setTimeout(() => {
+        resizeTimer = null;
+        setLayoutRevision((current) => current + 1);
+      }, RESIZE_DEBOUNCE_MS);
     };
 
     window.addEventListener("resize", handleResize);
     return () => {
+      if (resizeTimer) clearTimeout(resizeTimer);
       window.removeEventListener("resize", handleResize);
       nextHeaderHost?.removeAttribute(DISCOGRAPHY_INITIALIZING_ATTRIBUTE);
     };
@@ -1679,19 +1701,20 @@ function FullDiscographyView({
         createPortal(
           <div
             ref={stickyHeaderRef}
-            className={`artist-discography-sticky absolute inset-x-0 -top-px z-40 overflow-visible shadow-[0_10px_36px_rgba(0,0,0,0.32)] ${
+            className={`artist-discography-sticky absolute inset-x-0 -top-px z-30 overflow-visible shadow-[0_10px_36px_rgba(0,0,0,0.32)] ${
               stickyHeaderReady
                 ? "is-visible pointer-events-auto"
                 : "pointer-events-none"
             }`}
             aria-hidden={!stickyHeaderReady}
             style={{ backgroundColor: stickyBannerColor }}
+            onMouseDown={handleStickyDrag}
           >
             <div className="pt-[calc(0.5rem+1px)] transition-colors duration-300">
               <div
                 className="relative flex items-center gap-3.5"
                 style={{
-                  paddingLeft: "var(--ui-page-pad)",
+                  paddingLeft: "var(--ui-page-left-pad)",
                   paddingRight:
                     `calc(0.5rem + ${safeWindowControlsWidth} + ${stickyHistoryControlsWidth}px + ${stickyHistoryControlsGap}px)`,
                 }}
@@ -1752,7 +1775,7 @@ function FullDiscographyView({
               <div
                 className="bg-neutral-950"
                 style={{
-                  paddingLeft: "var(--ui-page-pad)",
+                  paddingLeft: "var(--ui-page-left-pad)",
                   paddingRight: "var(--ui-page-pad)",
                 }}
               >
@@ -1779,7 +1802,7 @@ function FullDiscographyView({
           headerHost,
         )}
 
-      <div className="artist-pane w-1/2 shrink-0 min-w-0 bg-black px-[var(--ui-page-pad)] pb-[calc(var(--ui-player-bottom)+var(--ui-player-height)+1.25rem)] pt-[calc(var(--ui-topbar-height)+5rem)]">
+      <div className="artist-pane w-1/2 shrink-0 min-w-0 bg-black px-[var(--ui-page-pad)] pl-[var(--ui-page-left-pad)] pb-[calc(var(--ui-player-bottom)+var(--ui-player-height)+1.25rem)] pt-[calc(var(--ui-topbar-height)+5rem)]">
         <div className="mx-auto max-w-[1120px] pt-1">
           <DiscographyHeaderControls
             artistTitle={artistTitle}
@@ -2211,12 +2234,10 @@ function DiscographyRelease({
       ) : state.status === "error" ? (
         <div className="px-4 py-5 text-sm font-semibold text-white/42">{state.message}</div>
       ) : (
-        <VirtualList
-          items={displayTracks}
-          estimateSize={56}
-          getItemKey={(track) => track.id}
-          renderItem={(track, index) => (
+        <div>
+          {displayTracks.map((track, index) => (
             <DiscographyTrackRow
+              key={`${track.id}:${index}`}
               track={track}
               index={index}
               dominoIndex={Math.min(index, 14)}
@@ -2233,8 +2254,8 @@ function DiscographyRelease({
               }}
               onHoverChange={index === 0 ? setFirstTrackHovered : undefined}
             />
-          )}
-        />
+          ))}
+        </div>
       )}
     </section>
   );

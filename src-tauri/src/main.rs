@@ -60,6 +60,16 @@ const FFMPEG_WIN_ZIP_URL: &str = "https://github.com/yt-dlp/FFmpeg-Builds/releas
 const FFMPEG_MACOS_URL: &str = "https://evermeet.cx/ffmpeg/get/zip";
 #[cfg(target_os = "macos")]
 const FFPROBE_MACOS_URL: &str = "https://evermeet.cx/ffmpeg/get/ffprobe/zip";
+/// Deno download URLs — yt-dlp needs a JavaScript runtime for YouTube extraction.
+#[cfg(target_os = "windows")]
+const DENO_WIN_URL: &str =
+    "https://github.com/denoland/deno/releases/latest/download/deno-x86_64-pc-windows-msvc.zip";
+#[cfg(target_os = "macos")]
+const DENO_MACOS_URL: &str =
+    "https://github.com/denoland/deno/releases/latest/download/deno-x86_64-apple-darwin.zip";
+#[cfg(target_os = "linux")]
+const DENO_LINUX_URL: &str =
+    "https://github.com/denoland/deno/releases/latest/download/deno-x86_64-unknown-linux-gnu.zip";
 const FFMPEG_EXPORT_UNAVAILABLE: &str = "MP3 export isn't available right now. Try again later.";
 const CLIENT_CACHE_TTL: Duration = Duration::from_secs(60 * 60 * 6);
 const STREAM_CACHE_TTL: Duration = Duration::from_secs(60 * 45);
@@ -593,19 +603,70 @@ async fn get_backend_status(app: AppHandle) -> Result<BackendStatus, String> {
 // or share-card wrappers still land in the right bucket. Each branch
 // returns a short slug used for display + telemetry.
 fn detect_playlist_service(url: &str) -> Result<&'static str, String> {
-    let lower = url.to_ascii_lowercase();
-    if lower.contains("music.youtube.com")
-        || lower.contains("youtube.com/playlist")
-        || lower.contains("youtu.be/playlist")
-    {
-        return Ok("youtube");
+    let trimmed = url.trim();
+
+    // Must start with https://
+    if !trimmed.starts_with("https://") {
+        return Err("Playlist URL must use HTTPS.".to_string());
     }
-    if lower.contains("open.spotify.com/") && lower.contains("/playlist/") {
-        return Ok("spotify");
+
+    // Strip the scheme.
+    let rest = &trimmed["https://".len()..];
+
+    // Reject credentials (user:password@host).
+    if rest.contains('@') {
+        return Err("Playlist URL must not contain credentials.".to_string());
     }
-    if lower.contains("music.apple.com/") && lower.contains("/playlist/") {
-        return Ok("apple");
+
+    // Extract host and path.
+    let (host, path) = match rest.split_once('/') {
+        Some((h, p)) => (h.to_ascii_lowercase(), format!("/{}", p)),
+        None => (rest.to_ascii_lowercase(), String::new()),
+    };
+
+    // YouTube / YouTube Music playlists.
+    //
+    // Acceptable hosts and path patterns:
+    //   music.youtube.com/playlist?list=...
+    //   music.youtube.com/watch?v=...&list=...
+    //   www.youtube.com/playlist?list=...
+    //   www.youtube.com/watch?v=...
+    //   youtu.be/playlist?list=...       (youtu.be doesn't host playlists
+    //                                      natively, but yt-dlp parses it)
+    if host == "music.youtube.com" || host == "www.youtube.com" || host == "youtube.com" {
+        let path_lower = path.to_ascii_lowercase();
+        if path_lower.starts_with("/playlist") || path_lower.contains("list=") {
+            return Ok("youtube");
+        }
+        return Err("YouTube URL does not appear to be a playlist.".to_string());
     }
+    if host == "youtu.be" {
+        // youtu.be playlists are rare — accept only explicit /playlist?list=.
+        let path_lower = path.to_ascii_lowercase();
+        if path_lower.starts_with("/playlist") && path_lower.contains("list=") {
+            return Ok("youtube");
+        }
+        return Err("YouTube short URL does not appear to be a playlist.".to_string());
+    }
+
+    // Spotify.
+    if host == "open.spotify.com" || host == "www.spotify.com" {
+        let path_lower = path.to_ascii_lowercase();
+        if path_lower.starts_with("/playlist/") || path_lower.starts_with("/intl-") && path_lower.contains("/playlist/") {
+            return Ok("spotify");
+        }
+        return Err("Spotify URL does not appear to be a playlist.".to_string());
+    }
+
+    // Apple Music.
+    if host == "music.apple.com" {
+        let path_lower = path.to_ascii_lowercase();
+        if path_lower.starts_with("/") && path_lower.contains("/playlist/") {
+            return Ok("apple");
+        }
+        return Err("Apple Music URL does not appear to be a playlist.".to_string());
+    }
+
     Err("That doesn't look like a YouTube Music, Spotify, or Apple Music playlist URL.".to_string())
 }
 
@@ -3286,6 +3347,10 @@ async fn resolve_stream(
     }
 
     let yt_dlp = ensure_yt_dlp(&app).await?;
+    let deno = ensure_deno(&app).await.ok();
+    let js_runtime_arg = deno
+        .as_ref()
+        .map(|p| format!("deno:{}", p.display()));
     let watch_url = format!("https://music.youtube.com/watch?v={video_id}");
     let cache_dir = stream_cache_dir(&app)?;
     tokio::fs::create_dir_all(&cache_dir)
@@ -3317,25 +3382,42 @@ async fn resolve_stream(
 
     remove_cached_streams(&cache_dir, &video_id).await?;
 
-    let output_template = cache_dir.join(format!("{video_id}.%(ext)s"));
+    // Never reuse the final cache filename while a player may still have the
+    // previous stream open. Windows refuses to rename over an open file
+    // (ERROR_ACCESS_DENIED), which otherwise makes a cache refresh fail.
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|value| value.as_nanos())
+        .unwrap_or(0);
+    let output_template = cache_dir.join(format!("{video_id}.{nonce}.%(ext)s"));
     let output_template = output_template.to_string_lossy().to_string();
-    let output = run_command(
-        &yt_dlp,
-        [
-            "-f",
-            "bestaudio[ext=m4a]/bestaudio/best",
-            "--no-playlist",
-            "--no-progress",
-            "--no-part",
-            "--force-overwrites",
-            "--print",
-            "after_move:filepath",
-            "-o",
-            &output_template,
-            &watch_url,
-        ],
-    )
-    .await?;
+    let mut args: Vec<&str> = vec![
+        "-f",
+        // Avoid extension/client constraints: YouTube may expose only SABR
+        // formats for one client, while another available audio format is
+        // still playable.
+        "bestaudio/best",
+        "--no-playlist",
+        "--no-progress",
+        "--no-part",
+        "--force-overwrites",
+        "--retries",
+        "3",
+        "--fragment-retries",
+        "3",
+        "--retry-sleep",
+        "exp=1:5",
+        "--print",
+        "after_move:filepath",
+        "-o",
+        &output_template,
+        &watch_url,
+    ];
+    if let Some(ref arg) = js_runtime_arg {
+        args.insert(0, "--js-runtimes");
+        args.insert(1, arg);
+    }
+    let output = run_command(&yt_dlp, args).await?;
     let file_path = output
         .lines()
         .rev()
@@ -3471,29 +3553,39 @@ async fn save_offline(app: AppHandle, video_id: String) -> Result<(), String> {
     }
 
     let yt_dlp = ensure_yt_dlp(&app).await?;
+    let deno = ensure_deno(&app).await.ok();
+    let js_runtime_arg = deno
+        .as_ref()
+        .map(|p| format!("deno:{}", p.display()));
     let watch_url = format!("https://music.youtube.com/watch?v={video_id}");
     remove_offline_video(&offline, &video_id).await?;
 
     let output_template = offline.join(format!("{video_id}.%(ext)s"));
     let output_template = output_template.to_string_lossy().to_string();
-    let output = run_command_with_timeout(
-        &yt_dlp,
-        [
-            "-f",
-            "bestaudio[ext=m4a]/bestaudio/best",
-            "--no-playlist",
-            "--no-progress",
-            "--no-part",
-            "--force-overwrites",
-            "--print",
-            "after_move:filepath",
-            "-o",
-            &output_template,
-            &watch_url,
-        ],
-        YT_DLP_DOWNLOAD_TIMEOUT,
-    )
-    .await?;
+    let mut args: Vec<&str> = vec![
+        "-f",
+        "bestaudio/best",
+        "--no-playlist",
+        "--no-progress",
+        "--no-part",
+        "--force-overwrites",
+        "--retries",
+        "3",
+        "--fragment-retries",
+        "3",
+        "--retry-sleep",
+        "exp=1:5",
+        "--print",
+        "after_move:filepath",
+        "-o",
+        &output_template,
+        &watch_url,
+    ];
+    if let Some(ref arg) = js_runtime_arg {
+        args.insert(0, "--js-runtimes");
+        args.insert(1, arg);
+    }
+    let output = run_command_with_timeout(&yt_dlp, args, YT_DLP_DOWNLOAD_TIMEOUT).await?;
 
     let file_path = output
         .lines()
@@ -3892,6 +3984,10 @@ async fn download_track_mp3(
         .ok_or_else(|| "Bundled ffmpeg has no parent directory.".to_string())?
         .to_string_lossy()
         .to_string();
+    let deno = ensure_deno(app).await.ok();
+    let js_runtime_arg = deno
+        .as_ref()
+        .map(|p| format!("deno:{}", p.display()));
     let watch_url = format!("https://music.youtube.com/watch?v={video_id}");
     let parent = target_path
         .parent()
@@ -3918,29 +4014,35 @@ async fn download_track_mp3(
     // `--embed-thumbnail` — we re-tag with lofty afterwards so the
     // user-supplied (and possibly enriched) metadata wins over whatever
     // yt-dlp scraped from the page.
-    let output = run_command_with_timeout(
-        yt_dlp,
-        [
-            "-x",
-            "--audio-format",
-            "mp3",
-            "--audio-quality",
-            "0",
-            "--ffmpeg-location",
-            &ffmpeg_dir,
-            "--no-playlist",
-            "--no-progress",
-            "--no-part",
-            "--force-overwrites",
-            "--print",
-            "after_move:filepath",
-            "-o",
-            &temp_template,
-            &watch_url,
-        ],
-        YT_DLP_DOWNLOAD_TIMEOUT,
-    )
-    .await?;
+    let mut args: Vec<&str> = vec![
+        "-x",
+        "--audio-format",
+        "mp3",
+        "--audio-quality",
+        "0",
+        "--ffmpeg-location",
+        &ffmpeg_dir,
+        "--no-playlist",
+        "--no-progress",
+        "--no-part",
+        "--force-overwrites",
+        "--retries",
+        "3",
+        "--fragment-retries",
+        "3",
+        "--retry-sleep",
+        "exp=1:5",
+        "--print",
+        "after_move:filepath",
+        "-o",
+        &temp_template,
+        &watch_url,
+    ];
+    if let Some(ref arg) = js_runtime_arg {
+        args.insert(0, "--js-runtimes");
+        args.insert(1, arg);
+    }
+    let output = run_command_with_timeout(yt_dlp, args, YT_DLP_DOWNLOAD_TIMEOUT).await?;
     let produced = output
         .lines()
         .rev()
@@ -5157,13 +5259,21 @@ async fn analyze_loudness_slice(
 
 #[tauri::command]
 async fn detect_leading_silence(app: AppHandle, file_path: String) -> Result<LeadingSilenceData, String> {
-    const LEADING_SILENCE_ANALYSIS_VERSION: u8 = 2;
+    // Bump LEADING_SILENCE_ANALYSIS_VERSION whenever detection parameters
+    // change to invalidate stale cached results on the frontend.
+    const LEADING_SILENCE_ANALYSIS_VERSION: u8 = 3;
     const ANALYSIS_MAX_SECONDS: f64 = 45.0;
-    const SILENCE_NOISE_DB: f64 = -35.0;
+    // Reduced threshold: -50 dB is much less likely to classify quiet music,
+    // fade-ins, tape hiss, or low-level intros as digital silence.
+    const SILENCE_NOISE_DB: f64 = -50.0;
     const SILENCE_MIN_DURATION: f64 = 0.75;
     const MIN_SKIP_SECONDS: f64 = 1.0;
     const MAX_SKIP_SECONDS: f64 = 30.0;
     const LEADING_SILENCE_START_TOLERANCE: f64 = 0.05;
+    // Pre-roll in seconds: after detecting the end of leading silence, start
+    // playback SHORTLY BEFORE that point so quiet attacks and fade-ins are
+    // fully audible instead of being cut off by the silence detector.
+    const SILENCE_END_PREROLL: f64 = 0.15;
 
     fn empty_leading_silence_data() -> LeadingSilenceData {
         LeadingSilenceData {
@@ -5245,10 +5355,13 @@ async fn detect_leading_silence(app: AppHandle, file_path: String) -> Result<Lea
     }
 
     let skip_seconds = leading_skip.and_then(|seconds| {
-        if seconds < MIN_SKIP_SECONDS {
+        // Apply a short pre-roll before the silence_end so quiet attacks and
+        // fade-ins are audible rather than being cut off.
+        let with_preroll = (seconds - SILENCE_END_PREROLL).max(0.0);
+        if with_preroll < MIN_SKIP_SECONDS {
             None
         } else {
-            Some(seconds.min(MAX_SKIP_SECONDS))
+            Some(with_preroll.min(MAX_SKIP_SECONDS))
         }
     });
 
@@ -5346,6 +5459,68 @@ fn yt_dlp_download_url() -> &'static str {
 
 fn yt_dlp_path(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(app_bin_dir(app)?.join(yt_dlp_executable_name()))
+}
+
+fn deno_executable_name() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "deno.exe"
+    } else {
+        "deno"
+    }
+}
+
+fn deno_download_url() -> &'static str {
+    #[cfg(target_os = "windows")]
+    { DENO_WIN_URL }
+    #[cfg(target_os = "macos")]
+    { DENO_MACOS_URL }
+    #[cfg(target_os = "linux")]
+    { DENO_LINUX_URL }
+}
+
+fn deno_path(app: &AppHandle) -> Result<PathBuf, String> {
+    Ok(app_bin_dir(app)?.join(deno_executable_name()))
+}
+
+async fn ensure_deno(app: &AppHandle) -> Result<PathBuf, String> {
+    let path = deno_path(app)?;
+    if path.exists() {
+        #[cfg(unix)]
+        prepare_downloaded_binary(&path).await?;
+        return Ok(path);
+    }
+
+    let parent = path
+        .parent()
+        .ok_or_else(|| "Failed to determine deno directory.".to_string())?;
+    tokio::fs::create_dir_all(parent)
+        .await
+        .map_err(|error| error.to_string())?;
+
+    let response = HTTP
+        .get(deno_download_url())
+        .send()
+        .await
+        .map_err(|error| format!("Failed to download deno: {error}"))?;
+
+    if !response.status().is_success() {
+        return Err(format!(
+            "Failed to download deno: HTTP {}",
+            response.status()
+        ));
+    }
+
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|error| format!("Failed to read deno download: {error}"))?;
+
+    // Deno ships as a zip containing a single binary.
+    extract_binary_from_zip(&bytes, &path, deno_executable_name())?;
+
+    prepare_downloaded_binary(&path).await?;
+
+    Ok(path)
 }
 
 #[cfg(unix)]
@@ -6108,6 +6283,12 @@ fn parse_search_response(query: &str, value: &Value) -> SearchResponse {
             .and_then(|value| value.get("contents"))
             .and_then(Value::as_array)
         {
+            if item
+                .get("musicShelfRenderer")
+                .is_some_and(is_more_from_youtube_shelf)
+            {
+                continue;
+            }
             collect_search_rows_from_entries(shelf_contents, &mut results, &mut seen);
             continue;
         }
@@ -6142,6 +6323,23 @@ fn parse_search_response(query: &str, value: &Value) -> SearchResponse {
 
 fn should_include_search_item(item: &SearchItem) -> bool {
     item.kind != "playlist" && item.kind != "video"
+}
+
+#[tauri::command]
+async fn write_user_data_batch(
+    app: AppHandle,
+    entries: Vec<(String, Option<String>)>,
+) -> Result<(), String> {
+    data_store::write_batch(&app, entries).await
+}
+
+fn is_more_from_youtube_shelf(value: &Value) -> bool {
+    value
+        .get("header")
+        .and_then(|header| header.get("musicShelfHeaderRenderer"))
+        .and_then(|header| header.get("title"))
+        .and_then(text_from_value)
+        .is_some_and(|title| title.trim().eq_ignore_ascii_case("more from youtube"))
 }
 
 fn effective_type_label<'a>(
@@ -8233,6 +8431,7 @@ fn main() {
             cancel_save_export,
             load_all_user_data,
             write_user_data,
+            write_user_data_batch,
             delete_user_data,
             clear_all_user_data_backend,
             import_external_playlist,
@@ -8680,6 +8879,34 @@ mod tests {
                                                     }
                                                 ]
                                             }
+                                        },
+                                        {
+                                            "musicShelfRenderer": {
+                                                "header": {
+                                                    "musicShelfHeaderRenderer": {
+                                                        "title": { "runs": [{ "text": "MORE FROM YOUTUBE" }] }
+                                                    }
+                                                },
+                                                "contents": [
+                                                    {
+                                                        "musicResponsiveListItemRenderer": {
+                                                            "flexColumns": [
+                                                                {
+                                                                    "musicResponsiveListItemFlexColumnRenderer": {
+                                                                        "text": { "runs": [{ "text": "YouTube Version" }] }
+                                                                    }
+                                                                },
+                                                                {
+                                                                    "musicResponsiveListItemFlexColumnRenderer": {
+                                                                        "text": { "runs": [{ "text": "Song • Radiohead" }] }
+                                                                    }
+                                                                }
+                                                            ],
+                                                            "playlistItemData": { "videoId": "youtube-version" }
+                                                        }
+                                                    }
+                                                ]
+                                            }
                                         }
                                     ]
                                 }
@@ -8699,6 +8926,7 @@ mod tests {
         assert!(titles.contains(&"Creep"));
         assert!(titles.contains(&"Paranoid Android"));
         assert!(titles.contains(&"OK Computer"));
+        assert!(!titles.contains(&"YouTube Version"));
     }
 
     #[test]

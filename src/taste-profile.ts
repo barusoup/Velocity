@@ -59,11 +59,16 @@ export type DailyRecommendations = {
   tracks: MediaTrack[];
 };
 
+export type RecommendationHistoryEntry = {
+  videoId: string;
+  ts: number;
+};
+
 export type TasteProfileState = {
   entries: Record<string, TasteProfileEntry>;
   lastProfileChangeAt: number;
   rediscoveryPool: string[];
-  recommendationHistory: string[];
+  recommendationHistory: Array<string | RecommendationHistoryEntry>;
   dailyRecommendations: DailyRecommendations | null;
   lastRecommendationRefreshAt: number | null;
 };
@@ -419,6 +424,11 @@ export function storeDailyRecommendations(tracks: MediaTrack[], now = Date.now()
     .map((track) => tasteProfileVideoId(track))
     .filter((id): id is string => Boolean(id));
 
+  const timestampedEntries: RecommendationHistoryEntry[] = videoIds.map((videoId) => ({
+    videoId,
+    ts: now,
+  }));
+
   const next: TasteProfileState = {
     ...state,
     dailyRecommendations: {
@@ -426,7 +436,7 @@ export function storeDailyRecommendations(tracks: MediaTrack[], now = Date.now()
       tracks: dedupedTracks,
     },
     lastRecommendationRefreshAt: now,
-    recommendationHistory: [...state.recommendationHistory, ...videoIds].slice(-400),
+    recommendationHistory: [...state.recommendationHistory, ...timestampedEntries].slice(-400),
   };
   saveTasteProfile(next);
   return next;
@@ -438,6 +448,15 @@ export function getCachedDailyRecommendations(now = Date.now()): MediaTrack[] | 
   return dedupeTracksBySong(state.dailyRecommendations.tracks).filter(
     (track) => !isLikelyMusicVideoTrack(track),
   );
+}
+
+export function invalidateDailyRecommendations(): void {
+  const state = loadTasteProfile();
+  if (state.dailyRecommendations) {
+    state.dailyRecommendations = null;
+    state.lastRecommendationRefreshAt = null;
+    saveTasteProfile(state);
+  }
 }
 
 /** Video ids from the immediately previous day's Today's Picks shelf, if any. */
@@ -459,17 +478,39 @@ export function isKnownTasteSong(videoId: string | null | undefined): boolean {
   if (!videoId) return false;
   const entries = loadTasteProfile().entries;
   if (entries[videoId]) return true;
-  return Object.values(entries).some((entry) =>
-    streamIdentityVideoIds(entryToTrack(entry)).includes(videoId),
-  );
+  // Fast path: check if the videoId appears as a resolvedVideoId in any
+  // entry without loading every entry's full identity set. The direct
+  // key lookup above already covers the common case; this linear scan
+  // only fires for cross-id matches (e.g. resolved vs raw videoId).
+  for (const entry of Object.values(entries)) {
+    if (entry.resolvedVideoId === videoId) return true;
+    // Only do the full streamIdentityVideoIds check when the entry has
+    // both videoId and resolvedVideoId (the expensive case).
+    if (entry.videoId && entry.resolvedVideoId && entry.videoId !== entry.resolvedVideoId) {
+      const ids = streamIdentityVideoIds(entryToTrack(entry));
+      if (ids.includes(videoId)) return true;
+    }
+  }
+  return false;
 }
 
+/**
+ * Video ids seen in recent daily recommendations, filtered by the time
+ * cutoff (`days` days before `now`). Uses `recommendationHistory` entries
+ * that include timestamps, with fallback for legacy string-only entries.
+ */
 export function getRecentRecommendationVideoIds(days = 7, now = Date.now()): Set<string> {
   const state = loadTasteProfile();
   const known = new Set(Object.keys(state.entries));
-  state.recommendationHistory.forEach((id) => known.add(id));
-  void days;
-  void now;
+  const cutoff = now - days * 24 * 60 * 60 * 1000;
+  for (const entry of state.recommendationHistory) {
+    if (typeof entry === "string") {
+      // Legacy string-only entry — include it unconditionally.
+      known.add(entry);
+    } else if (entry?.ts >= cutoff) {
+      known.add(entry.videoId);
+    }
+  }
   return known;
 }
 

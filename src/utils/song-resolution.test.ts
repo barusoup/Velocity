@@ -158,6 +158,46 @@ describe("song-resolution remaster handling", () => {
 });
 
 describe("resolveStreamTrackAudio", () => {
+  it("preserves the selected release metadata when resolving alternate playback audio", async () => {
+    mockedSearchMusic.mockResolvedValue({
+      query: "Radiohead How can you be sure?",
+      results: [{
+        id: "yt:other-release",
+        kind: "song",
+        title: "How can you be sure?",
+        subtitle: "Radiohead",
+        artist: "Radiohead",
+        album: "Nowhere",
+        videoId: "other-release",
+        durationSeconds: 180,
+      }],
+    });
+
+    const selected: MediaTrack = {
+      id: "yt:selected:fake-plastic-trees",
+      kind: "video",
+      title: "How can you be sure?",
+      artist: "Radiohead",
+      album: "Fake Plastic Trees",
+      albumBrowseId: "selected-album",
+      cover: "selected-cover",
+      videoId: "selected-video",
+      durationSeconds: 180,
+      source: "stream",
+    };
+
+    const resolved = await resolveStreamTrackAudio(selected);
+
+    expect(resolved).toMatchObject({
+      id: selected.id,
+      title: selected.title,
+      artist: selected.artist,
+      album: selected.album,
+      albumBrowseId: selected.albumBrowseId,
+      cover: selected.cover,
+      resolvedVideoId: "other-release",
+    });
+  });
   beforeEach(() => {
     mockedSearchMusic.mockReset();
     mockedGetEntityDetail.mockReset();

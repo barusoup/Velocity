@@ -99,7 +99,7 @@ export function Sidebar({
 
   return (
     <aside
-      className={`sidebar-shell relative z-40 flex h-full min-h-0 shrink-0 flex-col overflow-hidden border-r      ${view.name === "lyrics" ? "border-white/5 bg-black/35" : "border-neutral-900 bg-black"} transition-[width,border-color] ${SIDEBAR_TRANSITION} ${
+      className={`sidebar-shell absolute inset-y-0 left-0 z-40 flex h-full min-h-0 flex-col overflow-hidden rounded-r-[20px] border-r      ${view.name === "lyrics" ? "border-white/5 bg-black/35" : "border-neutral-900 bg-black"} transition-[width,border-color] ${SIDEBAR_TRANSITION} ${
         expanded ? "w-[var(--ui-sidebar-open)]" : "w-[var(--ui-sidebar-closed)]"
       }`}
       style={{ willChange: "width", contain: "size layout" }}
@@ -1135,7 +1135,7 @@ export function TopBar({
   };
 
   return (
-    <div className="pointer-events-none absolute left-0 right-0 top-0 z-50 flex">
+    <div className="pointer-events-none absolute left-0 right-0 top-0 z-50 flex pl-[var(--ui-sidebar-current)]">
       <div
         ref={topbarSensorRef}
         className="relative flex min-h-[var(--ui-topbar-height)] flex-1 items-center justify-center px-[clamp(0.75rem,1.8vw,1.5rem)] py-3"

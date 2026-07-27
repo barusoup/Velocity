@@ -271,7 +271,7 @@ export function UserPlaylistPage({
 
   if (!playlist) {
     return (
-      <div className="pt-[var(--ui-topbar-height)] px-[var(--ui-page-pad)] pb-12">
+      <div className="pt-[var(--ui-topbar-height)] px-[var(--ui-page-pad)] pl-[var(--ui-page-left-pad)] pb-12">
         <div className="mx-auto max-w-[var(--ui-content-max)]">
           <EmptyPlaylistState />
         </div>
@@ -297,7 +297,7 @@ export function UserPlaylistPage({
       />
 
       <section
-        className="px-[var(--ui-page-pad)] pb-[clamp(1rem,2vw,1.4rem)] pt-[clamp(1.1rem,2.2vw,1.6rem)] transition-opacity duration-150"
+        className="px-[var(--ui-page-pad)] pl-[var(--ui-page-left-pad)] pb-[clamp(1rem,2vw,1.4rem)] pt-[clamp(1.1rem,2.2vw,1.6rem)] transition-opacity duration-150"
         style={controlStyle}
       >
         <div className="flex min-h-[3rem] flex-wrap items-center gap-4 sm:gap-5">
@@ -406,7 +406,7 @@ export function UserPlaylistPage({
         />
       )}
 
-      <section className="bg-black px-[var(--ui-page-pad)] pb-[clamp(2.5rem,3.125vw,4rem)] pt-[clamp(1.4rem,3vw,2.2rem)]">
+      <section className="bg-black px-[var(--ui-page-pad)] pl-[var(--ui-page-left-pad)] pb-[clamp(2.5rem,3.125vw,4rem)] pt-[clamp(1.4rem,3vw,2.2rem)]">
         <TrackListHeader showAlbum showDateAdded dividerHidden={firstTrackHovered || firstTrackActive} />
 
         {tracks.length === 0 ? (
@@ -546,7 +546,7 @@ function PlaylistHero({
 
   return (
     <section
-      className="relative flex min-h-[clamp(17.75rem,26vw,22rem)] items-end px-[var(--ui-page-pad)] pb-[clamp(1.35rem,2.2vw,1.9rem)] pt-[calc(var(--ui-topbar-height)+clamp(0.75rem,1.5vw,1.25rem))]"
+      className="relative flex min-h-[clamp(17.75rem,26vw,22rem)] items-end px-[var(--ui-page-pad)] pl-[var(--ui-page-left-pad)] pb-[clamp(1.35rem,2.2vw,1.9rem)] pt-[calc(var(--ui-topbar-height)+clamp(0.75rem,1.5vw,1.25rem))]"
       style={heroStyle}
     >
       <div className="flex min-w-0 flex-col gap-[clamp(1.25rem,2vw,1.75rem)] md:flex-row md:items-end">

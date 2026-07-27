@@ -153,7 +153,24 @@ export function scheduleOfflineSyncForTrack(
       updateSongMetadata(track.id, metadataUpdates);
     }
 
-    await saveOffline(downloadId);
+    // A resolved YouTube id can still be rejected by the CDN (403s are
+    // common for music-video uploads). Try the other known identities before
+    // giving up so one stale/restricted id does not poison offline sync.
+    const offlineIds = [
+      downloadId,
+      ...streamIdentityVideoIds(track).filter((id) => id !== downloadId),
+    ];
+    let offlineError: unknown = null;
+    for (const candidate of offlineIds) {
+      try {
+        await saveOffline(candidate);
+        offlineError = null;
+        break;
+      } catch (error) {
+        offlineError = error;
+      }
+    }
+    if (offlineError) throw offlineError;
 
     const lyricsTrack: MediaTrack = {
       ...track,
