@@ -1,6 +1,8 @@
 use once_cell::sync::Lazy;
 use std::sync::Mutex as StdMutex;
-use tauri::{AppHandle, Manager, PhysicalPosition, PhysicalSize, WebviewWindow};
+use tauri::{AppHandle, PhysicalPosition, PhysicalSize, WebviewWindow};
+#[cfg(windows)]
+use tauri::Manager;
 
 static SAVED_WINDOW_BOUNDS: Lazy<
     StdMutex<Option<(PhysicalSize<u32>, PhysicalPosition<i32>)>>,
@@ -8,11 +10,13 @@ static SAVED_WINDOW_BOUNDS: Lazy<
 
 static APP_FULLSCREEN: Lazy<StdMutex<bool>> = Lazy::new(|| StdMutex::new(false));
 
+#[cfg(windows)]
 static WAS_MAXIMIZED_BEFORE_FULLSCREEN: Lazy<StdMutex<bool>> =
     Lazy::new(|| StdMutex::new(false));
 
 static APP_HANDLE: Lazy<StdMutex<Option<AppHandle>>> = Lazy::new(|| StdMutex::new(None));
 
+#[cfg(windows)]
 const MAIN_WINDOW_LABEL: &str = "main";
 
 #[cfg(windows)]
@@ -24,6 +28,7 @@ pub fn init(app: AppHandle) {
     }
 }
 
+#[cfg(windows)]
 fn main_window() -> Option<WebviewWindow> {
     let handle = APP_HANDLE.lock().ok()?.clone()?;
     handle.get_webview_window(MAIN_WINDOW_LABEL)
@@ -80,6 +85,7 @@ pub fn is_app_fullscreen() -> Result<bool, String> {
         .map_err(|e| e.to_string())
 }
 
+#[cfg(windows)]
 fn restore_saved_bounds(window: &WebviewWindow) -> Result<(), String> {
     let saved = SAVED_WINDOW_BOUNDS
         .lock()
@@ -181,9 +187,14 @@ fn apply_pseudo_fullscreen(window: &WebviewWindow) -> Result<(), String> {
 
 #[cfg(windows)]
 fn exit_pseudo_fullscreen(window: &WebviewWindow) -> Result<(), String> {
-    // Restore shadow before applying saved outer bounds so Tauri measures
-    // size the same way as when remember_window_bounds captured them.
-    window.set_shadow(true).map_err(|e| e.to_string())?;
+    // Keep shadow disabled to avoid the 1px light-grey DWM resize border
+    // that shows as a weird outline around the black window (user report).
+    // The previous `set_shadow(true)` restored the native frame and its
+    // ~7px NCCALCSIZE inset, which is exactly the outline visible in the
+    // screenshot. With `shadow: false` in tauri.conf the window never has
+    // that border, and measurement stays consistent because both capture
+    // and restore use the same shadow state.
+    window.set_shadow(false).map_err(|e| e.to_string())?;
 
     let should_remaximize = WAS_MAXIMIZED_BEFORE_FULLSCREEN
         .lock()
@@ -304,7 +315,7 @@ unsafe fn restore_under_cursor(hwnd: windows::Win32::Foundation::HWND) -> Result
     .map_err(|e| e.to_string())?;
 
     if let Some(window) = main_window() {
-        window.set_shadow(true).map_err(|e| e.to_string())?;
+        window.set_shadow(false).map_err(|e| e.to_string())?;
     }
 
     Ok(())

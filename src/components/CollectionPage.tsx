@@ -32,7 +32,7 @@ import { usePlayer, usePlayerActions } from "../player";
 import { useContextTrackTarget } from "../hooks/useContextTrackTarget";
 import { useCollectionMetadataBackfill } from "../hooks/useCollectionMetadataBackfill";
 import { useTrackPlaybackState } from "../hooks/usePlayerSelectors";
-import { VirtualList } from "./VirtualList";
+import { UnifiedTrackList } from "./UnifiedTrackList";
 import { useCollectionActions, useCollectionData } from "../collection";
 import { useIsTrackSaved, useToggleTrackSave } from "../hooks/useCollectionSelectors";
 import { getArtistDetail, getEntityDetail, importTracks, updateImportedTrackMetadata, extractFileMetadata } from "../api";
@@ -260,18 +260,43 @@ export function CollectionPage(props: CollectionPageProps) {
   );
 
   useEffect(() => {
+    // Defer bulk preload to idle so it never competes with the first paint
+    // or tab switch. The previous effect eagerly preloaded every cover in
+    // the entire collection (albums+songs+artists+local) on every mutation,
+    // causing a burst of cacheArtwork IPCs and disk writes that froze the
+    // tab switch animation. We now only preload the active tab via
+    // preloadTabArtwork, and this effect is kept as a low-priority idle
+    // warm-up limited to 20 covers per type.
+    let handle: number | null = null;
     const controller = new AbortController();
-    preloadArtworkUrls(
-      [
-        ...savedAlbums.map((album) => album.cover),
-        ...savedArtists.map((artist) => artist.cover),
-        ...savedArtists.map((artist) => artist.banner),
-        ...savedSongs.map((song) => song.cover),
-        ...sortedLocal.map((track) => track.cover),
-      ],
-      { signal: controller.signal },
-    );
-    return () => controller.abort();
+    const run = () => {
+      const urls = [
+        ...savedAlbums.slice(0, 20).map((album) => album.cover),
+        ...savedArtists.slice(0, 20).flatMap((artist) => [artist.cover, artist.banner]),
+        ...savedSongs.slice(0, 20).map((song) => song.cover),
+        ...sortedLocal.slice(0, 20).map((track) => track.cover),
+      ];
+      preloadArtworkUrls(urls, { signal: controller.signal, concurrency: 3 });
+    };
+    if (typeof window.requestIdleCallback === "function") {
+      handle = window.requestIdleCallback(run, { timeout: 2000 });
+    } else {
+      handle = window.setTimeout(run, 600) as unknown as number;
+    }
+    return () => {
+      controller.abort();
+      if (handle !== null) {
+        if (typeof window.cancelIdleCallback === "function") {
+          try {
+            window.cancelIdleCallback(handle);
+          } catch {
+            window.clearTimeout(handle);
+          }
+        } else {
+          window.clearTimeout(handle);
+        }
+      }
+    };
   }, [savedAlbums, savedArtists, savedSongs, sortedLocal]);
 
   // Tab switches update state locally only — no history entry, so page
@@ -450,7 +475,7 @@ export function CollectionPage(props: CollectionPageProps) {
   }, [pendingRows, importing, props]);
 
   return (
-    <div className="collection-page relative pt-8">
+    <div className="collection-page relative pt-8 pb-8">
       {/* Tab + upload header row */}
       <div className="flex items-center justify-between gap-4 px-3 pb-4">
         <div
@@ -703,7 +728,7 @@ function SavedAlbumsGrid({
         };
 
         return (
-          <div key={album.browseId}>
+          <div key={album.browseId} className="relative">
             <ReleaseCard
               item={releaseItem}
               onOpen={() =>
@@ -987,12 +1012,14 @@ function SavedSongsList({
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="8.5" /><path d="M12 8.3v4.2" /></svg>
         </div>
       </div>
-      <VirtualList
-        items={songs}
+      <UnifiedTrackList
+        tracks={songs}
+        variant="collection"
         enabled={listEnabled}
         estimateSize={viewMode === "compact" ? 44 : 56}
         getItemKey={(track) => track.id}
-        renderItem={(track, index) => (
+        showHeader={false}
+        renderTrack={(track, index) => (
           <CollectionSongRow
             track={track}
             index={index}
@@ -1118,12 +1145,14 @@ function LocalUploadsList({
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="8.5" /><path d="M12 8.3v4.2" /></svg>
         </div>
       </div>
-      <VirtualList
-        items={tracks}
+      <UnifiedTrackList
+        tracks={tracks}
+        variant="collection"
         enabled={listEnabled}
         estimateSize={viewMode === "compact" ? 44 : 56}
         getItemKey={(track) => track.id}
-        renderItem={(track, index) => (
+        showHeader={false}
+        renderTrack={(track, index) => (
           <LocalTrackRow
             track={track}
             index={index}
@@ -1402,7 +1431,7 @@ function CollectionRowShell({
       <div className="hidden items-center justify-end text-xs tabular-nums text-neutral-400 sm:flex">
         {formatPlayCount(track.playCount)}
       </div>
-      <div className="flex items-center justify-end text-xs tabular-nums text-neutral-400">
+      <div className="flex items-center justify-end gap-2 text-xs tabular-nums text-neutral-400">
         {formatRowDuration(track.durationSeconds)}
       </div>
     </div>

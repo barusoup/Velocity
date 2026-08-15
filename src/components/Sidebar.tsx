@@ -37,7 +37,7 @@ import { useSetting } from "../settings";
 import { DEFAULT_SEARCH_FILTERS, SearchFilterPanel, type SearchFilters, getActiveFilterCount } from "./SearchFilters";
 import type { UserPlaylist } from "../playlists";
 import type { SortMode, SortDirection } from "../playlists";
-import { DefaultArtwork } from "./Shared";
+import { capThumbnailUrl, DefaultArtwork } from "./Shared";
 import { PlaylistContextMenu } from "./PlaylistContextMenu";
 
 const SIDEBAR_TRANSITION = "duration-[220ms] ease-[cubic-bezier(0.22,1,0.36,1)]";
@@ -68,6 +68,7 @@ export function Sidebar({
   view,
   onNavigate,
   expanded,
+  hidden = false,
   onToggle,
   playlists,
   playlistsSortMode,
@@ -81,6 +82,7 @@ export function Sidebar({
   view: View;
   onNavigate: (view: View) => void;
   expanded: boolean;
+  hidden?: boolean;
   onToggle: () => void;
   playlists: UserPlaylist[];
   playlistsSortMode: SortMode;
@@ -93,14 +95,43 @@ export function Sidebar({
 }) {
   const showHomeMenu = useSetting("showHomeMenu");
 
+  // On narrow screens the collapsed sidebar is a bare rail; the outward
+  // bottom curve (the crescent) is only meaningful while the sidebar shows
+  // a real bottom edge, so hide it there.
+  const [narrowCollapsed, setNarrowCollapsed] = useState(() =>
+    window.matchMedia("(max-width: 760px)").matches,
+  );
+  useEffect(() => {
+    const mq = window.matchMedia("(max-width: 760px)");
+    const onChange = () => setNarrowCollapsed(mq.matches);
+    mq.addEventListener("change", onChange);
+    return () => mq.removeEventListener("change", onChange);
+  }, []);
+
   // `expanded` drives the sidebar width animation. Content visibility is
   // controlled via opacity transitions so the labels fade in/out in sync
   // with the sidebar opening/closing rather than teleporting at the end.
+  //
+  // While `hidden` on the lyrics page the sidebar renders its compact
+  // (collapsed) content. That way when it unfolds back out, the labels and
+  // row widths animate in the same way a normal expand does — rendering
+  // the full expanded layout instead would clip full-opacity text
+  // mid-letter while the width scales up from zero.
+  const compact = !expanded || hidden;
+
+  // The outward bottom-right curve. Lives OUTSIDE the <aside> (which is
+  // overflow-hidden, so a clipped child wedge would artifact) and follows
+  // the animated sidebar width so it glides in sync with collapse/expand.
+  // Overlaps the player bar by 1px (-bottom-px + 21px + 20→21 clip) so the
+  // seam between crescent and player bar is seamless (covers subpixel/DPR
+  // hairline gaps). See PlayerBar -mt-px counterpart.
+  const showCrescent = !hidden && !(narrowCollapsed && !expanded);
 
   return (
+    <>
     <aside
-      className={`sidebar-shell absolute inset-y-0 left-0 z-40 flex h-full min-h-0 flex-col overflow-hidden rounded-r-[20px] border-r      ${view.name === "lyrics" ? "border-white/5 bg-black/35" : "border-neutral-900 bg-black"} transition-[width,border-color] ${SIDEBAR_TRANSITION} ${
-        expanded ? "w-[var(--ui-sidebar-open)]" : "w-[var(--ui-sidebar-closed)]"
+      className={`sidebar-shell absolute inset-y-0 left-0 z-40 flex h-full min-h-0 flex-col overflow-hidden bg-neutral-950 transition-[width] ${SIDEBAR_TRANSITION} ${
+        hidden ? "w-0" : expanded ? "w-[var(--ui-sidebar-open)]" : "w-[var(--ui-sidebar-closed)]"
       }`}
       style={{ willChange: "width", contain: "size layout" }}
       aria-label="Primary"
@@ -159,7 +190,7 @@ export function Sidebar({
             active={view.name === "home"}
             onClick={() => onNavigate({ name: "home" })}
             icon={<Home size={18} strokeWidth={1.8} />}
-            compact={!expanded}
+            compact={compact}
           />
         </AnimatedSidebarNavItem>
         <SidebarLink
@@ -167,7 +198,7 @@ export function Sidebar({
           active={view.name === "collection"}
           onClick={() => onNavigate({ name: "collection" })}
           icon={<Book size={18} />}
-          compact={!expanded}
+          compact={compact}
         />
       </nav>
 
@@ -187,7 +218,7 @@ export function Sidebar({
         onSetSortMode={onSetPlaylistsSortMode}
         onSetSortDirection={onSetPlaylistsSortDirection}
         onCreate={onCreatePlaylist}
-        expanded={expanded}
+        expanded={!compact}
         onNavigate={onNavigate}
       />
 
@@ -195,7 +226,7 @@ export function Sidebar({
         <PlaylistsSection
           playlists={playlists}
           activeView={view}
-          expanded={expanded}
+          expanded={!compact}
           onNavigate={onNavigate}
           sortMode={playlistsSortMode}
           onDeletePlaylist={onDeletePlaylist}
@@ -209,17 +240,26 @@ export function Sidebar({
         // of the sidebar (last child in the flex column) with shrink-0
         // to prevent compression, while the scroll container above it
         // fills all remaining space via flex-1.
-        className="w-[var(--ui-sidebar-open)] pb-1.5 shrink-0"
+        className="w-[var(--ui-sidebar-open)] pb-0.5 shrink-0"
       >
         <SidebarLink
           label="Settings"
           active={view.name === "settings"}
           onClick={() => onNavigate({ name: "settings" })}
           icon={<IconSettings size={18} />}
-          compact={!expanded}
+          compact={compact}
+          className="mb-0"
         />
       </div>
     </aside>
+    {showCrescent && (
+      <div
+        aria-hidden
+        className="pointer-events-none absolute -bottom-px left-[var(--ui-sidebar-current)] z-40 h-[21px] w-[20px] bg-neutral-950"
+        style={{ clipPath: "path('M 0 0 C 0 20 14 20 20 20 L 20 21 L 0 21 Z')" }}
+      />
+    )}
+    </>
   );
 }
 
@@ -364,7 +404,7 @@ function PlaylistsHeader({
         compact "+" button below.
       */}
       <div
-        className={`flex items-center gap-1 ml-[calc((var(--ui-sidebar-rail)-2.5rem)/2)] mr-4 h-8 transition-opacity ${SIDEBAR_TRANSITION} ${
+        className={`flex items-center gap-1 ml-[calc((var(--ui-sidebar-rail)-2.5rem)/2)] mr-[calc((var(--ui-sidebar-rail)-2.5rem)/2)] h-8 transition-opacity ${SIDEBAR_TRANSITION} ${
           expanded ? "opacity-100" : "opacity-0 pointer-events-none"
         }`}
       >
@@ -642,7 +682,7 @@ function PlaylistsSidebarItem({
         className={`group relative z-10 ml-[calc((var(--ui-sidebar-rail)-2.5rem)/2)] flex items-center gap-2 text-left transition-[width,color,padding] ${SIDEBAR_TRANSITION} ${
           compact
             ? "w-10 h-10 mb-3"
-            : "pl-1 w-[calc(var(--ui-sidebar-open)-var(--ui-sidebar-rail)+2.5rem)] h-10 mb-3"
+            : "pl-1 w-[calc(var(--ui-sidebar-open)-(var(--ui-sidebar-rail)-2.5rem))] h-10 mb-3"
         } ${
           active
             ? "font-bold text-white"
@@ -661,7 +701,7 @@ function PlaylistsSidebarItem({
         >
           {playlist.cover ? (
             <img
-              src={playlist.cover}
+              src={capThumbnailUrl(playlist.cover, 128)}
               alt=""
               className="h-full w-full object-cover"
               draggable={false}
@@ -813,7 +853,7 @@ function SidebarLink({
       onClick={onClick}
       aria-label={compact ? label : undefined}
       className={`group relative z-10 mb-1 ml-[calc((var(--ui-sidebar-rail)-2.5rem)/2)] flex h-10 items-center overflow-hidden rounded-xl text-sm transition-[width,color,background-color] ${SIDEBAR_TRANSITION} ${
-        compact ? "w-10" : "w-[calc(var(--ui-sidebar-open)-var(--ui-sidebar-rail)+2.5rem)]"
+        compact ? "w-10" : "w-[calc(var(--ui-sidebar-open)-(var(--ui-sidebar-rail)-2.5rem))]"
       } ${className} ${
         active ? "bg-neutral-900 font-bold text-white" : "font-semibold text-neutral-200 hover:bg-neutral-900/50 hover:text-white"
       }`}
@@ -845,6 +885,7 @@ export function TopBar({
   query,
   isSearchLoading,
   sidebarExpanded,
+  nowPlayingOpen = false,
   showSearchFilters,
   searchFilters,
   searchFiltersOpen,
@@ -862,6 +903,7 @@ export function TopBar({
   query: string;
   isSearchLoading?: boolean;
   sidebarExpanded: boolean;
+  nowPlayingOpen?: boolean;
   showSearchFilters: boolean;
   searchFilters: SearchFilters;
   searchFiltersOpen: boolean;
@@ -869,6 +911,7 @@ export function TopBar({
   onCloseSearchFilters: () => void;
   onChangeSearchFilters: (filters: SearchFilters) => void;
 }) {
+  void nowPlayingOpen;
   const [draft, setDraft] = useState(query);
   const timeoutRef = useRef<number | null>(null);
   const suggestionsTimeoutRef = useRef<number | null>(null);
@@ -1135,7 +1178,7 @@ export function TopBar({
   };
 
   return (
-    <div className="pointer-events-none absolute left-0 right-0 top-0 z-50 flex pl-[var(--ui-sidebar-current)]">
+    <div className="pointer-events-none absolute left-0 right-0 top-0 z-50 flex pl-[var(--ui-sidebar-current)] pr-[var(--ui-nowplaying-current)]">
       <div
         ref={topbarSensorRef}
         className="relative flex min-h-[var(--ui-topbar-height)] flex-1 items-center justify-center px-[clamp(0.75rem,1.8vw,1.5rem)] py-3"
@@ -1179,12 +1222,13 @@ export function TopBar({
         {/* `.topbar-search-group` is a pure layout container — it owns NO
             animation properties. Only its class flips between
             `topbar-is-visible` and `topbar-is-hidden`. The actual
-            show/hide animation lives on its backdrop-blurred children
-            (the input / filter button / history pill) so their own
-            `backdrop-blur-md` renders correctly throughout the transition
-            instead of being trapped by an ancestor's transform, opacity,
-            filter, or non-zero translate (see the Search-bar hide/show
-            comment block in index.css for the full rationale). We use
+            show/hide animation lives on its children (the input / filter
+            button / history pill) so it isn't trapped by an ancestor's
+            transform, opacity, filter, or non-zero translate (see the
+            Search-bar hide/show comment block in index.css for the full
+            rationale). Note these controls no longer use `backdrop-blur`:
+            it's disproportionately slow in WKWebView on macOS, so they use
+            opaque `bg-neutral-900/70` backgrounds instead. We use
             `topbar-is-visible` / `topbar-is-hidden` (rather than the
             plain `.is-visible`/`.is-hidden` already used in `ArtistPage`)
             so there's no class-name collision. */}
@@ -1199,7 +1243,7 @@ export function TopBar({
         >
           <div
             className={clsx(
-              "topbar-history-controls absolute right-full top-1/2 mr-2 hidden h-11 shrink-0 items-center rounded-full border border-white/10 bg-white/5 backdrop-blur-md overflow-hidden transition-all duration-100 ease-out sm:flex",
+              "topbar-history-controls absolute right-full top-1/2 mr-2 hidden h-11 shrink-0 items-center rounded-full border border-white/10 bg-neutral-900/70 overflow-hidden transition-all duration-100 ease-out sm:flex",
               suppressHistoryControls && "invisible pointer-events-none !max-w-0 !border-transparent !opacity-0 !transition-none",
               !historyCanBack && !historyCanForward && "max-w-0 opacity-0 border-transparent",
               (historyCanBack || historyCanForward) && !(historyCanBack && historyCanForward) && "max-w-[48px]",
@@ -1272,7 +1316,7 @@ export function TopBar({
                 autoCorrect="off"
                 spellCheck={false}
                 aria-autocomplete="inline"
-                className="topbar-search-element peer relative z-[2] h-full min-h-[var(--ui-control)] max-h-[var(--ui-control)] w-full rounded-full border border-white/10 bg-white/5 pl-11 pr-10 text-[0.95rem] text-white placeholder-neutral-500 outline-none backdrop-blur-md transition-colors hover:border-white/15 hover:bg-white/10 focus:border-white/15 focus:bg-white/10"
+                className="topbar-search-element peer relative z-[2] h-full min-h-[var(--ui-control)] max-h-[var(--ui-control)] w-full rounded-full border border-white/10 bg-neutral-900/70 pl-11 pr-10 text-[0.95rem] text-white placeholder-neutral-500 outline-none transition-colors hover:border-white/15 hover:bg-neutral-800/80 focus:border-white/15 focus:bg-neutral-800/80"
               />
               {inlineSuggestionSuffix && (
                 <div
@@ -1314,7 +1358,7 @@ export function TopBar({
                 onClick={onToggleSearchFilters}
                 tabIndex={showSearchFilters ? 0 : -1}
                 className={clsx(
-                  "topbar-search-element relative flex h-[var(--ui-control)] w-[var(--ui-control)] items-center justify-center rounded-full border border-white/10 bg-white/5 text-neutral-300 backdrop-blur-md transition-all duration-100 ease-out hover:border-white/15 hover:bg-white/10 hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/70",
+                  "topbar-search-element relative flex h-[var(--ui-control)] w-[var(--ui-control)] items-center justify-center rounded-full border border-white/10 bg-neutral-900/70 text-neutral-300 transition-all duration-100 ease-out hover:border-white/15 hover:bg-neutral-800/80 hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/70",
                   showSearchFilters ? "scale-100" : "scale-95",
                   (searchFiltersOpen || activeFilterCount > 0) && "border-white/15 bg-white/10 text-white",
                 )}
@@ -1407,7 +1451,7 @@ export const PageHistoryControls = forwardRef<HTMLDivElement, {
     <div
       ref={ref}
       className={clsx(
-        "flex h-11 items-center overflow-hidden rounded-full border border-white/10 bg-white/5 backdrop-blur-md",
+        "flex h-11 items-center overflow-hidden rounded-full border border-white/10 bg-neutral-900/70",
         animated && "transition-all duration-100 ease-out",
         !hasAny && "max-w-0 border-transparent opacity-0",
         hasBoth && "w-[84px] max-w-[84px]",

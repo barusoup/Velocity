@@ -11,9 +11,12 @@ import {
   cleanAutoplaySearchTitle,
   editionsCompatible,
   findStudioSongForTrack,
+  isStreamResolveTimeout,
+  isUnplayableStreamError,
   remasterEditionKey,
   resolveAutoplayEntryToSong,
   resolveStreamTrackAudio,
+  resolveStreamTrackAudioFallback,
   titlesMatchForAudioSwap,
   trackNeedsStudioSongResolution,
 } from "./song-resolution";
@@ -612,5 +615,543 @@ describe("resolveAutoplayEntryToSong", () => {
       kind: "song",
     });
     expect(resolved?.cover).not.toBe(entry.cover);
+  });
+});
+
+describe("music-video candidate hygiene", () => {
+  beforeEach(() => {
+    mockedSearchMusic.mockReset();
+    mockedGetEntityDetail.mockReset();
+  });
+
+  it("resolves the Paranoid Android single/EP track (the official MV) to a studio song, not a live cut", async () => {
+    mockedSearchMusic.mockResolvedValue({
+      query: "Radiohead Paranoid Android",
+      topResult: {
+        id: "video:fHiGbolFFGw",
+        kind: "video",
+        title: "Paranoid Android",
+        subtitle: "Radiohead",
+        artist: "Radiohead",
+        videoId: "fHiGbolFFGw",
+        durationSeconds: 393,
+      },
+      results: [
+        {
+          id: "yt:DExBeFCx3mQ",
+          kind: "song",
+          title: "Paranoid Android",
+          subtitle: "Song • Radiohead",
+          artist: "Radiohead",
+          videoId: "DExBeFCx3mQ",
+        },
+        {
+          id: "browse:MPREb_okc",
+          kind: "album",
+          title: "OK Computer",
+          subtitle: "Album • Radiohead",
+          artist: "Radiohead",
+        },
+        {
+          id: "yt:Lt8AfIeJOxw",
+          kind: "song",
+          title: "Paranoid Android",
+          subtitle: "Song • Radiohead",
+          artist: "Radiohead",
+          videoId: "Lt8AfIeJOxw",
+        },
+        {
+          id: "yt:JvvSfgWJCpE",
+          kind: "song",
+          title: "Paranoid Android",
+          subtitle: "Song • Zoom Karaoke",
+          artist: "Zoom Karaoke",
+          videoId: "JvvSfgWJCpE",
+        },
+      ],
+    });
+    mockedGetEntityDetail.mockResolvedValue({
+      kind: "album",
+      browseId: "MPREb_qcBQFrhPGhz",
+      title: "Paranoid Android",
+      subtitle: "",
+      tracks: [
+        {
+          id: "yt:fHiGbolFFGw:MPREb_qcBQFrhPGhz",
+          title: "Paranoid Android",
+          artist: "Radiohead",
+          videoId: "fHiGbolFFGw",
+          source: "stream",
+        },
+      ],
+    });
+
+    // The single/EP's "Paranoid Android" row IS the official music video.
+    const singleTrack: MediaTrack = {
+      id: "yt:fHiGbolFFGw:MPREb_qcBQFrhPGhz",
+      title: "Paranoid Android",
+      artist: "Radiohead",
+      album: "Paranoid Android",
+      albumBrowseId: "MPREb_qcBQFrhPGhz",
+      videoId: "fHiGbolFFGw",
+      source: "stream",
+    };
+
+    const resolved = await resolveStreamTrackAudio(singleTrack);
+
+    expect(resolved?.resolvedVideoId).toBe("DExBeFCx3mQ");
+    expect(resolved?.videoId).toBe("fHiGbolFFGw");
+  });
+
+  it("never resolves a studio song to a music-video candidate even when cleaned titles match", async () => {
+    mockedSearchMusic.mockResolvedValue({
+      query: "Artist Song",
+      results: [
+        {
+          id: "yt:mv",
+          kind: "song",
+          title: "Song (Official Music Video)",
+          subtitle: "",
+          artist: "Artist",
+          videoId: "mv",
+          durationSeconds: 200,
+        },
+        {
+          id: "yt:studio",
+          kind: "song",
+          title: "Song",
+          subtitle: "",
+          artist: "Artist",
+          videoId: "studio",
+          durationSeconds: 200,
+        },
+      ],
+    });
+
+    const track: MediaTrack = {
+      id: "yt:studio",
+      kind: "song",
+      title: "Song",
+      artist: "Artist",
+      videoId: "studio",
+      durationSeconds: 200,
+      source: "stream",
+    };
+
+    const resolved = await resolveStreamTrackAudio(track);
+
+    expect(resolved?.resolvedVideoId).toBeUndefined();
+    expect(resolved?.videoId).toBe("studio");
+  });
+
+  it("does not resolve a music-video row to a music-video candidate", async () => {
+    mockedSearchMusic.mockResolvedValue({
+      query: "Artist Song Name",
+      results: [
+        {
+          id: "yt:mv",
+          kind: "song",
+          title: "Song Name (Official Music Video)",
+          subtitle: "",
+          artist: "Artist",
+          videoId: "mv",
+          durationSeconds: 200,
+        },
+      ],
+    });
+
+    const track: MediaTrack = {
+      id: "yt:mv2",
+      kind: "video",
+      title: "Song Name (Official Music Video)",
+      artist: "Artist",
+      videoId: "mv2",
+      durationSeconds: 200,
+      source: "stream",
+    };
+
+    const resolved = await resolveStreamTrackAudio(track);
+
+    expect(resolved?.resolvedVideoId).toBeUndefined();
+    expect(resolved?.videoId).toBe("mv2");
+  });
+
+  it("drops a music-video autoplay row whose id is only catalogued under a music-video title", async () => {
+    mockedSearchMusic.mockResolvedValue({
+      query: "Artist Song",
+      results: [
+        {
+          id: "yt:mv456",
+          kind: "song",
+          title: "Song (Official Music Video)",
+          subtitle: "",
+          artist: "Artist",
+          videoId: "mv456",
+        },
+      ],
+    });
+
+    const entry: MediaTrack = {
+      id: "yt:mv456",
+      kind: "song",
+      title: "Song",
+      artist: "Artist",
+      videoId: "mv456",
+      source: "stream",
+    };
+
+    await expect(resolveAutoplayEntryToSong(entry)).resolves.toBeNull();
+  });
+
+  it("keeps a genuine studio-song autoplay row that is catalogued", async () => {
+    mockedSearchMusic.mockResolvedValue({
+      query: "Artist Song",
+      results: [
+        {
+          id: "yt:studio",
+          kind: "song",
+          title: "Song",
+          subtitle: "",
+          artist: "Artist",
+          videoId: "studio",
+        },
+      ],
+    });
+
+    const entry: MediaTrack = {
+      id: "yt:studio",
+      kind: "song",
+      title: "Song",
+      artist: "Artist",
+      videoId: "studio",
+      source: "stream",
+    };
+
+    const resolved = await resolveAutoplayEntryToSong(entry);
+
+    expect(resolved).toMatchObject({ id: "yt:studio", videoId: "studio" });
+  });
+});
+
+describe("resolveStreamTrackAudioFallback", () => {
+  beforeEach(() => {
+    mockedSearchMusic.mockReset();
+    mockedGetEntityDetail.mockReset();
+  });
+
+  it("never falls back to the music video when the resolved studio id is unplayable (Paranoid Android case)", async () => {
+    mockedSearchMusic.mockResolvedValue({
+      query: "Radiohead Paranoid Android",
+      results: [
+        {
+          id: "yt:mv-abc",
+          kind: "video",
+          title: "Paranoid Android (Official Music Video)",
+          subtitle: "",
+          artist: "Radiohead",
+          videoId: "mv-abc",
+          durationSeconds: 383,
+        },
+        {
+          id: "yt:studio-xyz",
+          kind: "song",
+          title: "Paranoid Android",
+          subtitle: "",
+          artist: "Radiohead",
+          videoId: "studio-xyz",
+          durationSeconds: 383,
+        },
+      ],
+    });
+
+    const track: MediaTrack = {
+      id: "yt:studio-xyz",
+      kind: "song",
+      title: "Paranoid Android",
+      artist: "Radiohead",
+      album: "OK Computer",
+      videoId: "studio-xyz",
+      resolvedVideoId: "studio-xyz",
+      durationSeconds: 383,
+      source: "stream",
+    };
+
+    // The only alternate besides the dead studio id is the official music
+    // video — it must never be selected as audio, so the fallback gives up.
+    await expect(
+      resolveStreamTrackAudioFallback(track, { excludeVideoIds: ["studio-xyz"] }),
+    ).resolves.toBeNull();
+  });
+
+  it("prefers another studio upload over the music video when both are playable", async () => {
+    mockedSearchMusic.mockResolvedValue({
+      query: "Radiohead Paranoid Android",
+      results: [
+        {
+          id: "yt:mv-abc",
+          kind: "video",
+          title: "Paranoid Android (Official Music Video)",
+          subtitle: "",
+          artist: "Radiohead",
+          videoId: "mv-abc",
+          durationSeconds: 383,
+        },
+        {
+          id: "yt:studio-alt",
+          kind: "song",
+          title: "Paranoid Android",
+          subtitle: "",
+          artist: "Radiohead",
+          videoId: "studio-alt",
+          durationSeconds: 383,
+        },
+      ],
+    });
+
+    const track: MediaTrack = {
+      id: "yt:studio-dead",
+      kind: "song",
+      title: "Paranoid Android",
+      artist: "Radiohead",
+      videoId: "studio-dead",
+      resolvedVideoId: "studio-dead",
+      durationSeconds: 383,
+      source: "stream",
+    };
+
+    const resolved = await resolveStreamTrackAudioFallback(track, {
+      excludeVideoIds: ["studio-dead"],
+    });
+
+    expect(resolved?.resolvedVideoId).toBe("studio-alt");
+  });
+
+  it("returns null when no same-song alternate exists", async () => {
+    mockedSearchMusic.mockResolvedValue({
+      query: "Artist Obscure",
+      results: [
+        {
+          id: "yt:other",
+          kind: "song",
+          title: "Totally Different Song",
+          subtitle: "",
+          artist: "Someone Else",
+          videoId: "other",
+          durationSeconds: 120,
+        },
+      ],
+    });
+
+    const track: MediaTrack = {
+      id: "yt:obscure",
+      kind: "song",
+      title: "Obscure",
+      artist: "Artist",
+      videoId: "obscure",
+      source: "stream",
+    };
+
+    await expect(resolveStreamTrackAudioFallback(track)).resolves.toBeNull();
+  });
+
+  it("never swaps a studio song to a recording-variant upload", async () => {
+    mockedSearchMusic.mockResolvedValue({
+      query: "Radiohead Paranoid Android",
+      results: [
+        {
+          id: "yt:live-abc",
+          kind: "song",
+          title: "Paranoid Android (Live)",
+          subtitle: "",
+          artist: "Radiohead",
+          videoId: "live-abc",
+          durationSeconds: 400,
+        },
+      ],
+    });
+
+    const track: MediaTrack = {
+      id: "yt:studio-xyz",
+      kind: "song",
+      title: "Paranoid Android",
+      artist: "Radiohead",
+      videoId: "studio-xyz",
+      resolvedVideoId: "studio-xyz",
+      durationSeconds: 383,
+      source: "stream",
+    };
+
+    // A studio row must not silently play a live/acoustic/remix variant.
+    await expect(
+      resolveStreamTrackAudioFallback(track, { excludeVideoIds: ["studio-xyz"] }),
+    ).resolves.toBeNull();
+  });
+
+  it("allows a variant alternate when the SOURCE track is itself a variant", async () => {
+    mockedSearchMusic.mockResolvedValue({
+      query: "Radiohead Paranoid Android",
+      results: [
+        {
+          id: "yt:live-abc",
+          kind: "song",
+          title: "Paranoid Android (Live)",
+          subtitle: "",
+          artist: "Radiohead",
+          videoId: "live-abc",
+          durationSeconds: 400,
+        },
+      ],
+    });
+
+    const track: MediaTrack = {
+      id: "yt:live-xyz",
+      kind: "song",
+      title: "Paranoid Android (Live)",
+      artist: "Radiohead",
+      videoId: "live-xyz",
+      resolvedVideoId: "live-xyz",
+      durationSeconds: 400,
+      source: "stream",
+    };
+
+    const resolved = await resolveStreamTrackAudioFallback(track, {
+      excludeVideoIds: ["live-xyz"],
+    });
+
+    expect(resolved?.resolvedVideoId).toBe("live-abc");
+  });
+
+  it("refuses to fall a remaster row back to the music video when no studio upload exists", async () => {
+    mockedSearchMusic.mockResolvedValue({
+      query: "Radiohead Paranoid Android",
+      results: [
+        {
+          id: "yt:mv-abc",
+          kind: "video",
+          title: "Paranoid Android (Official Music Video)",
+          subtitle: "",
+          artist: "Radiohead",
+          videoId: "mv-abc",
+          durationSeconds: 383,
+        },
+      ],
+    });
+
+    const track: MediaTrack = {
+      id: "yt:remaster-xyz",
+      kind: "song",
+      title: "Paranoid Android (2017 Remaster)",
+      artist: "Radiohead",
+      videoId: "remaster-xyz",
+      resolvedVideoId: "remaster-xyz",
+      durationSeconds: 383,
+      source: "stream",
+    };
+
+    // A music video is not an acceptable audio fallback — not even for a
+    // remaster whose own upload is unplayable.
+    await expect(
+      resolveStreamTrackAudioFallback(track, { excludeVideoIds: ["remaster-xyz"] }),
+    ).resolves.toBeNull();
+  });
+
+  it("does not recover to the originally-clicked music video when the resolved studio upload fails", async () => {
+    mockedSearchMusic.mockResolvedValue({
+      query: "Radiohead Paranoid Android",
+      results: [
+        {
+          id: "yt:mv",
+          kind: "video",
+          title: "Paranoid Android (Official Music Video)",
+          subtitle: "",
+          artist: "Radiohead",
+          videoId: "mv",
+          durationSeconds: 393,
+        },
+        {
+          id: "yt:studio",
+          kind: "song",
+          title: "Paranoid Android",
+          subtitle: "",
+          artist: "Radiohead",
+          videoId: "studio",
+          durationSeconds: 384,
+        },
+      ],
+    });
+
+    const track: MediaTrack = {
+      id: "yt:mv:paranoid-single",
+      title: "Paranoid Android",
+      artist: "Radiohead",
+      album: "Paranoid Android",
+      albumBrowseId: "MPREb_single",
+      videoId: "mv",
+      resolvedVideoId: "studio",
+      source: "stream",
+    };
+
+    // The music-video row the user originally clicked is not a recovery
+    // source once the resolved studio upload fails — the fallback gives up
+    // rather than play a video.
+    await expect(
+      resolveStreamTrackAudioFallback(track, { excludeVideoIds: ["studio"] }),
+    ).resolves.toBeNull();
+  });
+
+  it("rejects a tribute-band upload even when title and duration line up", async () => {
+    mockedSearchMusic.mockResolvedValue({
+      query: "The Beatles Hey Jude",
+      results: [
+        {
+          id: "yt:tribute-abc",
+          kind: "song",
+          title: "Hey Jude",
+          subtitle: "",
+          artist: "The Beatles Tribute Band",
+          videoId: "tribute-abc",
+          durationSeconds: 431,
+        },
+      ],
+    });
+
+    const track: MediaTrack = {
+      id: "yt:studio-xyz",
+      kind: "song",
+      title: "Hey Jude",
+      artist: "The Beatles",
+      videoId: "studio-xyz",
+      resolvedVideoId: "studio-xyz",
+      durationSeconds: 431,
+      source: "stream",
+    };
+
+    await expect(
+      resolveStreamTrackAudioFallback(track, { excludeVideoIds: ["studio-xyz"] }),
+    ).resolves.toBeNull();
+  });
+});
+
+describe("isStreamResolveTimeout", () => {
+  it("classifies frontend resolve timeouts", () => {
+    expect(isStreamResolveTimeout("Resolving this track's audio took too long.")).toBe(true);
+    expect(isStreamResolveTimeout("request timed out")).toBe(true);
+    expect(isStreamResolveTimeout("HTTP error 403")).toBe(false);
+    expect(isStreamResolveTimeout("")).toBe(false);
+  });
+});
+
+describe("isUnplayableStreamError", () => {
+  it("catches the sign-in/bot refusals yt-dlp returns for restricted uploads", () => {
+    expect(isUnplayableStreamError("Sign in to confirm you're not a bot. Use --cookies...")).toBe(true);
+    expect(isUnplayableStreamError("Sign in to confirm your age")).toBe(true);
+    expect(isUnplayableStreamError("ERROR: [youtube] DExBeFCx3mQ: Sign in to confirm you're not a bot.")).toBe(true);
+    expect(isUnplayableStreamError("HTTP Error 403: Forbidden")).toBe(true);
+    expect(isUnplayableStreamError("This video is not available")).toBe(true);
+  });
+
+  it("does not classify transient network failures as unplayable", () => {
+    expect(isUnplayableStreamError("connection reset by peer")).toBe(false);
+    expect(isUnplayableStreamError("Read timed out")).toBe(false);
   });
 });

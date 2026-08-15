@@ -13,8 +13,12 @@ export type Settings = {
   crossfade: boolean;
   masterVolume: number;
   equalizerBands: number[];
-  hidePlayerOnLyrics: boolean;
-  hideSearchOnLyrics: boolean;
+  // Hide the sidebar on the lyrics page (revealed on left-edge hover /
+  // Ctrl+B). The media player is never hidden there.
+  hideSidebarOnLyrics: boolean;
+  // Hide the Now Playing menu on the lyrics page (revealed on right-edge hover
+  // or toggle button).
+  hideNowPlayingOnLyrics: boolean;
   saveTimestamp: boolean;
   offlineSync: boolean;
   lyricsDistanceFade: boolean;
@@ -34,7 +38,13 @@ export type Settings = {
   viewModeAlbum: ViewMode;
   viewModePlaylist: ViewMode;
   viewModeDiscography: DiscographyViewMode;
+  compactDownloads: boolean;
+  exportFormat: ExportFormat;
+  sidebarOpen: boolean;
+  nowPlayingOpen: boolean;
 };
+
+export type ExportFormat = "native" | "opus" | "mp3";
 
 // Exported so callers (e.g. `player.tsx`'s autoplay migration) can
 // distinguish between "the saved-settings blob has its own autoplay
@@ -53,8 +63,8 @@ const DEFAULTS: Settings = {
   crossfade: true,
   masterVolume: 0,
   equalizerBands: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-  hidePlayerOnLyrics: false,
-  hideSearchOnLyrics: false,
+  hideSidebarOnLyrics: false,
+  hideNowPlayingOnLyrics: true,
   saveTimestamp: true,
   offlineSync: true,
   lyricsDistanceFade: true,
@@ -68,16 +78,43 @@ const DEFAULTS: Settings = {
   viewModePlaylist: "list",
   viewModeDiscography: "list",
   autoplay: true,
+  compactDownloads: false,
+  exportFormat: "opus",
+  sidebarOpen: false,
+  nowPlayingOpen: true,
 };
+
+let _cachedSettings: Settings | null = null;
+let _cachedRaw: string | null = null;
 
 export function getSettings(): Settings {
   try {
     const raw = getItem(SETTINGS_KEY);
-    if (!raw) return { ...DEFAULTS };
+    if (raw === _cachedRaw && _cachedSettings) return _cachedSettings!;
+    if (!raw) {
+      _cachedRaw = null;
+      _cachedSettings = { ...DEFAULTS };
+      return _cachedSettings!;
+    }
+    if (raw === _cachedRaw && _cachedSettings) return _cachedSettings!;
     const parsed = JSON.parse(raw);
-    return { ...DEFAULTS, ...parsed };
+    _cachedRaw = raw;
+    // The lyrics-page chrome settings were consolidated over time: the old
+    // per-element toggles (hidePlayerOnLyrics / hideSearchOnLyrics) became
+    // hideControlsOnLyrics, and that is now a sidebar-only toggle
+    // (hideSidebarOnLyrics — the media player is never hidden on lyrics).
+    // Carry over the intermediate key so a user who had the toggle on
+    // keeps it; the player/search preferences are obsolete and dropped.
+    const merged: Settings = { ...DEFAULTS, ...parsed };
+    if (parsed.hideSidebarOnLyrics === undefined && parsed.hideControlsOnLyrics === true) {
+      merged.hideSidebarOnLyrics = true;
+    }
+    _cachedSettings = merged;
+    return merged;
   } catch {
-    return { ...DEFAULTS };
+    _cachedRaw = null;
+    _cachedSettings = { ...DEFAULTS };
+    return _cachedSettings!;
   }
 }
 
@@ -86,14 +123,19 @@ export function getSetting<K extends keyof Settings>(key: K): Settings[K] {
 }
 
 export function setSetting<K extends keyof Settings>(key: K, value: Settings[K]): void {
-  const current = getSettings();
-  current[key] = value;
-  storeSetItem(SETTINGS_KEY, JSON.stringify(current));
+  const current = { ...getSettings(), [key]: value };
+  const serialized = JSON.stringify(current);
+  _cachedRaw = serialized;
+  _cachedSettings = current;
+  storeSetItem(SETTINGS_KEY, serialized);
   notifyListeners(key, value);
 }
 
 export function resetAllSettings(): void {
-  storeSetItem(SETTINGS_KEY, JSON.stringify({ ...DEFAULTS }));
+  const serialized = JSON.stringify({ ...DEFAULTS });
+  _cachedRaw = serialized;
+  _cachedSettings = { ...DEFAULTS };
+  storeSetItem(SETTINGS_KEY, serialized);
   notifyListeners("__all__", null);
 }
 
@@ -120,10 +162,9 @@ function notifyListeners(key: string, value: unknown): void {
 // Reactive variant of getSetting: subscribes to local changes so the
 // consuming component re-renders with the up-to-date value. Components
 // that need to react to setting changes (e.g. player.tsx re-applying the
-// output gain when masterVolume changes, PlayerBar omitting itself when
-// hidePlayerOnLyrics is toggled, Sidebar/TopBar suppressing the search
-// bar when hideSearchOnLyrics is toggled or keeping it visible when
-// alwaysShowSearch is toggled) should
+// output gain when masterVolume changes, App/Sidebar re-hiding the
+// sidebar when hideSidebarOnLyrics is toggled, or TopBar keeping the
+// search bar visible when alwaysShowSearch is toggled) should
 // use this hook instead of `getSetting`, which only returns a snapshot.
 export function useSetting<K extends keyof Settings>(key: K): Settings[K] {
   const [value, setValue] = useState<Settings[K]>(() => getSettings()[key]);
@@ -166,6 +207,13 @@ export async function clearAllUserData(): Promise<void> {
   try {
     const { listImportedTracks, removeImportedTrack, clearAllOffline } = await import("./api");
     await clearAllOffline().catch(() => {});
+    // Files are gone — drop every "downloaded" badge too, and cancel any
+    // queued / retry-pending background download so it can't re-create
+    // files after the wipe.
+    const { useOfflineStatusStore } = await import("./store/offlineStatusStore");
+    useOfflineStatusStore.getState().clearAll();
+    const { cancelAllOfflineSync } = await import("./utils/offline-download-queue");
+    cancelAllOfflineSync();
     const tracks = await listImportedTracks().catch(() => [] as Awaited<ReturnType<typeof listImportedTracks>>);
     await Promise.all(
       tracks.map((t) => removeImportedTrack(t.id).catch(() => {})),

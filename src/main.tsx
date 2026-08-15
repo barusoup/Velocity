@@ -40,6 +40,16 @@ async function boot() {
     // Silently continue — localStorage fallback is always available
   }
 
+  // One-time migration: purge any persisted lyrics from bad regional providers
+  // (Kugou / QQ / NetEase) cached before the clean-provider restriction.
+  // Keeps the app from flashing stale poor LRC on first paint after update.
+  try {
+    const { purgeBadPersistedLyrics } = await import("./api");
+    purgeBadPersistedLyrics();
+  } catch {
+    // best-effort
+  }
+
   const { default: App } = await appModule;
 
   createRoot(document.getElementById("root")!).render(

@@ -54,3 +54,9 @@ show_line.cjs
 
 AGENTS.md
 .velocity-public-readme.md
+
+tmp/
+
+# Local dev symlinks (shared node_modules / cargo target)
+node_modules
+src-tauri/target

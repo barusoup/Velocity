@@ -114,7 +114,7 @@ function rememberBounded<K, V>(map: Map<K, V>, key: K, value: V, max: number): v
 }
 
 const MAIN_FILTERS: Array<{ value: ReleaseFilter; label: string }> = [
-  { value: "all", label: "Popular releases" },
+  { value: "all", label: "All Releases" },
   { value: "album", label: "Albums" },
   { value: "single", label: "Singles and EPs" },
 ];
@@ -138,6 +138,14 @@ const SORT_OPTIONS: Array<{ value: SortMode; label: string }> = [
 
 // Keep the extra rows mounted until the list's closing motion has finished.
 const POPULAR_COLLAPSE_TOTAL_MS = 280;
+
+// After the artist page mounts, wait for the longest entrance cascade
+// (release blocks: 14 * 54ms stagger + 460ms duration ≈ 1.22s) to settle,
+// then mark the slider as layout-settled. index.css gates its
+// `content-visibility` skips (hidden off-screen pane, auto off-viewport
+// rows) on `[data-artist-layout-settled]` so the skips never interfere
+// with the mount animations and every visible pixel stays identical.
+const ARTIST_LAYOUT_SETTLE_MS = 1400;
 const DISCOGRAPHY_INITIALIZING_ATTRIBUTE = "data-discography-layout-initializing";
 const DISCOGRAPHY_TITLE_WIDTH_PROPERTY = "--discography-title-width";
 const DISCOGRAPHY_WINDOW_CONTROLS_WIDTH_PROPERTY = "--discography-window-controls-width";
@@ -274,6 +282,25 @@ export function ArtistPage({
     setSortMenuOpen(false);
   }, [fullDiscographyOpen]);
 
+  // Flip `data-artist-layout-settled` once the entrance cascade settles so
+  // CSS can start skipping layout/paint for the off-screen pane and the
+  // off-viewport discography rows (see the index.css comment block). The
+  // attribute lives on the slider element, which persists across
+  // overview ↔ discography section flips, so toggling the sidebar while on
+  // either pane is fast after the first settle.
+  const artistSliderRef = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    const slider = artistSliderRef.current;
+    if (!slider) return;
+    const timer = window.setTimeout(() => {
+      slider.setAttribute("data-artist-layout-settled", "");
+    }, ARTIST_LAYOUT_SETTLE_MS);
+    return () => {
+      window.clearTimeout(timer);
+      slider.removeAttribute("data-artist-layout-settled");
+    };
+  }, []);
+
   const detail = state.data ?? null;
   const topSongs = useMemo<MediaTrack[]>(
     () =>
@@ -408,7 +435,10 @@ export function ArtistPage({
 
   return (
     <div className="-mt-20 [overflow-x:clip] bg-black">
-      <div className={`artist-page-slider ${fullDiscographyOpen ? "is-open" : ""}`}>
+      <div
+        ref={artistSliderRef}
+        className={`artist-page-slider ${fullDiscographyOpen ? "is-open" : ""}`}
+      >
         <ArtistOverview
           detail={detail}
           monthlyListeners={detail.monthlyListeners ?? extraMonthlyListeners ?? null}
@@ -606,6 +636,9 @@ function ArtistOverview({
   useEffect(() => {
     const strip = releaseStripRef.current;
     if (!strip) return;
+    let raf = 0;
+    let deferred = false;
+    let sidebarTransitioning = false;
     const update = () => {
       const children = strip.children;
       if (children.length === 0) {
@@ -625,13 +658,60 @@ function ArtistOverview({
         applyScrollFades(strip, left, right);
       }
     };
+
+    // The strip's ResizeObserver fires whenever its box resizes — which,
+    // during a sidebar expand/collapse, happens on EVERY frame as the pane's
+    // padding-left reflows. Reading rects there would force a synchronous
+    // layout pass on top of the transition's own per-frame reflows. Coalesce
+    // to one rAF and, while `--ui-sidebar-current` is transitioning, defer
+    // entirely; a single final flush after `transitionend` leaves the fade
+    // masks exactly correct. Edge fades are subtle, so the 220ms staleness
+    // during the transition is not perceptible.
+    const flushUpdate = () => {
+      raf = 0;
+      if (sidebarTransitioning) {
+        deferred = true;
+        return;
+      }
+      update();
+    };
+    const requestUpdate = () => {
+      if (!raf) raf = window.requestAnimationFrame(flushUpdate);
+    };
+    const layoutHost = document.querySelector(".sidebar-layout-transition");
+    const onTransitionStart = (event: Event) => {
+      if ((event as TransitionEvent).propertyName === "--ui-sidebar-current") {
+        sidebarTransitioning = true;
+      }
+    };
+    // `transitioncancel` is the same reset as `transitionend`: a cancelled
+    // transition (interrupted toggle, property reverting, or the host class
+    // dropped mid-flight) must not leave `sidebarTransitioning` stuck true,
+    // or every later flush would defer forever and the edge-fade masks would
+    // freeze for the rest of the session.
+    const endSidebarTransition = (event: Event) => {
+      if ((event as TransitionEvent).propertyName !== "--ui-sidebar-current") return;
+      sidebarTransitioning = false;
+      if (deferred) {
+        deferred = false;
+        requestUpdate();
+      }
+    };
+    layoutHost?.addEventListener("transitionstart", onTransitionStart);
+    layoutHost?.addEventListener("transitionend", endSidebarTransition);
+    layoutHost?.addEventListener("transitioncancel", endSidebarTransition);
+
     updateScrollFadesRef.current = update;
     update();
     strip.addEventListener("scroll", update, { passive: true });
-    const ro = new ResizeObserver(update);
+    const ro = new ResizeObserver(requestUpdate);
     ro.observe(strip);
     return () => {
       updateScrollFadesRef.current = null;
+      if (raf) window.cancelAnimationFrame(raf);
+      layoutHost?.removeEventListener("transitionstart", onTransitionStart);
+      layoutHost?.removeEventListener("transitionend", endSidebarTransition);
+      layoutHost?.removeEventListener("transitioncancel", endSidebarTransition);
       strip.removeEventListener("scroll", update);
       ro.disconnect();
     };
@@ -648,12 +728,19 @@ function ArtistOverview({
     player.currentTrack?.artistBrowseId === browseId;
   const isArtistPlaying = isArtistActive && player.isPlaying;
   const isArtistBuffering = isArtistActive && player.isBuffering;
-  const resolvedHeroArtwork = useResolvedArtworkSource([displayBanner, displayCover]);
+  // The hero renders the banner full-width, far larger than the artwork
+  // cache's 512px ceiling, so skip the warm-cache lookup: PlayerBar and the
+  // collection preload `cacheArtwork(banner)` for icon-sized use, and serving
+  // that 512px copy here makes the page banner look blurry/pixelated. Always
+  // render the real banner URL (w2880); the browser HTTP cache covers
+  // repeat visits. The error fallback (backend download via `cacheArtwork`)
+  // is still kept as a last resort when the CDN URL fails.
+  const resolvedHeroArtwork = useResolvedArtworkSource([displayBanner, displayCover], 0, { skipCache: true });
   const accent = useArtworkAccent(resolvedHeroArtwork.src, browseId);
   const hasBanner = Boolean(resolvedHeroArtwork.src);
   // The hero is part of the normal page layer. The overlaid sidebar simply
-  // reveals it through its rounded edge, so there is no duplicate background
-  // image or global state to keep in sync while the page scrolls.
+  // covers its left edge, so there is no duplicate background image or
+  // global state to keep in sync while the page scrolls.
   const playButtonBg = hasBanner
     ? rgbToCss(mixRgb(accent, { r: 255, g: 255, b: 255 }, 0.22))
     : "#ffffff";
@@ -666,7 +753,7 @@ function ArtistOverview({
 
   return (
     <div className="artist-pane w-1/2 shrink-0 min-w-0">
-      <section className="relative isolate h-[var(--ui-artist-hero)] overflow-hidden px-[var(--ui-page-pad)] pl-[var(--ui-page-left-pad)] pb-[clamp(1.75rem,2.5vw,2.75rem)] pt-[calc(var(--ui-topbar-height)+1rem)]" style={heroStyle}>
+      <section className="relative isolate h-[var(--ui-artist-hero)] overflow-hidden px-[var(--ui-page-pad)] pl-[var(--ui-page-left-pad)] pr-[var(--ui-page-right-pad)] pb-[clamp(1.75rem,2.5vw,2.75rem)] pt-[calc(var(--ui-topbar-height)+1rem)]" style={heroStyle}>
         {resolvedHeroArtwork.src && (
           <>
             <img
@@ -693,7 +780,7 @@ function ArtistOverview({
         </div>
       </section>
 
-      <section className="bg-black px-[var(--ui-page-pad)] pl-[var(--ui-page-left-pad)] pb-0 pt-[clamp(1.15rem,2.6vw,1.8rem)]">
+      <section className="bg-black px-[var(--ui-page-pad)] pl-[var(--ui-page-left-pad)] pr-[var(--ui-page-right-pad)] pb-[clamp(2.5rem,3.125vw,4rem)] pt-[clamp(1.15rem,2.6vw,1.8rem)]">
         <div className="mb-7 flex items-center gap-6 transition-opacity duration-150">
           {topSongs.length > 0 && (
             <button
@@ -794,77 +881,208 @@ function ArtistOverview({
         )}
 
         <section>
-            <div className="max-w-[1120px]">
-              <div className="mb-4">
-                <h2 className="text-2xl font-extrabold text-white">Discography</h2>
-              </div>
+          <div className="max-w-[1120px]">
+            <div className="mb-4">
+              <h2 className="text-2xl font-extrabold text-white">Discography</h2>
+            </div>
 
-              <div className="mb-6 flex flex-wrap items-center justify-between gap-3">
-                <div ref={filterBarRef} className="relative flex flex-wrap items-center gap-2">
-                  <div
-                    className="artist-filter-pill-indicator absolute top-0 left-0 h-8 rounded-full bg-white transition-all duration-300 ease-[cubic-bezier(0.16,1,0.3,1)]"
-                    style={pillStyle}
-                    aria-hidden
+            <div className="mb-6 flex flex-wrap items-center justify-between gap-3">
+              <div ref={filterBarRef} className="relative flex flex-wrap items-center gap-2">
+                <div
+                  className="artist-filter-pill-indicator absolute top-0 left-0 h-8 rounded-full bg-white transition-all duration-300 ease-[cubic-bezier(0.16,1,0.3,1)]"
+                  style={pillStyle}
+                  aria-hidden
+                />
+                {MAIN_FILTERS.map((filter) => (
+                  <button
+                    key={filter.value}
+                    type="button"
+                    data-filter-value={filter.value}
+                    onClick={() => onChangeMainFilter(filter.value)}
+                    className={`relative z-10 h-8 rounded-full px-3 text-sm font-semibold transition-colors duration-200 animate-none ${
+                      mainFilter === filter.value
+                      ? "text-black"
+                      : "text-white hover:text-white/80"
+                    }`}
+                  >
+                    {filter.label}
+                  </button>
+                ))}
+              </div>
+              <button
+                type="button"
+                onClick={onOpenFullDiscography}
+                className="h-8 px-1 text-sm font-semibold text-white/58 transition hover:text-white animate-none"
+              >
+                Show Discography
+              </button>
+            </div>
+
+            <div
+              ref={releaseStripRef}
+              className={`artist-release-strip flex gap-3 overflow-x-auto pb-1 pr-6 overscroll-x-contain select-none [scrollbar-width:none] [&::-webkit-scrollbar]:hidden ${
+                isDraggingReleases ? "cursor-grabbing" : "cursor-grab"
+              } ${stripMotion === "forward" ? "is-transitioning-forward" : ""} ${
+                stripMotion === "backward" ? "is-transitioning-backward" : ""
+              }`}
+              onPointerDown={handleReleaseStripPointerDown}
+              onClickCapture={handleReleaseStripClickCapture}
+            >
+              {mainReleases.map((item, index) => (
+                <div
+                  key={`${mainFilter}-${item.id}`}
+                  className="artist-release-strip-card w-[clamp(10.25rem,15.3125vw,12.25rem)] shrink-0"
+                  style={
+                    {
+                      "--domino-index": Math.min(index, RELEASE_STRIP_MAX_STAGGER_ITEMS),
+                    } as CSSProperties
+                  }
+                >
+                  <ReleaseCard
+                    item={item}
+                    onOpen={() => onOpenItem(item)}
+                    onPlay={() => handlePlayRelease(item)}
+                    playBgColor={releaseCardPlayBg}
+                    playButtonSize="lg"
+                    artistBrowseId={browseId}
                   />
-                  {MAIN_FILTERS.map((filter) => (
-                    <button
-                      key={filter.value}
-                      type="button"
-                      data-filter-value={filter.value}
-                      onClick={() => onChangeMainFilter(filter.value)}
-                      className={`relative z-10 h-8 rounded-full px-3 text-sm font-semibold transition-colors duration-200 animate-none ${
-                        mainFilter === filter.value
-                        ? "text-black"
-                        : "text-white hover:text-white/80"
-                      }`}
-                    >
-                      {filter.label}
-                    </button>
-                  ))}
                 </div>
-                <button
-                  type="button"
-                  onClick={onOpenFullDiscography}
-                  className="h-8 px-1 text-sm font-semibold text-white/58 transition hover:text-white animate-none"
-                >
-                  Show Discography
-                </button>
-              </div>
-
-              <div
-                  ref={releaseStripRef}
-                  className={`artist-release-strip flex gap-3 overflow-x-auto pb-3 pr-6 overscroll-x-contain select-none [scrollbar-width:none] [&::-webkit-scrollbar]:hidden ${
-                    isDraggingReleases ? "cursor-grabbing" : "cursor-grab"
-                  } ${stripMotion === "forward" ? "is-transitioning-forward" : ""} ${
-                    stripMotion === "backward" ? "is-transitioning-backward" : ""
-                  }`}
-                  onPointerDown={handleReleaseStripPointerDown}
-                  onClickCapture={handleReleaseStripClickCapture}
-                >
-                  {mainReleases.map((item, index) => (
-                    <div
-                      key={`${mainFilter}-${item.id}`}
-                      className="artist-release-strip-card w-[clamp(10.25rem,15.3125vw,12.25rem)] shrink-0"
-                      style={
-                        {
-                          "--domino-index": Math.min(index, RELEASE_STRIP_MAX_STAGGER_ITEMS),
-                        } as CSSProperties
-                      }
-                    >
-                      <ReleaseCard
-                        item={item}
-                        onOpen={() => onOpenItem(item)}
-                        onPlay={() => handlePlayRelease(item)}
-                        playBgColor={releaseCardPlayBg}
-                        playButtonSize="lg"
-                        artistBrowseId={browseId}
-                      />
-                    </div>
-                  ))}
-                </div>
-              </div>
-            </section>
+              ))}
+            </div>
+            <ReleaseStripScrollbar targetRef={releaseStripRef} />
+          </div>
+        </section>
       </section>
+    </div>
+  );
+}
+
+function ReleaseStripScrollbar({
+  targetRef,
+}: {
+  targetRef: React.RefObject<HTMLDivElement | null>;
+}) {
+  const [metrics, setMetrics] = useState({
+    scrollLeft: 0,
+    scrollWidth: 0,
+    clientWidth: 0,
+  });
+  const trackRef = useRef<HTMLDivElement | null>(null);
+  const isDraggingRef = useRef(false);
+  const dragStartXRef = useRef(0);
+  const dragStartScrollLeftRef = useRef(0);
+
+  const updateMetrics = useCallback(() => {
+    const el = targetRef.current;
+    if (!el) return;
+    setMetrics({
+      scrollLeft: el.scrollLeft,
+      scrollWidth: el.scrollWidth,
+      clientWidth: el.clientWidth,
+    });
+  }, [targetRef]);
+
+  useEffect(() => {
+    const el = targetRef.current;
+    if (!el) return;
+    updateMetrics();
+
+    el.addEventListener("scroll", updateMetrics, { passive: true });
+    const ro = new ResizeObserver(updateMetrics);
+    ro.observe(el);
+
+    return () => {
+      el.removeEventListener("scroll", updateMetrics);
+      ro.disconnect();
+    };
+  }, [targetRef, updateMetrics]);
+
+  const maxScroll = Math.max(0, metrics.scrollWidth - metrics.clientWidth);
+  if (maxScroll <= 1) return null;
+
+  const trackEl = trackRef.current;
+  const trackWidth = trackEl ? trackEl.clientWidth : 0;
+  const rawThumbWidth =
+    trackWidth > 0 && metrics.scrollWidth > 0
+      ? (metrics.clientWidth / metrics.scrollWidth) * trackWidth
+      : 0;
+  const thumbWidth = Math.max(32, Math.min(rawThumbWidth, trackWidth));
+  const availableTrack = Math.max(0, trackWidth - thumbWidth);
+  const scrollRatio = maxScroll > 0 ? metrics.scrollLeft / maxScroll : 0;
+  const thumbLeft = availableTrack * Math.min(1, Math.max(0, scrollRatio));
+
+  const handlePointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
+    const el = targetRef.current;
+    const track = trackRef.current;
+    if (!el || !track) return;
+
+    const trackRect = track.getBoundingClientRect();
+    const clickX = e.clientX - trackRect.left;
+
+    if (clickX < thumbLeft || clickX > thumbLeft + thumbWidth) {
+      const clickRatio =
+        (clickX - thumbWidth / 2) / Math.max(1, trackWidth - thumbWidth);
+      el.scrollLeft = Math.max(0, Math.min(maxScroll, clickRatio * maxScroll));
+    }
+
+    isDraggingRef.current = true;
+    dragStartXRef.current = e.clientX;
+    dragStartScrollLeftRef.current = el.scrollLeft;
+    track.setPointerCapture(e.pointerId);
+  };
+
+  const handlePointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (!isDraggingRef.current) return;
+    const el = targetRef.current;
+    const track = trackRef.current;
+    if (!el || !track) return;
+
+    const deltaX = e.clientX - dragStartXRef.current;
+    const currentTrackWidth = track.clientWidth;
+    const currentThumbWidth = Math.max(
+      32,
+      Math.min(
+        (metrics.clientWidth / metrics.scrollWidth) * currentTrackWidth,
+        currentTrackWidth,
+      ),
+    );
+    const currentAvailable = Math.max(1, currentTrackWidth - currentThumbWidth);
+    const scrollDelta = (deltaX / currentAvailable) * maxScroll;
+    el.scrollLeft = Math.max(
+      0,
+      Math.min(maxScroll, dragStartScrollLeftRef.current + scrollDelta),
+    );
+  };
+
+  const handlePointerUp = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (isDraggingRef.current) {
+      isDraggingRef.current = false;
+      try {
+        trackRef.current?.releasePointerCapture(e.pointerId);
+      } catch {
+        // ignore
+      }
+    }
+  };
+
+  return (
+    <div className="pt-2 select-none">
+      <div
+        ref={trackRef}
+        className="relative h-1.5 w-full cursor-pointer rounded-full bg-transparent"
+        onPointerDown={handlePointerDown}
+        onPointerMove={handlePointerMove}
+        onPointerUp={handlePointerUp}
+        onPointerCancel={handlePointerUp}
+      >
+        <div
+          className="absolute top-0 bottom-0 rounded-full bg-[#2a2a2a] transition-colors hover:bg-[#3a3a3a]"
+          style={{
+            width: `${thumbWidth}px`,
+            transform: `translateX(${thumbLeft}px)`,
+          }}
+        />
+      </div>
     </div>
   );
 }
@@ -1802,7 +2020,7 @@ function FullDiscographyView({
           headerHost,
         )}
 
-      <div className="artist-pane w-1/2 shrink-0 min-w-0 bg-black px-[var(--ui-page-pad)] pl-[var(--ui-page-left-pad)] pb-[calc(var(--ui-player-bottom)+var(--ui-player-height)+1.25rem)] pt-[calc(var(--ui-topbar-height)+5rem)]">
+      <div className="artist-pane w-1/2 shrink-0 min-w-0 bg-black px-[var(--ui-page-pad)] pl-[var(--ui-page-left-pad)] pr-[var(--ui-page-right-pad)] pb-[1.25rem] pt-[calc(var(--ui-topbar-height)+5rem)]">
         <div className="mx-auto max-w-[1120px] pt-1">
           <DiscographyHeaderControls
             artistTitle={artistTitle}

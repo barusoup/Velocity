@@ -21,11 +21,9 @@ import {
   Play,
 } from "lucide-react";
 import { CoverImageCropper } from "./CoverImageCropper";
-import {
-  PLAYLIST_TRACK_GRID,
-  TrackListHeader,
-} from "./TrackList";
-import { DefaultArtwork, ConfirmDialog, rowSaveButtonRevealClass } from "./Shared";
+import { PLAYLIST_TRACK_GRID } from "./TrackList";
+import { UnifiedTrackList } from "./UnifiedTrackList";
+import { capThumbnailUrl, DefaultArtwork, ConfirmDialog, rowSaveButtonRevealClass } from "./Shared";
 import { PlaylistContextMenu } from "./PlaylistContextMenu";
 import { SaveButton } from "./SaveButton";
 import { useIsTrackSaved, useToggleTrackSave } from "../hooks/useCollectionSelectors";
@@ -42,7 +40,6 @@ import { getDirectArtistBrowseId, resolveArtistBrowseId } from "../utils/navigat
 import { AnimatedShuffle } from "./PlayerButtonIcons";
 import { useSetting, setSetting } from "../settings";
 import { useTrackPlaybackState } from "../hooks/usePlayerSelectors";
-import { VirtualList } from "./VirtualList";
 
 // ---------------------------------------------------------------------------
 // UserPlaylistPage
@@ -271,7 +268,7 @@ export function UserPlaylistPage({
 
   if (!playlist) {
     return (
-      <div className="pt-[var(--ui-topbar-height)] px-[var(--ui-page-pad)] pl-[var(--ui-page-left-pad)] pb-12">
+      <div className="pt-[var(--ui-topbar-height)] px-[var(--ui-page-pad)] pl-[var(--ui-page-left-pad)] pr-[var(--ui-page-right-pad)] pb-12">
         <div className="mx-auto max-w-[var(--ui-content-max)]">
           <EmptyPlaylistState />
         </div>
@@ -297,7 +294,7 @@ export function UserPlaylistPage({
       />
 
       <section
-        className="px-[var(--ui-page-pad)] pl-[var(--ui-page-left-pad)] pb-[clamp(1rem,2vw,1.4rem)] pt-[clamp(1.1rem,2.2vw,1.6rem)] transition-opacity duration-150"
+        className="px-[var(--ui-page-pad)] pl-[var(--ui-page-left-pad)] pr-[var(--ui-page-right-pad)] pb-[clamp(1rem,2vw,1.4rem)] pt-[clamp(1.1rem,2.2vw,1.6rem)] transition-opacity duration-150"
         style={controlStyle}
       >
         <div className="flex min-h-[3rem] flex-wrap items-center gap-4 sm:gap-5">
@@ -406,17 +403,17 @@ export function UserPlaylistPage({
         />
       )}
 
-      <section className="bg-black px-[var(--ui-page-pad)] pl-[var(--ui-page-left-pad)] pb-[clamp(2.5rem,3.125vw,4rem)] pt-[clamp(1.4rem,3vw,2.2rem)]">
-        <TrackListHeader showAlbum showDateAdded dividerHidden={firstTrackHovered || firstTrackActive} />
-
+      <section className="bg-black px-[var(--ui-page-pad)] pl-[var(--ui-page-left-pad)] pr-[var(--ui-page-right-pad)] pb-[clamp(2.5rem,3.125vw,4rem)] pt-[clamp(1.4rem,3vw,2.2rem)]">
         {tracks.length === 0 ? (
           <EmptyPlaylistTracksState onAddToQueue={onAddAlbumToQueue} />
         ) : (
-          <VirtualList
-            items={tracks}
+          <UnifiedTrackList
+            tracks={tracks}
+            variant="playlist"
             estimateSize={viewMode === "compact" ? 44 : 56}
             getItemKey={(track) => track.id}
-            renderItem={(track, index) =>
+            headerProps={{ showAlbum: true, showDateAdded: true, dividerHidden: firstTrackHovered || firstTrackActive }}
+            renderTrack={(track, index) =>
               viewMode === "compact" ? (
                 <CompactTrackRow
                   track={track}
@@ -546,7 +543,7 @@ function PlaylistHero({
 
   return (
     <section
-      className="relative flex min-h-[clamp(17.75rem,26vw,22rem)] items-end px-[var(--ui-page-pad)] pl-[var(--ui-page-left-pad)] pb-[clamp(1.35rem,2.2vw,1.9rem)] pt-[calc(var(--ui-topbar-height)+clamp(0.75rem,1.5vw,1.25rem))]"
+      className="relative flex min-h-[clamp(17.75rem,26vw,22rem)] items-end px-[var(--ui-page-pad)] pl-[var(--ui-page-left-pad)] pr-[var(--ui-page-right-pad)] pb-[clamp(1.35rem,2.2vw,1.9rem)] pt-[calc(var(--ui-topbar-height)+clamp(0.75rem,1.5vw,1.25rem))]"
       style={heroStyle}
     >
       <div className="flex min-w-0 flex-col gap-[clamp(1.25rem,2vw,1.75rem)] md:flex-row md:items-end">
@@ -651,7 +648,7 @@ function PlaylistCoverButton({
     >
       {cover ? (
         <img
-          src={cover}
+          src={capThumbnailUrl(cover, 256)}
           alt=""
           className="block h-full w-full object-cover"
           draggable={false}

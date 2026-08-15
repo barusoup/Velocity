@@ -98,23 +98,70 @@ function isNearViewport(element: Element): boolean {
   return rect.bottom >= -margin && rect.top <= window.innerHeight + margin;
 }
 
-export function useResolvedArtworkSource(sources: Array<string | null | undefined>) {
+const YT_THUMBNAIL_SIZE_RE = /=w\d+-h\d+/;
+
+/**
+ * Rewrite a YouTube/Google-hosted thumbnail URL to request a smaller variant
+ * (e.g. `=w640-h640-l90-rj` -> `=w160-h160-l90-rj`). Other hosts are left
+ * untouched. Returns the original URL when no size suffix is present.
+ */
+export function capThumbnailUrl(url: string, maxSize: number): string {
+  if (maxSize <= 0 || !url.includes("ytimg.com") && !url.includes("googleusercontent.com") && !url.includes("youtube.com")) {
+    return url;
+  }
+  return url.replace(YT_THUMBNAIL_SIZE_RE, `=w${maxSize}-h${maxSize}`);
+}
+
+const ARTWORK_SIZE_BUCKETS = [128, 256, 512, 1024];
+
+/** Pick the smallest cache/request bucket that covers a rendered box (in CSS px, incl. device pixel ratio). */
+function artworkSizeBucket(cssSize: number): number {
+  const target = Math.ceil(cssSize * (typeof window !== "undefined" ? window.devicePixelRatio || 1 : 1));
+  for (const bucket of ARTWORK_SIZE_BUCKETS) {
+    if (target <= bucket) return bucket;
+  }
+  return ARTWORK_SIZE_BUCKETS[ARTWORK_SIZE_BUCKETS.length - 1];
+}
+
+/**
+ * Resolve which URL to render for an artwork slot, trying candidates in order
+ * and preferring an already-cached local copy when one exists.
+ *
+ * `options.skipCache` bypasses the warm-cache lookup only (the error fallback
+ * that downloads via the backend is kept). Use it for slots that render an
+ * image much larger than the artwork cache's 512px ceiling — e.g. the artist
+ * page hero banner, which would otherwise paint the blurry 512px copy that
+ * PlayerBar/CollectionPage preloaded for icon-sized usage.
+ */
+export function useResolvedArtworkSource(
+  sources: Array<string | null | undefined>,
+  maxSize = 0,
+  options?: { skipCache?: boolean },
+) {
+  const skipCache = options?.skipCache === true;
   const sourceSignature = sources.map((source) => source?.trim() ?? "").join("\n");
   const candidates = useMemo(
-    () => buildArtworkCandidateList(sources),
-    [sourceSignature],
+    () => {
+      const base = buildArtworkCandidateList(sources);
+      if (maxSize <= 0) return base;
+      const capped = base.map((url) => capThumbnailUrl(url, maxSize));
+      return Array.from(new Set([...capped, ...base]));
+    },
+    [sourceSignature, maxSize],
   );
   const [candidateIndex, setCandidateIndex] = useState(0);
-  const [cachedSrc, setCachedSrc] = useState<string | null>(() => peekCachedArtworkForCandidates(candidates));
+  const [cachedSrc, setCachedSrc] = useState<string | null>(() =>
+    skipCache ? null : peekCachedArtworkForCandidates(candidates),
+  );
   const [cacheAttempted, setCacheAttempted] = useState(false);
   const signatureRef = useRef(sourceSignature);
 
   useEffect(() => {
     signatureRef.current = sourceSignature;
     setCandidateIndex(0);
-    setCachedSrc(peekCachedArtworkForCandidates(candidates));
+    setCachedSrc(skipCache ? null : peekCachedArtworkForCandidates(candidates));
     setCacheAttempted(false);
-  }, [sourceSignature, candidates]);
+  }, [sourceSignature, candidates, skipCache]);
 
   const activeSrc = cachedSrc ?? candidates[candidateIndex] ?? null;
 
@@ -169,6 +216,14 @@ function ArtworkSkeleton({ className }: { className: string }) {
   return <span className={`block bg-neutral-800 ${className}`} aria-hidden />;
 }
 
+/**
+ * Loads that finish faster than this are treated as instant: the artwork is
+ * swapped in at full opacity with no fade. Cached/on-disk images otherwise
+ * pay the full 150ms grey-to-cover transition even though they were ready a
+ * frame after mount. Only genuinely slow (cold/network) loads get the fade.
+ */
+const INSTANT_ARTWORK_LOAD_MS = 100;
+
 function ArtworkImageLoaded({
   src,
   sources,
@@ -176,6 +231,7 @@ function ArtworkImageLoaded({
   draggable = false,
   fallback,
   loading,
+  maxSize,
 }: {
   src?: string | null;
   sources?: Array<string | null | undefined>;
@@ -183,19 +239,30 @@ function ArtworkImageLoaded({
   draggable?: boolean;
   fallback?: ReactNode;
   loading: "lazy" | "eager";
+  maxSize: number;
 }) {
-  const resolved = useResolvedArtworkSource(sources ?? [src]);
+  const resolved = useResolvedArtworkSource(sources ?? [src], maxSize);
   const activeSrc = resolved.src;
   const imgRef = useRef<HTMLImageElement | null>(null);
   const [loaded, setLoaded] = useState(() => isArtworkUrlLoaded(activeSrc));
+  // Only set once the load has demonstrably taken a while; the transition
+  // class lives on this flag so instant loads skip the 150ms fade entirely.
+  const [fadeIn, setFadeIn] = useState(false);
+  const loadStartedAtRef = useRef<{ src: string; at: number } | null>(null);
 
   useEffect(() => {
     setLoaded(isArtworkUrlLoaded(activeSrc));
+    setFadeIn(false);
   }, [activeSrc]);
 
   useLayoutEffect(() => {
     const img = imgRef.current;
     if (!img || !activeSrc) return;
+    // Re-arm the load timer whenever the src changes: the browser starts a
+    // fresh fetch at that point, so elapsed time must be measured from it.
+    if (loadStartedAtRef.current?.src !== activeSrc) {
+      loadStartedAtRef.current = { src: activeSrc, at: performance.now() };
+    }
     if (img.complete && img.naturalWidth > 0) {
       markArtworkUrlLoaded(activeSrc);
       setLoaded(true);
@@ -213,16 +280,21 @@ function ArtworkImageLoaded({
         ref={imgRef}
         src={activeSrc}
         alt=""
-        className={`block bg-transparent transition-opacity duration-150 ${loaded ? "opacity-100" : "opacity-0"} ${className}`}
+        className={`block bg-transparent ${fadeIn ? "transition-opacity duration-150" : ""} ${loaded ? "opacity-100" : "opacity-0"} ${className}`}
         draggable={draggable}
         decoding="async"
         loading={loading}
         onLoad={() => {
           markArtworkUrlLoaded(activeSrc);
+          const started = loadStartedAtRef.current;
+          const elapsed =
+            started && started.src === activeSrc ? performance.now() - started.at : 0;
           setLoaded(true);
+          setFadeIn(elapsed >= INSTANT_ARTWORK_LOAD_MS);
         }}
         onError={(event) => {
           setLoaded(false);
+          setFadeIn(false);
           resolved.onError(event.currentTarget.currentSrc || event.currentTarget.src);
         }}
       />
@@ -247,9 +319,20 @@ export function ArtworkImage({
 }) {
   const hostRef = useRef<HTMLSpanElement | null>(null);
   const [visible, setVisible] = useState(loading === "eager");
+  const [measuredSize, setMeasuredSize] = useState(0);
   const hasSource = Boolean(
     buildArtworkCandidateList(sources ?? [src]).length > 0,
   );
+
+  useLayoutEffect(() => {
+    const host = hostRef.current;
+    if (!host) return;
+    const rect = host.getBoundingClientRect();
+    const cssSize = Math.max(rect.width, rect.height);
+    if (cssSize > 0) {
+      setMeasuredSize(artworkSizeBucket(cssSize));
+    }
+  }, [loading, hasSource, src, sources]);
 
   useLayoutEffect(() => {
     if (loading === "eager") {
@@ -285,6 +368,7 @@ export function ArtworkImage({
           draggable={draggable}
           fallback={fallback}
           loading={loading}
+          maxSize={measuredSize}
         />
       ) : hasSource ? (
         <ArtworkSkeleton className={className} />
@@ -461,17 +545,7 @@ export const TrackRow = memo(function TrackRow({
   );
 });
 
-// JSON-encode the track for the right-click context menu's data-track
-// attribute. We strip filePath/audioSrc because they're large and
-// the menu never needs them. _labelOrigin is internal queue metadata
-// that doesn't belong in the data attribute.
-export function encodeTrackForContextMenu(track: MediaTrack): string {
-  const { filePath: _filePath, audioSrc: _audioSrc, _labelOrigin: _lo, ...rest } = track;
-  void _filePath;
-  void _audioSrc;
-  void _lo;
-  return JSON.stringify(rest);
-}
+export { encodeTrackForContextMenu } from "../utils/track-factory";
 
 function PlayingBars() {
   return (

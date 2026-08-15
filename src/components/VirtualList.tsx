@@ -73,7 +73,7 @@ function VirtualListBody<T>({
   useLayoutEffect(() => {
     if (!enabled) return;
     // Re-sync positions after a hidden→visible transition before paint.
-    virtualizer.scrollToOffset(virtualizer.scrollOffset, { behavior: "auto" });
+    virtualizer.scrollToOffset(virtualizer.scrollOffset ?? 0, { behavior: "auto" });
   }, [enabled, virtualizer, items.length]);
 
   const totalSize = virtualizer.getTotalSize();

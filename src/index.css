@@ -11,37 +11,88 @@ html {
   --app-height: 100dvh;
 }
 
+/* Window chrome — transparent window + CSS rounding
+   Tauri is configured with `decorations: false`, `shadow: false`,
+   `transparent: true` (see tauri.conf.json). The native DWM 1px
+   light-grey resize border that caused the "weird outline" is gone
+   because `shadow: false` removes it. Windows 11 native rounded
+   corners are also gone with it, so we recreate them in CSS:
+
+   - `html`/`body` are transparent so the desktop shows through the
+     rounded corners.
+   - `#root` is the opaque black surface that actually gets the
+     `border-radius` and `overflow: hidden` clipping.
+   - When the window is maximized or pseudo-fullscreen (F11) the radius
+     is removed so the app fills the monitor edge-to-edge without
+     desktop gaps at the corners. JS toggles `data-window-maximized`
+     / `data-window-fullscreen` on <html> (see App.tsx). */
+html,
+body {
+  background: transparent !important;
+  border: none !important;
+  outline: none !important;
+  box-shadow: none !important;
+  overflow: hidden;
+}
+
+html:focus,
+body:focus,
+#root:focus {
+  outline: none !important;
+  box-shadow: none !important;
+}
+
 body {
   font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
   font-feature-settings: "ss01", "cv02", "cv03";
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
-  background: #000000;
+  background: transparent !important;
   color: #f5f5f5;
   overflow: hidden;
   user-select: none;
   -webkit-user-select: none;
+  border: none !important;
+  outline: none !important;
+  box-shadow: none !important;
+}
+
+#root {
+  background: #000000;
+  border: none !important;
+  outline: none !important;
+  box-shadow: none !important;
+  border-radius: 10px;
+  overflow: hidden;
+}
+
+/* Fullscreen / maximized — square corners so the window truly fills
+   the monitor. The JS in App.tsx sets these data attrs via Tauri. */
+html[data-window-maximized="true"] #root,
+html[data-window-fullscreen="true"] #root {
+  border-radius: 0 !important;
 }
 
 #root {
   --ui-sidebar-open: clamp(12.5rem, 17.5vw, 15rem);
   --ui-sidebar-closed: clamp(3.25rem, 4.375vw, 4rem);
   --ui-sidebar-rail: var(--ui-sidebar-closed);
+  --ui-nowplaying-open: clamp(17rem, 20vw, 22rem);
   --ui-topbar-height: clamp(3.25rem, 4.375vw, 4.25rem);
   --ui-page-pad: clamp(1rem, 3.125vw, 2.75rem);
   --ui-content-max: clamp(64rem, 93.75vw, 82rem);
   --ui-player-max: clamp(56rem, 95vw, 90rem);
-  --ui-player-side: clamp(11rem, 17.1875vw, 15rem);
+  --ui-player-side: clamp(14rem, 28vw, 24rem);
   --ui-control: clamp(2.4rem, 3.4375vw, 3rem);
   --ui-control-sm: clamp(2.2rem, 3.125vw, 2.75rem);
-  --ui-art-sm: clamp(3.2rem, 4.6875vw, 4rem);
+  --ui-art-sm: clamp(2.75rem, 4vw, 3.5rem);
   --ui-art-row: clamp(3.25rem, 4.375vw, 4rem);
   --ui-art-feature: clamp(5rem, 7.5vw, 6.5rem);
   --ui-art-lg: clamp(10rem, 16.25vw, 14rem);
   --ui-radius-panel: clamp(1rem, 2.1875vw, 1.75rem);
   --ui-artist-hero: clamp(26.875rem, 36.71875vw, 34rem);
   --ui-player-bottom: clamp(0.75rem, 1.5625vw, 1.5rem);
-  --ui-player-height: clamp(4.1rem, 5.9375vw, 5.4rem);
+  --ui-player-height: clamp(4.8rem, 6.25vw, 5.8rem);
   --ui-home-card-width: clamp(10.25rem, 15.3125vw, 12.25rem);
   /* Five cards, four gap-1 gaps, and px-1 rail padding — keeps the first
      five songs fully visible when the rail is centered. */
@@ -53,17 +104,59 @@ body {
     --ui-sidebar-open: min(82vw, 17rem);
     --ui-sidebar-closed: 0rem;
     --ui-sidebar-rail: 3.5rem;
+    --ui-nowplaying-open: min(82vw, 22rem);
     --ui-player-side: 0rem;
     --ui-player-bottom: 0.5rem;
   }
+}
+
+/*
+ * Sidebar expand/collapse — content-area sync.
+ *
+ * The sidebar `<aside>` animates its `width` (220ms ease-out) and the
+ * player bar animates its `left`/`width` on the same curve, but the
+ * page content used to snap: `--ui-sidebar-current` (which feeds the
+ * scrollport's `pl-[var(--ui-page-left-pad)]`, the full-bleed page
+ * heroes, and the TopBar's left padding) flipped instantly between
+ * `--ui-sidebar-open` and `--ui-sidebar-closed`. That made the content
+ * jump a whole sidebar-width in one frame while the sidebar's edge and
+ * the player bar glided, which read as a jolt.
+ *
+ * Registering `--ui-sidebar-current` as an interpolable `<length>` and
+ * transitioning it on the layout wrapper (`.sidebar-layout-transition`
+ * in App.tsx) turns it into a smooth animation. Every consumer that
+ * resolves this variable — directly or through the derived
+ * `--ui-page-left-pad` calc — picks up the per-frame value, so the
+ * whole workspace shifts in lockstep with the sidebar edge and the
+ * player bar using the exact same 220ms cubic-bezier(0.22,1,0.36,1)
+ * timing.
+ */
+@property --ui-sidebar-current {
+  syntax: "<length>";
+  inherits: true;
+  initial-value: 0px;
+}
+
+@property --ui-nowplaying-current {
+  syntax: "<length>";
+  inherits: true;
+  initial-value: 0px;
+}
+
+.sidebar-layout-transition {
+  transition:
+    --ui-sidebar-current 220ms cubic-bezier(0.22, 1, 0.36, 1),
+    --ui-nowplaying-current 220ms cubic-bezier(0.22, 1, 0.36, 1);
 }
 
 * {
   box-sizing: border-box;
 }
 
+*:focus,
 *:focus-visible {
-  outline: none;
+  outline: none !important;
+  box-shadow: none !important;
 }
 
 button {
@@ -193,6 +286,17 @@ textarea,
 }
 
 .main-scrollport::-webkit-scrollbar {
+  display: none;
+}
+
+.home-card-rail,
+.artist-release-strip {
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+
+.home-card-rail::-webkit-scrollbar,
+.artist-release-strip::-webkit-scrollbar {
   display: none;
 }
 
@@ -410,6 +514,12 @@ input[type="number"]::-webkit-inner-spin-button {
 }
 
 @media (prefers-reduced-motion: reduce) {
+  .sidebar-layout-transition,
+  .sidebar-shell,
+  .nowplaying-shell {
+    transition: none;
+  }
+
   .queue-panel {
     transition: none;
   }
@@ -417,37 +527,40 @@ input[type="number"]::-webkit-inner-spin-button {
   .queue-drag-overlay {
     transition: none;
   }
-
-  .player-bar-shell.player-bar-lyrics-hidden {
-    transition: none;
-  }
 }
 
 .player-bar-shell {
   animation: player-bar-enter 380ms cubic-bezier(0.4, 0, 0.2, 1);
   transform-origin: bottom center;
-  will-change: opacity, transform, filter;
-  transform: translate3d(0, 0, 0) scale(1);
 }
 
 /*
- * Player bar hide/show on the lyrics page.
- *
- * Mirrors the search bar hide/show pattern: the transition is declared
- * inline on the element (so it composes with the existing width
- * transition), and the hidden state only overrides the endpoint
- * transform/opacity. The player bar lives at the bottom of the viewport
- * so it slides DOWN when hiding (opposite of the search bar which
- * slides up).
- *
- * Visible-state transform is an explicit identity matrix (translate3d
- * + scale) so Chromium interpolates smoothly against the hidden state's
- * matching function list — see note 1 in the search bar comment block.
+ * The play button uses a slightly longer, eased press and release than the
+ * other player controls. The smaller scale keeps the feedback tactile
+ * without making the button look like it is collapsing on click.
  */
-.player-bar-shell.player-bar-lyrics-hidden {
-  opacity: 0;
-  transform: translate3d(0, 12px, 0) scale(0.97);
-  pointer-events: none;
+.player-play-button {
+  will-change: transform;
+  transition:
+    transform 180ms cubic-bezier(0.22, 1, 0.36, 1),
+    background-color 150ms ease,
+    color 150ms ease;
+}
+
+.player-play-button:active {
+  transform: scale(0.95);
+  transition-duration: 120ms, 150ms, 150ms;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .player-play-button {
+    will-change: auto;
+    transition: none;
+  }
+
+  .player-play-button:active {
+    transform: none;
+  }
 }
 
 /*
@@ -687,6 +800,47 @@ input[type="number"]::-webkit-inner-spin-button {
   overflow: clip;
   height: 0;
   min-height: 0;
+}
+
+/*
+ * Sidebar-expand performance on the artist page.
+ *
+ * The off-screen pane above (height: 0 + overflow: clip) is invisible, but
+ * its ENTIRE subtree — the full discography with every release's track rows,
+ * or the overview with hero, top tracks, and release strip — is still laid
+ * out and painted on every frame of the sidebar's 220ms padding transition.
+ * That is the dominant cost that made artist/discography pages chug while
+ * every other page stayed smooth.
+ *
+ * Once the mount entrance cascade has settled (ArtistPage sets
+ * `data-artist-layout-settled` after the longest domino animation finishes),
+ * the browser is told to:
+ *   - skip the hidden pane's subtree entirely (`content-visibility: hidden`)
+ *     — it is already clipped to nothing, so the result is pixel-identical;
+ *   - skip off-viewport discography rows (`content-visibility: auto` +
+ *     remembered intrinsic size), so only rows near the viewport reflow.
+ *
+ * Rows are gated on the settled attribute (not applied from mount) so the
+ * domino entrance animations still play exactly once, and everything the
+ * user can actually see renders identically — only the per-frame layout
+ * cost becomes proportional to the visible viewport instead of the whole
+ * page tree. Grid cards and release blocks are deliberately excluded:
+ * `content-visibility` implies `contain: paint`, which would clip their
+ * large cover shadows at the container box.
+ */
+.artist-page-slider[data-artist-layout-settled].is-open .artist-pane:first-child,
+.artist-page-slider[data-artist-layout-settled]:not(.is-open) .artist-pane:last-child {
+  content-visibility: hidden;
+}
+
+.artist-page-slider[data-artist-layout-settled] .artist-discography-track {
+  content-visibility: auto;
+  /* Height-only on purpose: rows are block-width, so the shared
+     `contain-intrinsic-size` shorthand would also assert a width hint it
+     doesn't need. The `auto` keyword remembers each row's real height after
+     its first layout; the fallback (~artwork column + py-2 padding) only
+     sizes rows that have never been laid out when they first scroll in. */
+  contain-intrinsic-height: auto 4.5rem;
 }
 
 /*

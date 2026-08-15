@@ -1,4 +1,4 @@
-import { useEffect, useState, type ReactNode } from "react";
+import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
 import { CircleAlert, LoaderCircle } from "lucide-react";
 import { getArtistDetail, getEntityDetail, cacheArtwork } from "../api";
 import type { QueueOrigin } from "../player";
@@ -6,7 +6,7 @@ import type { MediaTrack, SearchItem } from "../types";
 import { buildArtistDisplayParts, buildArtistNameParts } from "../utils/artist-links";
 import { getDirectArtistBrowseId, resolveArtistBrowseId } from "../utils/navigation";
 import { isSameSongTrack } from "../utils/media";
-import { getSearchItemArtist } from "../utils/search";
+import { createTrackFromSearchItem } from "../utils/track-factory";
 import { extractInterestingArtworkColor, peekArtworkAccent, type RgbColor } from "../utils/artwork-color";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import type { View } from "./Sidebar";
@@ -22,9 +22,66 @@ export function EmptyPanel({ title, description }: { title: string; description:
   );
 }
 
+// Nearest scrollable ancestor of a loader host — the box the page content
+// will center itself in (the shared `.main-scrollport`, or a page-local
+// scroller). Mirrors the container resolution LyricsPage uses for its
+// loading overlay so every page-level spinner lands on the same spot the
+// loaded content occupies.
+function findScrollContainer(from: HTMLElement | null): HTMLElement | null {
+  let container: HTMLElement | null = from ? from.parentElement : null;
+  while (container) {
+    const style = window.getComputedStyle(container);
+    if (style.overflowY === "auto" || style.overflowY === "scroll") break;
+    container = container.parentElement;
+  }
+  return container;
+}
+
 export function LoadingPanel({ label }: { label: string }) {
+  const hostRef = useRef<HTMLDivElement | null>(null);
+  // Centered on the scrollport's MEASURED vertical center, not the window
+  // center or a fixed 55vh guess. The scrollport spans from the window top
+  // (under the floating topbar overlay) down to the player dock, so its
+  // center sits below the window center by half the dock height — an
+  // in-flow `min-h-[55vh]` box drifted off the same way the old lyrics
+  // spinner did.
+  const [centerY, setCenterY] = useState(() =>
+    typeof window === "undefined" ? 0 : window.innerHeight / 2,
+  );
+
+  useLayoutEffect(() => {
+    const measure = () => {
+      const host = hostRef.current;
+      if (!host) return;
+      const container = findScrollContainer(host);
+      if (!container) {
+        setCenterY(window.innerHeight / 2);
+        return;
+      }
+      const rect = container.getBoundingClientRect();
+      setCenterY(rect.top + rect.height / 2);
+    };
+
+    measure();
+    window.addEventListener("resize", measure);
+    let observer: ResizeObserver | null = null;
+    if (typeof ResizeObserver !== "undefined") {
+      observer = new ResizeObserver(measure);
+      const container = findScrollContainer(hostRef.current);
+      if (container) observer.observe(container);
+    }
+    return () => {
+      window.removeEventListener("resize", measure);
+      observer?.disconnect();
+    };
+  }, []);
+
   return (
-    <div className="flex min-h-[55vh] items-center justify-center">
+    <div
+      ref={hostRef}
+      className="pointer-events-none fixed left-[var(--ui-sidebar-current)] right-0 z-20 flex -translate-y-1/2 items-center justify-center"
+      style={{ top: centerY }}
+    >
       <LoaderCircle size={40} className="animate-spin text-neutral-400" aria-label={label} />
       <span className="sr-only">{label}</span>
     </div>
@@ -267,32 +324,7 @@ export function SearchItemMeta({
   return <>{formatSearchItemMeta(item)}</>;
 }
 
-export function toTrack(item: SearchItem): MediaTrack | null {
-  if (item.kind !== "song" || !item.videoId) return null;
-  // Encode the release/album so identical songs that appear under multiple
-  // YouTube Music releases (single vs. parent album) get distinct ids. This
-  // mirrors the Rust-side `track_id` and `trackFromSearchItem` so every
-  // MediaTrack constructor agrees on the same release-scoped identity.
-  const id = item.albumBrowseId
-    ? `yt:${item.videoId}:${item.albumBrowseId}`
-    : `yt:${item.videoId}`;
-  return {
-    id,
-    kind: item.kind,
-    title: item.title,
-    artist: getSearchItemArtist(item),
-    album: item.album ?? null,
-    albumBrowseId: item.albumBrowseId ?? null,
-    artistBrowseId: item.artistBrowseId ?? null,
-    artistCredits: item.artistCredits ?? null,
-    durationSeconds: item.durationSeconds ?? null,
-    playCount: item.playCount ?? null,
-    cover: item.cover ?? null,
-    videoId: item.videoId,
-    source: "stream",
-    filePath: null,
-  };
-}
+export const toTrack = createTrackFromSearchItem;
 
 export function isItemPlaying(
   item: SearchItem,

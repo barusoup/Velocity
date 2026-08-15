@@ -16,7 +16,6 @@ import type { MediaTrack } from "../types";
 import {
   getCachedDailyRecommendations,
   getTopSongRows,
-  getTopSongsPeriodLimit,
   needsDailyRecommendationRefresh,
   subscribeTasteProfile,
   type TopSongsPeriod,
@@ -167,6 +166,136 @@ function HomeTrackCard({
   );
 }
 
+function HomeRailScrollbar({
+  targetRef,
+}: {
+  targetRef: React.RefObject<HTMLDivElement | null>;
+}) {
+  const [metrics, setMetrics] = useState({
+    scrollLeft: 0,
+    scrollWidth: 0,
+    clientWidth: 0,
+  });
+  const trackRef = useRef<HTMLDivElement | null>(null);
+  const isDraggingRef = useRef(false);
+  const dragStartXRef = useRef(0);
+  const dragStartScrollLeftRef = useRef(0);
+
+  const updateMetrics = useCallback(() => {
+    const el = targetRef.current;
+    if (!el) return;
+    setMetrics({
+      scrollLeft: el.scrollLeft,
+      scrollWidth: el.scrollWidth,
+      clientWidth: el.clientWidth,
+    });
+  }, [targetRef]);
+
+  useEffect(() => {
+    const el = targetRef.current;
+    if (!el) return;
+    updateMetrics();
+
+    el.addEventListener("scroll", updateMetrics, { passive: true });
+    const ro = new ResizeObserver(updateMetrics);
+    ro.observe(el);
+
+    return () => {
+      el.removeEventListener("scroll", updateMetrics);
+      ro.disconnect();
+    };
+  }, [targetRef, updateMetrics]);
+
+  const maxScroll = Math.max(0, metrics.scrollWidth - metrics.clientWidth);
+  if (maxScroll <= 1) return null;
+
+  const trackEl = trackRef.current;
+  const trackWidth = trackEl ? trackEl.clientWidth : 0;
+  const rawThumbWidth =
+    trackWidth > 0 && metrics.scrollWidth > 0
+      ? (metrics.clientWidth / metrics.scrollWidth) * trackWidth
+      : 0;
+  const thumbWidth = Math.max(32, Math.min(rawThumbWidth, trackWidth));
+  const availableTrack = Math.max(0, trackWidth - thumbWidth);
+  const scrollRatio = maxScroll > 0 ? metrics.scrollLeft / maxScroll : 0;
+  const thumbLeft = availableTrack * Math.min(1, Math.max(0, scrollRatio));
+
+  const handlePointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
+    const el = targetRef.current;
+    const track = trackRef.current;
+    if (!el || !track) return;
+
+    const trackRect = track.getBoundingClientRect();
+    const clickX = e.clientX - trackRect.left;
+
+    if (clickX < thumbLeft || clickX > thumbLeft + thumbWidth) {
+      const clickRatio =
+        (clickX - thumbWidth / 2) / Math.max(1, trackWidth - thumbWidth);
+      el.scrollLeft = Math.max(0, Math.min(maxScroll, clickRatio * maxScroll));
+    }
+
+    isDraggingRef.current = true;
+    dragStartXRef.current = e.clientX;
+    dragStartScrollLeftRef.current = el.scrollLeft;
+    track.setPointerCapture(e.pointerId);
+  };
+
+  const handlePointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (!isDraggingRef.current) return;
+    const el = targetRef.current;
+    const track = trackRef.current;
+    if (!el || !track) return;
+
+    const deltaX = e.clientX - dragStartXRef.current;
+    const currentTrackWidth = track.clientWidth;
+    const currentThumbWidth = Math.max(
+      32,
+      Math.min(
+        (metrics.clientWidth / metrics.scrollWidth) * currentTrackWidth,
+        currentTrackWidth,
+      ),
+    );
+    const currentAvailable = Math.max(1, currentTrackWidth - currentThumbWidth);
+    const scrollDelta = (deltaX / currentAvailable) * maxScroll;
+    el.scrollLeft = Math.max(
+      0,
+      Math.min(maxScroll, dragStartScrollLeftRef.current + scrollDelta),
+    );
+  };
+
+  const handlePointerUp = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (isDraggingRef.current) {
+      isDraggingRef.current = false;
+      try {
+        trackRef.current?.releasePointerCapture(e.pointerId);
+      } catch {
+        // ignore
+      }
+    }
+  };
+
+  return (
+    <div className="px-[var(--ui-page-pad)] pl-[var(--ui-page-left-pad)] pr-[var(--ui-page-right-pad)] pt-1 select-none">
+      <div
+        ref={trackRef}
+        className="relative h-1.5 w-full cursor-pointer rounded-full bg-transparent"
+        onPointerDown={handlePointerDown}
+        onPointerMove={handlePointerMove}
+        onPointerUp={handlePointerUp}
+        onPointerCancel={handlePointerUp}
+      >
+        <div
+          className="absolute top-0 bottom-0 rounded-full bg-[#2a2a2a] transition-colors hover:bg-[#3a3a3a]"
+          style={{
+            width: `${thumbWidth}px`,
+            transform: `translateX(${thumbLeft}px)`,
+          }}
+        />
+      </div>
+    </div>
+  );
+}
+
 function HomeTrackCardRail({
   tracks,
   onPlayTrack,
@@ -179,31 +308,34 @@ function HomeTrackCardRail({
   const { stripRef, isDragging, onPointerDown, onClickCapture } = useHorizontalDragScroll();
 
   return (
-    <div
-      ref={stripRef}
-      className={cn(
-        "home-card-rail flex gap-1 overflow-x-auto overscroll-x-contain px-1 pb-1 select-none [scrollbar-width:none] [&::-webkit-scrollbar]:hidden",
-        isDragging ? "cursor-grabbing" : "cursor-grab",
-      )}
-      onPointerDown={onPointerDown}
-      onClickCapture={onClickCapture}
-    >
-      {tracks.map((track) => (
-        <div key={homeTrackRailKey(track)} className="w-[var(--ui-home-card-width)] shrink-0">
-          <HomeTrackCard
-            track={track}
-            onPlayTrack={onPlayTrack}
-            onNavigate={onNavigate}
-          />
-        </div>
-      ))}
+    <div>
+      <div
+        ref={stripRef}
+        className={cn(
+          "home-card-rail flex gap-3 overflow-x-auto overscroll-x-contain select-none px-[var(--ui-page-pad)] pl-[var(--ui-page-left-pad)] pr-[var(--ui-page-right-pad)]",
+          isDragging ? "cursor-grabbing" : "cursor-grab",
+        )}
+        onPointerDown={onPointerDown}
+        onClickCapture={onClickCapture}
+      >
+        {tracks.map((track) => (
+          <div key={homeTrackRailKey(track)} className="w-[var(--ui-home-card-width)] shrink-0">
+            <HomeTrackCard
+              track={track}
+              onPlayTrack={onPlayTrack}
+              onNavigate={onNavigate}
+            />
+          </div>
+        ))}
+      </div>
+      <HomeRailScrollbar targetRef={stripRef} />
     </div>
   );
 }
 
 function HomeEmptyState({ title, description }: { title: string; description: string }) {
   return (
-    <div className="flex flex-col items-center gap-3 px-3 py-16 text-center">
+    <div className="flex flex-col items-center gap-3 py-16 text-center px-[var(--ui-page-pad)] pl-[var(--ui-page-left-pad)] pr-[var(--ui-page-right-pad)]">
       <p className="text-base font-semibold text-white">{title}</p>
       <p className="max-w-md text-sm text-neutral-400">{description}</p>
     </div>
@@ -257,7 +389,7 @@ export function HomePage({
   }, [topPeriod]);
 
   const topSongRows = useMemo(
-    () => getTopSongRows(topPeriod, getTopSongsPeriodLimit(topPeriod)),
+    () => getTopSongRows(topPeriod, DAILY_RECOMMENDATIONS_TARGET),
     [topPeriod, profileRevision],
   );
   const topSongs = useMemo(() => topSongRows.map((row) => row.track), [topSongRows]);
@@ -293,10 +425,10 @@ export function HomePage({
   const showRecsLoading = recsStatus === "loading" && dailyTracks.length === 0;
 
   return (
-    <div className="home-page relative pt-[clamp(0.75rem,1.25vw,1.125rem)]">
+    <div className="home-page relative pt-[calc(var(--ui-topbar-height)+clamp(0.75rem,1.25vw,1.125rem))] pb-[clamp(2.5rem,3.125vw,4rem)]">
       {showTopSongs ? (
         <section className="mb-[clamp(2rem,3.125vw,3.25rem)]">
-          <div className="mb-4 flex flex-wrap items-end justify-between gap-x-4 gap-y-2 px-3">
+          <div className="mb-4 flex flex-wrap items-end justify-between gap-x-4 gap-y-2 px-[var(--ui-page-pad)] pl-[var(--ui-page-left-pad)] pr-[var(--ui-page-right-pad)]">
             <h2 className="text-2xl font-semibold leading-none text-white">Top Songs</h2>
             <div ref={periodTabContainerRef} className="relative flex translate-y-[7px] items-center gap-1.5">
               {periodIndicatorStyle && (
@@ -334,18 +466,20 @@ export function HomePage({
       ) : null}
 
       {showTodaysPicks ? (
-        <section className="mb-16">
-          <h2 className="mb-2 px-3 text-2xl font-semibold text-white">Today&apos;s Picks</h2>
+        <section>
+          <h2 className="mb-2 px-[var(--ui-page-pad)] pl-[var(--ui-page-left-pad)] pr-[var(--ui-page-right-pad)] text-2xl font-semibold text-white">
+            Today&apos;s Picks
+          </h2>
 
           {showRecsLoading ? (
-            <div className="flex items-center justify-center gap-3 px-3 py-16">
+            <div className="flex items-center justify-center gap-3 py-16 px-[var(--ui-page-pad)] pl-[var(--ui-page-left-pad)] pr-[var(--ui-page-right-pad)]">
               <LoaderCircle size={28} className="animate-spin text-neutral-400" aria-label="Finding songs for you" />
               <span className="text-sm font-semibold text-neutral-400">Finding songs for you</span>
             </div>
           ) : null}
 
           {recsStatus === "error" ? (
-            <div className="px-3 py-16 text-center">
+            <div className="py-16 text-center px-[var(--ui-page-pad)] pl-[var(--ui-page-left-pad)] pr-[var(--ui-page-right-pad)]">
               <p className="text-base font-semibold text-white">Something went wrong</p>
               <p className="mt-2 text-sm text-neutral-400">{recsError ?? "Could not load recommendations."}</p>
             </div>

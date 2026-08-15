@@ -8,9 +8,10 @@ import {
   type ReactNode,
 } from "react";
 import { HardDrive, Monitor, Settings as SettingsIcon, Volume2 } from "lucide-react";
-import { scheduleOfflineSyncForTrack, useCollectionActions, useCollectionData } from "../collection";
+import { useCollectionActions } from "../collection";
 import { usePlayer } from "../player";
 import {
+  type ExportFormat,
   type Settings,
   getSetting,
   getSettings,
@@ -19,12 +20,19 @@ import {
   clearAllUserData,
   subscribe,
 } from "../settings";
-import { clearAllOffline } from "../api";
+import { clearAllOffline, reconcileOfflineQuality } from "../api";
+import { useOfflineStatusStore } from "../store/offlineStatusStore";
 import { clearTasteProfile } from "../taste-profile";
 import { cn } from "../utils/cn";
 import { ConfirmDialog } from "./Shared";
 
-type ConfirmAction = "configs" | "data" | "offline" | "tasteProfile" | null;
+type ConfirmAction =
+  | "configs"
+  | "data"
+  | "offline"
+  | "downloadQuality"
+  | "tasteProfile"
+  | null;
 type SettingsTab = "general" | "playback" | "display" | "storage";
 
 const SETTINGS_TABS: {
@@ -44,6 +52,16 @@ let _lastSettingsTab: SettingsTab | null = null;
 let _homeMenuEnabledBeforeSectionLock = false;
 
 const EQ_FREQUENCIES = ["32", "64", "125", "250", "500", "1k", "2k", "4k", "8k", "16k"] as const;
+
+const EXPORT_FORMAT_OPTIONS: {
+  value: ExportFormat;
+  label: string;
+  hint: string;
+}[] = [
+  { value: "native", label: "Native", hint: "Original audio, no re-encode" },
+  { value: "opus", label: "Opus", hint: "Efficient, great quality" },
+  { value: "mp3", label: "MP3", hint: "Broadest compatibility" },
+];
 
 function ToggleRow({
   label,
@@ -158,8 +176,7 @@ function DangerButton({
 }
 
 export function SettingsPage() {
-  const { savedSongs } = useCollectionData();
-  const { updateSongMetadata } = useCollectionActions();
+  const { resyncOfflineDownloads } = useCollectionActions();
   const player = usePlayer();
   const [tab, setTab] = useState<SettingsTab>(_lastSettingsTab ?? "general");
   const [settings, setSettingsState] = useState<Settings>(getSettings);
@@ -204,10 +221,8 @@ export function SettingsPage() {
   // function identity on each `savedSongs` mutation, which then re-renders
   // every ToggleRow in this page even though nothing about the toggles
   // actually changed.
-  const savedSongsRef = useRef(savedSongs);
-  savedSongsRef.current = savedSongs;
-  const updateSongMetadataRef = useRef(updateSongMetadata);
-  updateSongMetadataRef.current = updateSongMetadata;
+  const resyncOfflineDownloadsRef = useRef(resyncOfflineDownloads);
+  resyncOfflineDownloadsRef.current = resyncOfflineDownloads;
 
   useEffect(() => {
     const unsub = subscribe((key, _value) => {
@@ -246,19 +261,14 @@ export function SettingsPage() {
       setLaunchOnStartup(value as boolean);
     }
     // When the user enables offline sync, retroactively backfill offline
-    // files for every track already in the collection. Without this fire
-    // the toggle only affected future saves (each individual Save action
-    // reads the setting), and the user had to unsave/resave every song
-    // they wanted offline. Fired with `.catch(() => {})` so a failed
-    // download for one track can't take the rest down with it. Uses the
-    // ref snapshot above so the callback can stay referentially stable
-    // across saves.
+    // files for every saved song that doesn't have one yet. The download
+    // queue (see `utils/offline-download-queue.ts`) bounds the work to a
+    // couple of downloads at a time and retries failures silently, so
+    // enabling the toggle can't fire a download storm or leave a manual
+    // "click to retry" state. Uses the ref snapshot above so the callback
+    // can stay referentially stable across saves.
     if (key === "offlineSync" && value === true) {
-      for (const track of savedSongsRef.current) {
-        if (track.source === "stream" && track.videoId) {
-          scheduleOfflineSyncForTrack(track, updateSongMetadataRef.current);
-        }
-      }
+      resyncOfflineDownloadsRef.current();
     }
   }, []);
 
@@ -298,6 +308,9 @@ export function SettingsPage() {
 
   const handleDisableOfflineSync = useCallback(() => {
     clearAllOffline().catch(() => {});
+    // The files are being deleted — drop every "downloaded" badge so the
+    // collection stops advertising them as available offline.
+    useOfflineStatusStore.getState().clearAll();
     updateSetting("offlineSync", false);
     setConfirmAction(null);
   }, [updateSetting]);
@@ -311,6 +324,34 @@ export function SettingsPage() {
     clearTasteProfile();
     setConfirmAction(null);
   }, []);
+
+  // Detect whether any offline audio files exist on disk. The status
+  // store tracks every id we've downloaded (or attempted); "downloaded"
+  // is the only state that guarantees a file exists. Used to decide
+  // whether toggling compact mode needs the confirm dialog.
+  const hasOfflineFiles = useCallback(() => {
+    const statuses = useOfflineStatusStore.getState().byVideoId;
+    return Object.values(statuses).some((status) => status === "downloaded");
+  }, []);
+
+  // Apply the compact-download setting, then reconcile existing offline
+  // files to match: full→compact re-encodes the local files (no
+  // re-download), compact→full re-downloads at full quality. The
+  // backend sweeps every id and reports failures internally, so a
+  // partial failure is fine to swallow here.
+  const applyCompactDownloads = useCallback((value: boolean) => {
+    updateSetting("compactDownloads", value);
+    setConfirmAction(null);
+    reconcileOfflineQuality(value).catch(() => {});
+  }, [updateSetting]);
+
+  const handleCompactDownloadsToggle = useCallback((value: boolean) => {
+    if (value && hasOfflineFiles()) {
+      setConfirmAction("downloadQuality");
+    } else {
+      applyCompactDownloads(value);
+    }
+  }, [applyCompactDownloads, hasOfflineFiles]);
 
   const homeSectionsEnabled =
     settings.showHomeTopSongs || settings.showHomeTodaysPicks;
@@ -393,7 +434,7 @@ export function SettingsPage() {
           ))}
         </div>
         <p className="shrink-0 text-xs font-medium tracking-[0.04em] text-neutral-500">
-          Velocity v0.1.5 Experimental
+          Velocity v0.1.6 Experimental
         </p>
       </div>
 
@@ -576,16 +617,16 @@ export function SettingsPage() {
               <SectionHeader>Lyrics &amp; Display</SectionHeader>
               <div className="divide-y divide-white/5">
                 <ToggleRow
-                  label="Disable search bar on lyrics"
-                  description="Keep the search bar disabled on the lyrics page instead of revealing it on hover"
-                  enabled={settings.hideSearchOnLyrics}
-                  onChange={(v) => updateSetting("hideSearchOnLyrics", v)}
+                  label="Hide sidebar on lyrics"
+                  description="Hide the sidebar on the lyrics page; hover the left edge or press Ctrl+B to reveal it"
+                  enabled={settings.hideSidebarOnLyrics}
+                  onChange={(v) => updateSetting("hideSidebarOnLyrics", v)}
                 />
                 <ToggleRow
-                  label="Disable media player on lyrics"
-                  description="Keep the media player disabled on the lyrics page instead of revealing it on hover"
-                  enabled={settings.hidePlayerOnLyrics}
-                  onChange={(v) => updateSetting("hidePlayerOnLyrics", v)}
+                  label="Hide Now Playing menu on lyrics"
+                  description="Hide the Now Playing menu on the lyrics page; hover the right edge to reveal it"
+                  enabled={settings.hideNowPlayingOnLyrics}
+                  onChange={(v) => updateSetting("hideNowPlayingOnLyrics", v)}
                 />
                 <ToggleRow
                   label="Fade distant lyrics"
@@ -605,7 +646,7 @@ export function SettingsPage() {
               <div className="divide-y divide-white/5">
                 <ToggleRow
                   label="Save songs for offline playback"
-                  description="When enabled, songs added to your collection are automatically downloaded for offline listening. Disabling will prompt to remove downloaded files."
+                  description="When enabled, songs added to your collection are automatically downloaded for offline listening, quietly in the background. Disabling will prompt to remove downloaded files."
                   enabled={settings.offlineSync}
                   onChange={(v) => {
                     if (!v) {
@@ -615,6 +656,48 @@ export function SettingsPage() {
                     }
                   }}
                 />
+              </div>
+            </section>
+
+            <section>
+              <SectionHeader>Downloads &amp; Exports</SectionHeader>
+              <div className="divide-y divide-white/5">
+                <ToggleRow
+                  label="Compact downloads"
+                  description="Store offline downloads as 64 kbps Opus to save disk space. Existing files are re-encoded when you turn this on; turning it off re-downloads them at full quality."
+                  enabled={settings.compactDownloads}
+                  onChange={handleCompactDownloadsToggle}
+                />
+                <div className="py-3">
+                  <div className="mb-2 text-sm font-medium text-white">
+                    Save to my device format
+                  </div>
+                  <div className="flex flex-wrap gap-1.5">
+                    {EXPORT_FORMAT_OPTIONS.map((option) => {
+                      const active = settings.exportFormat === option.value;
+                      return (
+                        <button
+                          key={option.value}
+                          type="button"
+                          aria-pressed={active}
+                          onClick={() => updateSetting("exportFormat", option.value)}
+                          className={cn(
+                            "rounded-full border px-4 py-1.5 text-sm font-medium transition",
+                            active
+                              ? "border-white bg-white text-black"
+                              : "border-neutral-700 text-neutral-200 hover:border-neutral-500 hover:text-white",
+                          )}
+                        >
+                          {option.label}
+                        </button>
+                      );
+                    })}
+                  </div>
+                  <p className="mt-1.5 text-xs text-neutral-500">
+                    Native copies the original file without re-encoding; Opus and MP3
+                    are re-encoded and tagged.
+                  </p>
+                </div>
               </div>
             </section>
 
@@ -677,6 +760,15 @@ export function SettingsPage() {
         onSecondary={() => {
           handleKeepOfflineFiles();
         }}
+      />
+
+      <ConfirmDialog
+        open={confirmAction === "downloadQuality"}
+        title="Switch to compact downloads?"
+        message="Existing offline downloads will be re-encoded to 64 kbps Opus to save disk space. You can switch back to full quality at any time, which re-downloads them at full quality."
+        confirmLabel="Compact existing files"
+        onConfirm={() => applyCompactDownloads(true)}
+        onCancel={() => setConfirmAction(null)}
       />
 
     </div>

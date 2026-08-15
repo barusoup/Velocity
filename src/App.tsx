@@ -14,7 +14,6 @@ import { SongContextMenu, type AddToPlaylistResolver } from "./components/SongCo
 import { ConfirmDialog } from "./components/Shared";
 import { LoadingPanel } from "./components/PagesShared";
 import { PlayerProvider, usePlayer, type QueueOrigin } from "./player";
-import { usePlayerHasTrack } from "./hooks/usePlayerSelectors";
 import { useGlobalContextMenus } from "./hooks/useGlobalContextMenus";
 import { useGlobalShortcuts } from "./hooks/useGlobalShortcuts";
 import { useImportedTracksHydration } from "./hooks/useImportedTracksHydration";
@@ -31,16 +30,20 @@ import {
   enrichUploadMetadataFromYtm,
   isPlaceholderAlbumName,
 } from "./utils/upload-enrichment";
-import { getSearchItemArtist } from "./utils/search";
 import { cn } from "./utils/cn";
+import { createTrackFromSearchItem } from "./utils/track-factory";
 import { getItem, setItem } from "./storage";
-import { getSettings, useSetting } from "./settings";
+import { getSettings, setSetting, useSetting } from "./settings";
+import { invoke } from "@tauri-apps/api/core";
 import PlayerBar from "./components/PlayerBar";
+import { NowPlayingPanel } from "./components/NowPlayingPanel";
 import { HomePage } from "./components/HomePage";
 import { SearchPage } from "./components/SearchPage";
 import { Sidebar, TopBar, isSearchWorkspace, type View } from "./components/Sidebar";
 import { useTasteProfileTracking } from "./hooks/useTasteProfileTracking";
+import { useHistoryStack } from "./hooks/useHistoryStack";
 import { DEFAULT_SEARCH_FILTERS, type SearchFilters } from "./components/SearchFilters";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 
 declare global {
   interface Window {
@@ -58,20 +61,6 @@ const UserPlaylistsPage = lazy(() => import("./components/UserPlaylistsPage").th
 
 const RECENT_SEARCHES_KEY = "velocity-recent-searches";
 
-type HistoryEntry = {
-  view: View;
-  scrollTop: number;
-};
-
-type HistoryState = {
-  entries: HistoryEntry[];
-  index: number;
-};
-
-function getArtistSection(view: Extract<View, { name: "artist" }>): "overview" | "discography" {
-  return view.section ?? "overview";
-}
-
 function readStoredArray<T>(key: string, fallback: T[]): T[] {
   try {
     const raw = getItem(key);
@@ -80,50 +69,6 @@ function readStoredArray<T>(key: string, fallback: T[]): T[] {
     return Array.isArray(parsed) ? (parsed as T[]) : fallback;
   } catch {
     return fallback;
-  }
-}
-
-function viewsEqual(left: View, right: View): boolean {
-  if (left.name !== right.name) return false;
-  switch (left.name) {
-    case "collection":
-      if (right.name !== "collection") return false;
-      return left.tab === right.tab;
-    case "home":
-      return right.name === "home";
-    case "search":
-      return right.name === "search" && left.query === right.query;
-    case "lyrics":
-      return true;
-    case "settings":
-      return true;
-    case "album":
-    case "artist":
-    case "playlist":
-      if (
-        right.name !== left.name ||
-        left.browseId !== right.browseId ||
-        left.context !== right.context
-      ) {
-        return false;
-      }
-      if (left.name === "artist") {
-        // `right` is guaranteed to share `left`'s shape here (discriminant
-        // check + fall-through guard), but TypeScript can't propagate that
-        // correlation into this nested branch. Narrow-cast so the helper
-        // accepts the argument.
-        return (
-          getArtistSection(left) ===
-          getArtistSection(right as Extract<View, { name: "artist" }>)
-        );
-      }
-      return true;
-    case "user-playlist":
-      return right.name === "user-playlist" && left.id === right.id;
-    case "user-playlists":
-      return right.name === "user-playlists";
-    default:
-      return false;
   }
 }
 
@@ -166,47 +111,8 @@ function getViewAnimationKey(view: View): string {
 // If the next view matches the currently active one, we drop the push so the
 // history doesn't pile up duplicate entries when navigation is triggered more
 // than once for the same destination (e.g. a rapid double-click).
-function pushHistoryEntry(
-  current: HistoryState,
-  nextView: View,
-  scrollTop: number,
-): HistoryState {
-  const active = current.entries[current.index]?.view;
-  if (active && viewsEqual(active, nextView)) {
-    return current;
-  }
-  const entries = current.entries.slice(0, current.index + 1);
-  entries.push({ view: nextView, scrollTop });
-  return { entries, index: entries.length - 1 };
-}
 
-function trackFromSearchItem(item: SearchItem): MediaTrack | null {
-  if (!item.videoId) return null;
-  // Encode the release/album so identical songs that appear under multiple
-  // YouTube Music releases (e.g. a single and its parent album) produce
-  // distinct MediaTrack ids. This keeps the UI's "selected" row identity
-  // aligned with the actual release the user picked instead of bleeding
-  // across every appearance.
-  const id = item.albumBrowseId
-    ? `yt:${item.videoId}:${item.albumBrowseId}`
-    : `yt:${item.videoId}`;
-  return {
-    id,
-    kind: item.kind,
-    title: item.title,
-    artist: getSearchItemArtist(item),
-    album: item.album ?? null,
-    albumBrowseId: item.albumBrowseId ?? null,
-    artistBrowseId: item.artistBrowseId ?? null,
-    artistCredits: item.artistCredits ?? null,
-    durationSeconds: item.durationSeconds ?? null,
-    playCount: item.playCount ?? null,
-    cover: item.cover ?? null,
-    videoId: item.videoId,
-    source: "stream",
-    filePath: null,
-  };
-}
+const trackFromSearchItem = createTrackFromSearchItem;
 
 function getInitialView(): View {
   return getSettings().showHomeMenu ? { name: "home" } : { name: "collection" };
@@ -214,45 +120,113 @@ function getInitialView(): View {
 
 function Shell() {
   const player = usePlayer();
-  const hasActiveTrack = usePlayerHasTrack();
   const showHomeMenu = useSetting("showHomeMenu");
-  const [sidebarOpen, setSidebarOpen] = useState(true);
+  const sidebarOpen = useSetting("sidebarOpen");
+  const nowPlayingOpen = useSetting("nowPlayingOpen");
+  const hasTrack = Boolean(player.currentTrack);
+  const effectiveNowPlayingOpen = hasTrack && nowPlayingOpen;
+  // On the lyrics page the control panels (sidebar / now playing panel)
+  // stay hidden by default and only slide out while the cursor hovers
+  // near the edges of the window. Those reveals are tracked separately
+  // from the persistent preferences so leaving the lyrics page restores
+  // them exactly as they were before.
+  const [lyricsControlsRevealed, setLyricsControlsRevealed] = useState(false);
+  const [lyricsNowPlayingRevealed, setLyricsNowPlayingRevealed] = useState(false);
 
   useStartupSplash();
   useStartupMinimized();
   useDiscordRichPresence();
   useViewportHeightTracker();
-
-  const handleToggleSidebar = useCallback(() => {
-    setSidebarOpen((current) => !current);
-  }, []);
-
-  useGlobalShortcuts({ onToggleSidebar: handleToggleSidebar });
   useTasteProfileTracking();
 
-  const [historyState, setHistoryState] = useState<HistoryState>(() => ({
-    entries: [{ view: getInitialView(), scrollTop: 0 }],
-    index: 0,
-  }));
-  const [transientView, setTransientView] = useState<View | null>(null);
-  // Mirror of `transientView` so the synchronous setHistoryState callback can
-  // read the latest pending transient without relying on the (stale)
-  // useCallback closure value. Cleared inline whenever a transient is
-  // committed, so back-to-back navigations in the same render don't push it
-  // twice.
-  const transientViewRef = useRef<View | null>(null);
+  // Keep window chrome in sync for transparent+rounded mode.
+  // With `transparent: true` + `shadow: false` the window is rounded via
+  // CSS (`#root { border-radius: 10px }`). When maximized or pseudo-
+  // fullscreen the radius must be 0 so the app fills the monitor.
+  useEffect(() => {
+    const html = document.documentElement;
+    let cancelled = false;
+    let unlistenResized: (() => void) | undefined;
+
+    const syncChrome = async () => {
+      try {
+        const win = getCurrentWindow();
+        const [maximized, nativeFs, pseudoFs] = await Promise.all([
+          win.isMaximized().catch(() => false),
+          win.isFullscreen().catch(() => false),
+          invoke<boolean>("is_app_fullscreen").catch(() => false),
+        ]);
+        if (cancelled) return;
+        const isFs = nativeFs || pseudoFs;
+        html.setAttribute("data-window-maximized", String(maximized));
+        html.setAttribute("data-window-fullscreen", String(isFs));
+      } catch {
+        if (!cancelled) {
+          html.setAttribute("data-window-maximized", "false");
+          html.setAttribute("data-window-fullscreen", "false");
+        }
+      }
+    };
+
+    void syncChrome();
+    try {
+      const win = getCurrentWindow();
+      // onResized fires for maximize/unmaximize and for pseudo-fullscreen
+      // size changes. This is the only trigger needed — the previous
+      // 600 ms poll fired 5 IPC roundtrips per second forever, waking
+      // the backend and janking the main thread even when idle.
+      win
+        .onResized(() => {
+          void syncChrome();
+        })
+        .then((fn) => {
+          unlistenResized = fn;
+        })
+        .catch(() => {});
+    } catch {}
+    // Listen for Tauri window focus/active changes which also reflect
+    // fullscreen transitions on some platforms, as a lightweight
+    // alternative to polling.
+    const onWindowFocus = () => void syncChrome();
+    const onVisibility = () => {
+      if (document.visibilityState === "visible") void syncChrome();
+    };
+    window.addEventListener("focus", onWindowFocus);
+    document.addEventListener("visibilitychange", onVisibility);
+
+    return () => {
+      cancelled = true;
+      window.removeEventListener("focus", onWindowFocus);
+      document.removeEventListener("visibilitychange", onVisibility);
+      unlistenResized?.();
+    };
+  }, []);
+
   const scrollContainerRef = useRef<HTMLDivElement | null>(null);
-  const transientScrollTopRef = useRef(0);
-  const committedView = historyState.entries[historyState.index].view;
-  const view = transientView ?? committedView;
+  const {
+    historyState,
+    setHistoryState,
+    transientView,
+    setTransientView,
+    transientViewRef,
+    transientScrollTopRef,
+    view,
+    canBack,
+    canForward,
+    transitionView,
+    navigate,
+    goBack,
+    goForward,
+    viewsEqual,
+    pushHistoryEntry,
+  } = useHistoryStack(getInitialView(), scrollContainerRef);
   const pageAnimationKey = getViewAnimationKey(view);
-  const canBack = Boolean(transientView) || historyState.index > 0;
-  const canForward = !transientView && historyState.index < historyState.entries.length - 1;
   // Pages that paint their own cover-style hero stretch all the way to
   // the topbar — these views drop the scroll container's outer pt / px
   // so the hero's internal `pt-[calc(topbar+pad)]` and `px-[page-pad]`
   // are the single source of clearance, avoiding double padding.
   const isFullBleedView =
+    view.name === "home" ||
     view.name === "album" ||
     view.name === "playlist" ||
     view.name === "user-playlist" ||
@@ -260,10 +234,158 @@ function Shell() {
     view.name === "artist" ||
     view.name === "lyrics";
 
-  const hideSearchOnLyrics = useSetting("hideSearchOnLyrics");
-  const hidePlayerOnLyrics = useSetting("hidePlayerOnLyrics");
+  const hideSidebarOnLyrics = useSetting("hideSidebarOnLyrics");
+  const hideNowPlayingOnLyrics = useSetting("hideNowPlayingOnLyrics");
   const onLyricsPage = view.name === "lyrics";
-  const lyricsPlayerHidden = onLyricsPage && hidePlayerOnLyrics;
+  // With the "hide sidebar on lyrics" toggle ON, the sidebar stays hidden
+  // on the lyrics page and slides out while the cursor hovers near the
+  // left edge (or Ctrl+B is pressed). With the toggle OFF it behaves like
+  // every other page, following the persistent open/closed state.
+  const lyricsSidebarHidden =
+    onLyricsPage && hideSidebarOnLyrics && !lyricsControlsRevealed;
+  // With the "hide now playing on lyrics" toggle ON, the now playing menu
+  // stays hidden on the lyrics page and slides out while the cursor hovers near
+  // the right edge (or the toggle button is clicked).
+  const lyricsNowPlayingHidden =
+    onLyricsPage && hideNowPlayingOnLyrics && !lyricsNowPlayingRevealed;
+
+  // Sidebar toggle. Works the same everywhere: toggles the persistent
+  // open/closed state. On the lyrics page the toggle also brings the
+  // hidden sidebar back into view (Ctrl+B / brand button) so those
+  // shortcuts have a visible effect there too. Collapsing, on the other
+  // hand, drops the reveal immediately — otherwise the collapsed rail
+  // would linger after the pointer has already left its (now smaller)
+  // footprint, with nothing re-evaluating it until the next mouse move.
+  const handleToggleSidebar = useCallback(() => {
+    const next = !sidebarOpen;
+    if (onLyricsPage && hideSidebarOnLyrics) {
+      setLyricsControlsRevealed(next);
+    }
+    setSetting("sidebarOpen", next);
+  }, [onLyricsPage, hideSidebarOnLyrics, sidebarOpen]);
+
+  const handleToggleNowPlaying = useCallback(() => {
+    if (!player.currentTrack) return;
+    const next = !nowPlayingOpen;
+    if (onLyricsPage && hideNowPlayingOnLyrics) {
+      setLyricsNowPlayingRevealed(next);
+    }
+    setSetting("nowPlayingOpen", next);
+  }, [onLyricsPage, hideNowPlayingOnLyrics, nowPlayingOpen, player.currentTrack]);
+
+  useGlobalShortcuts({ onToggleSidebar: handleToggleSidebar });
+
+  // The reveal is hover-scoped with hysteresis: while the toggle is on
+  // and we're on the lyrics page, the sidebar slides out as soon as the
+  // pointer approaches its footprint and hides only once the pointer
+  // clearly leaves it. The two thresholds (a tight one to reveal, a wide
+  // one to hide) leave a dead band between them, so the state never
+  // oscillates when the pointer hovers near the sidebar's edge — it
+  // decisively stays open or closed instead of jittering.
+  useEffect(() => {
+    if (!onLyricsPage || !hideSidebarOnLyrics) return;
+    let frame = 0;
+    // The footprint matches the sidebar's intended rendered size
+    // (expanded or collapsed per the persistent preference), so hovering
+    // anywhere over where the sidebar would sit reveals it. The custom
+    // property is a `clamp(...)`, so resolve it to px by measuring a
+    // hidden probe element.
+    let intendedWidth = 0;
+    const measureIntended = () => {
+      const root = document.getElementById("root");
+      if (!root) return;
+      const probe = document.createElement("div");
+      probe.style.position = "absolute";
+      probe.style.visibility = "hidden";
+      probe.style.pointerEvents = "none";
+      probe.style.width = `var(${sidebarOpen ? "--ui-sidebar-open" : "--ui-sidebar-closed"})`;
+      root.appendChild(probe);
+      intendedWidth = parseFloat(getComputedStyle(probe).width) || 0;
+      probe.remove();
+    };
+    measureIntended();
+    const handlePointerMove = (event: MouseEvent) => {
+      if (frame) return;
+      frame = requestAnimationFrame(() => {
+        frame = 0;
+        const dock = document.querySelector(".player-bar-dock");
+        const zoneBottom = dock ? dock.getBoundingClientRect().top : window.innerHeight;
+        const width = intendedWidth > 0 ? intendedWidth : 64;
+        const hideMargin = Math.max(28, Math.round(width * 0.18));
+        setLyricsControlsRevealed((revealed) => {
+          const abovePlayerBar = event.clientY < zoneBottom;
+          if (revealed) {
+            // Stay open until the pointer clearly leaves the sidebar.
+            return abovePlayerBar && event.clientX < width + hideMargin;
+          }
+          // Reveal as soon as the pointer approaches the sidebar.
+          return abovePlayerBar && event.clientX < width + 12;
+        });
+      });
+    };
+    window.addEventListener("mousemove", handlePointerMove);
+    window.addEventListener("resize", measureIntended);
+    return () => {
+      window.removeEventListener("mousemove", handlePointerMove);
+      window.removeEventListener("resize", measureIntended);
+      if (frame) cancelAnimationFrame(frame);
+    };
+  }, [onLyricsPage, hideSidebarOnLyrics, sidebarOpen]);
+
+  // Hover reveal with hysteresis for Now Playing panel on lyrics page
+  useEffect(() => {
+    if (!onLyricsPage || !hideNowPlayingOnLyrics || !effectiveNowPlayingOpen) return;
+    let frame = 0;
+    let intendedWidth = 0;
+    const measureIntended = () => {
+      const root = document.getElementById("root");
+      if (!root) return;
+      const probe = document.createElement("div");
+      probe.style.position = "absolute";
+      probe.style.visibility = "hidden";
+      probe.style.pointerEvents = "none";
+      probe.style.width = "var(--ui-nowplaying-open)";
+      root.appendChild(probe);
+      intendedWidth = parseFloat(getComputedStyle(probe).width) || 0;
+      probe.remove();
+    };
+    measureIntended();
+    const handlePointerMove = (event: MouseEvent) => {
+      if (frame) return;
+      frame = requestAnimationFrame(() => {
+        frame = 0;
+        const dock = document.querySelector(".player-bar-dock");
+        const zoneBottom = dock ? dock.getBoundingClientRect().top : window.innerHeight;
+        const width = intendedWidth > 0 ? intendedWidth : 320;
+        const hideMargin = Math.max(28, Math.round(width * 0.18));
+        setLyricsNowPlayingRevealed((revealed) => {
+          const abovePlayerBar = event.clientY < zoneBottom;
+          const distFromRight = window.innerWidth - event.clientX;
+          if (revealed) {
+            // Stay open until the pointer clearly leaves the now playing panel.
+            return abovePlayerBar && distFromRight < width + hideMargin;
+          }
+          // Reveal as soon as the pointer approaches the now playing panel.
+          return abovePlayerBar && distFromRight < width + 12;
+        });
+      });
+    };
+    window.addEventListener("mousemove", handlePointerMove);
+    window.addEventListener("resize", measureIntended);
+    return () => {
+      window.removeEventListener("mousemove", handlePointerMove);
+      window.removeEventListener("resize", measureIntended);
+      if (frame) cancelAnimationFrame(frame);
+    };
+  }, [onLyricsPage, hideNowPlayingOnLyrics, effectiveNowPlayingOpen]);
+
+  // Leaving the lyrics page drops the hover reveal so the sidebar and
+  // now playing panel return to their persistent states.
+  useEffect(() => {
+    if (onLyricsPage) return;
+    setLyricsControlsRevealed(false);
+    setLyricsNowPlayingRevealed(false);
+  }, [onLyricsPage]);
 
   // Derived each render from refs + state. The hook reads it at render
   // time, then re-runs its layout effect when transientView or
@@ -277,22 +399,6 @@ function Shell() {
     savedScrollTop,
     enabled: true,
   });
-
-  const transitionView = useCallback((updater: () => void) => {
-    const currentScrollTop = scrollContainerRef.current?.scrollTop ?? 0;
-    if (transientView) {
-      transientScrollTopRef.current = currentScrollTop;
-    } else {
-      setHistoryState((current) => {
-        const active = current.entries[current.index];
-        if (active.scrollTop === currentScrollTop) return current;
-        const entries = current.entries.slice();
-        entries[current.index] = { ...active, scrollTop: currentScrollTop };
-        return { ...current, entries };
-      });
-    }
-    updater();
-  }, [transientView]);
 
   const [searchInput, setSearchInput] = useState("");
   const [recentSearches, setRecentSearches] = useState<string[]>(() =>
@@ -314,7 +420,7 @@ function Shell() {
   useEffect(() => {
     const mq = window.matchMedia("(max-width: 900px)");
     const collapseIfNarrow = () => {
-      if (mq.matches) setSidebarOpen(false);
+      if (mq.matches) setSetting("sidebarOpen", false);
     };
     // Only auto-collapse on narrow viewports. Never auto-expand when the
     // viewport widens — Win+Shift+Arrow monitor moves in fullscreen can
@@ -378,54 +484,79 @@ function Shell() {
   }, [searchSessionView, view]);
 
   const hydrateImportedDurations = useCallback(async (tracks: MediaTrack[]) => {
-    // Batch the duration probes so we don't spin up an `<audio>` element
-    // for every imported track at once. Each `readDuration` call creates a
-    // new media element and waits for metadata; with a large library this
-    // floods the audio subsystem and slows the first paint. Processing in
-    // fixed-size chunks keeps the boot responsive while still hydrating
-    // every track.
-    const BATCH_SIZE = 4;
-    for (let i = 0; i < tracks.length; i += BATCH_SIZE) {
-      const batch = tracks.slice(i, i + BATCH_SIZE);
+    // Hydrate durations + YTM enrichment in small batches, with explicit
+    // idle yielding between batches so the main thread stays responsive
+    // even with hundreds of local tracks. The previous version fired
+    // BATCH_SIZE=4 enrichUploadMetadataFromYtm calls in parallel per chunk
+    // with no yielding, which issued dozens of searchMusic IPCs back-to-back
+    // and blocked the UI. We now probe durations in parallel but enrich
+    // album/artist sequentially with a yield point.
+    const DURATION_BATCH = 3;
+    const ENRICH_CONCURRENCY = 2;
+    // Phase 1: durations only — fast, local, no network.
+    for (let i = 0; i < tracks.length; i += DURATION_BATCH) {
+      const batch = tracks.slice(i, i + DURATION_BATCH);
       await Promise.all(
         batch.map(async (track) => {
-          const updates: { durationSeconds?: number; album?: string; artist?: string } = {};
-
-          if (track.audioSrc && !track.durationSeconds) {
+          if (!track.audioSrc || track.durationSeconds) return;
+          try {
             const durationSeconds = await readDuration(track.audioSrc);
-            if (durationSeconds) updates.durationSeconds = durationSeconds;
+            if (!durationSeconds) return;
+            setUploadedTracks((current) =>
+              current.map((entry) =>
+                entry.id === track.id ? { ...entry, durationSeconds } : entry,
+              ),
+            );
+            void updateImportedTrackMetadata(track.id, { durationSeconds }).catch(() => undefined);
+          } catch {
+            // ignore
           }
-
-          if (
-            track.title &&
-            track.artist &&
-            isPlaceholderAlbumName(displayAlbumName(track.album))
-          ) {
-            try {
-              const enrichment = await enrichUploadMetadataFromYtm({
-                title: track.title,
-                artist: track.artist,
-                album: track.album,
-              });
-              if (enrichment?.album) updates.album = enrichment.album;
-              if (enrichment?.artist && isPlaceholderAlbumName(track.artist)) {
-                updates.artist = enrichment.artist;
-              }
-            } catch {
-              // best-effort
-            }
-          }
-
-          if (Object.keys(updates).length === 0) return;
-
-          setUploadedTracks((current) =>
-            current.map((entry) =>
-              entry.id === track.id ? { ...entry, ...updates } : entry,
-            ),
-          );
-          void updateImportedTrackMetadata(track.id, updates).catch(() => undefined);
         }),
       );
+      // Yield to the browser so the player bar and list can paint.
+      await new Promise<void>((r) => {
+        if (typeof window.requestIdleCallback === "function") {
+          window.requestIdleCallback(() => r(), { timeout: 50 });
+        } else {
+          setTimeout(r, 0);
+        }
+      });
+    }
+    // Phase 2: YTM enrichment — network bound, defer to idle and limit concurrency.
+    // Only enrich tracks that still have placeholder album names.
+    const needsEnrich = tracks.filter(
+      (t) => t.title && t.artist && isPlaceholderAlbumName(displayAlbumName(t.album)),
+    );
+    // Cap enrichment to first 30 tracks to avoid hammering search on huge libraries.
+    const enrichSlice = needsEnrich.slice(0, 30);
+    for (let i = 0; i < enrichSlice.length; i += ENRICH_CONCURRENCY) {
+      const batch = enrichSlice.slice(i, i + ENRICH_CONCURRENCY);
+      await Promise.all(
+        batch.map(async (track) => {
+          try {
+            const enrichment = await enrichUploadMetadataFromYtm({
+              title: track.title,
+              artist: track.artist,
+              album: track.album,
+            });
+            const updates: { album?: string; artist?: string } = {};
+            if (enrichment?.album) updates.album = enrichment.album;
+            if (enrichment?.artist && isPlaceholderAlbumName(track.artist)) {
+              updates.artist = enrichment.artist;
+            }
+            if (Object.keys(updates).length === 0) return;
+            setUploadedTracks((current) =>
+              current.map((entry) =>
+                entry.id === track.id ? { ...entry, ...updates } : entry,
+              ),
+            );
+            void updateImportedTrackMetadata(track.id, updates).catch(() => undefined);
+          } catch {
+            // best-effort
+          }
+        }),
+      );
+      await new Promise<void>((r) => setTimeout(r, 80));
     }
   }, []);
 
@@ -433,35 +564,6 @@ function Shell() {
     onLoaded: setUploadedTracks,
     onHydrate: hydrateImportedDurations,
   });
-
-  const navigate = useCallback((nextView: View) => {
-    transitionView(() => {
-      if (nextView.name === "search") {
-        if (viewsEqual(view, nextView)) return;
-        transientViewRef.current = nextView;
-        setTransientView(nextView);
-        return;
-      }
-
-      setTransientView(null);
-      setHistoryState((current) => {
-        let intermediate = current;
-        const pendingTransient = transientViewRef.current;
-        if (pendingTransient) {
-          const active = intermediate.entries[intermediate.index]?.view;
-          if (!active || !viewsEqual(active, pendingTransient)) {
-            intermediate = pushHistoryEntry(
-              intermediate,
-              pendingTransient,
-              transientScrollTopRef.current,
-            );
-          }
-          transientViewRef.current = null;
-        }
-        return pushHistoryEntry(intermediate, nextView, 0);
-      });
-    });
-  }, [transitionView, transientView, view]);
 
   useEffect(() => {
     if (!showHomeMenu && view.name === "home") {
@@ -756,21 +858,14 @@ function Shell() {
       // go back; otherwise fall back to a blank search.
       if (current.name === "user-playlist" && current.id === id) {
         if (canBack) {
-          transitionView(() => {
-            if (transientView) {
-              transientViewRef.current = null;
-              setTransientView(null);
-              return;
-            }
-            setHistoryState((prev) => ({ ...prev, index: prev.index - 1 }));
-          });
+          goBack();
         } else {
           navigate(showHomeMenu ? { name: "home" } : { name: "collection" });
         }
       }
       playlistsCtx.deletePlaylist(id);
     },
-    [view, navigate, playlistsCtx, canBack, transitionView, transientView, transientViewRef, setTransientView, setHistoryState, showHomeMenu],
+    [view, navigate, playlistsCtx, canBack, goBack, showHomeMenu],
   );
 
   // ── Playlist deletion confirmation (sidebar path) ───────────────────
@@ -840,25 +935,43 @@ function Shell() {
     }, []),
   });
 
-  // The sidebar overlays the workspace instead of consuming a flex column.
-  // That makes its rounded edge reveal the actual page underneath it (hero
-  // artwork, gradients, and scrolling content), rather than a separately
-  // maintained approximation of whichever page happens to be open.
+  // The sidebar overlays the workspace instead of consuming a flex column,
+  // so the page underneath it (hero artwork, gradients, and scrolling
+  // content) is the real thing rather than a separately maintained
+  // approximation of whichever page happens to be open.
   return (
     <div className="flex h-[var(--app-height)] w-full flex-col overflow-hidden text-neutral-100">
+      {/* `sidebar-layout-transition` registers + transitions
+           `--ui-sidebar-current` (an interpolable <length>, see index.css)
+           so the scrollport padding, page hero padding, TopBar inset, and
+           every other consumer of the variable glide in sync with the
+           sidebar width and the player bar's own 220ms ease-out transition
+           instead of snapping on toggle.
+           overflow-visible (not hidden) lets the sidebar crescent's
+           -bottom-px bleed 1px into the player bar to hide the hairline seam. */}
       <div
-        className="relative flex min-h-0 flex-1 overflow-hidden"
+        className="sidebar-layout-transition relative flex min-h-0 flex-1 overflow-visible"
         style={{
-          "--ui-sidebar-current": sidebarOpen
-            ? "var(--ui-sidebar-open)"
-            : "var(--ui-sidebar-closed)",
+          "--ui-sidebar-current": lyricsSidebarHidden
+            ? "0px"
+            : sidebarOpen
+              ? "var(--ui-sidebar-open)"
+              : "var(--ui-sidebar-closed)",
+          "--ui-nowplaying-current": lyricsNowPlayingHidden
+            ? "0px"
+            : effectiveNowPlayingOpen
+              ? "var(--ui-nowplaying-open)"
+              : "0px",
           "--ui-page-left-pad": "calc(var(--ui-sidebar-current) + var(--ui-page-pad))",
+          "--ui-page-right-pad": "calc(var(--ui-nowplaying-current) + var(--ui-page-pad))",
         } as React.CSSProperties}
       >
         <Sidebar
+          key="primary-sidebar"
           view={view}
           expanded={sidebarOpen}
-          onToggle={() => setSidebarOpen((current) => !current)}
+          hidden={lyricsSidebarHidden}
+          onToggle={handleToggleSidebar}
           onNavigate={navigate}
           playlists={playlistsCtx.playlists}
           playlistsSortMode={playlistsCtx.sortMode}
@@ -870,32 +983,19 @@ function Shell() {
           onTogglePinPlaylist={playlistsCtx.togglePlaylistPinned}
         />
 
-        <main className="relative flex min-w-0 flex-1 flex-col overflow-hidden bg-black">
+        <main key="main-content" className="relative flex min-w-0 flex-1 flex-col overflow-hidden bg-black">
           <TopBar
             canBack={canBack}
             canForward={canForward}
             suppressHistoryControls={false}
 
-            suppressSearchBar={onLyricsPage && hideSearchOnLyrics}
-            onBack={() =>
-              canBack &&
-              transitionView(() => {
-                if (transientView) {
-                  transientViewRef.current = null;
-                  setTransientView(null);
-                  return;
-                }
-                setHistoryState((current) => ({ ...current, index: current.index - 1 }));
-              })
-            }
-            onForward={() =>
-              canForward &&
-              transitionView(() => setHistoryState((current) => ({ ...current, index: current.index + 1 })))
-            }
+            onBack={goBack}
+            onForward={goForward}
             query={searchInput}
             onSearch={searchNow}
             isSearchLoading={isSearchLoading}
             sidebarExpanded={sidebarOpen}
+            nowPlayingOpen={effectiveNowPlayingOpen}
             showSearchFilters={view.name === "search" && Boolean(view.query.trim())}
             searchFilters={searchFilters}
             searchFiltersOpen={searchFiltersOpen}
@@ -911,10 +1011,8 @@ function Shell() {
               isFullBleedView ? "pt-0" : "pt-[var(--ui-topbar-height)]",
               isFullBleedView
                 ? "px-0"
-                : "pl-[var(--ui-page-left-pad)] pr-[var(--ui-page-pad)]",
-              hasActiveTrack && !lyricsPlayerHidden
-                ? "pb-[clamp(5rem,8vw,7.5rem)]"
-                : "pb-[clamp(1.5rem,2vw,2.5rem)]",
+                : "pl-[var(--ui-page-left-pad)] pr-[var(--ui-page-right-pad)]",
+              "pb-0",
             )}
           >
             <div
@@ -1024,11 +1122,7 @@ function Shell() {
                   />
                 )}
 
-                {view.name === "lyrics" && (
-                  <LyricsPage
-                    onNavigate={navigate}
-                  />
-                )}
+                {view.name === "lyrics" && <LyricsPage onNavigate={navigate} />}
 
                  {view.name === "settings" && (
                   <SettingsPage />
@@ -1045,12 +1139,26 @@ function Shell() {
             </div>
           </div>
         </main>
+
+        <NowPlayingPanel
+          key="now-playing-panel"
+          open={effectiveNowPlayingOpen}
+          hidden={lyricsNowPlayingHidden}
+          onClose={() => {
+            if (onLyricsPage && hideNowPlayingOnLyrics) {
+              setLyricsNowPlayingRevealed(false);
+            }
+            setSetting("nowPlayingOpen", false);
+          }}
+          onNavigate={navigate}
+        />
       </div>
 
       <PlayerBar
-        sidebarOpen={sidebarOpen}
         onNavigate={navigate}
         viewName={view.name}
+        nowPlayingOpen={effectiveNowPlayingOpen}
+        onToggleNowPlaying={handleToggleNowPlaying}
       />
 
       {/* Global song context menu — opens from any row that tags itself

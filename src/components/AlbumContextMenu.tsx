@@ -15,16 +15,14 @@ import { useCollectionActions } from "../collection";
 import { usePlayerState } from "../player";
 import { useIsAlbumSaved, useIsSongSavedByVideo } from "../hooks/useCollectionSelectors";
 import { deviceExportVideoIds, getEntityDetail, saveAlbumToMp3 } from "../api";
+import { getSetting } from "../settings";
 import { useDeviceExport } from "../hooks/useDeviceExport";
-import { exportStreamVideoId, filterQueueableTracks, sanitizeFilename } from "../utils/media";
+import { exportStreamVideoId, filterQueueableTracks } from "../utils/media";
+import { safeTrackFileName } from "../utils/save-helpers";
 import type { MediaTrack } from "../types";
-import { NestedSubMenuPanel } from "./NestedSubMenuPanel";
 import { SavingPanel } from "./SavingPanel";
-import {
-  ContextMenu,
-  ContextMenuItem,
-  ContextMenuSection,
-} from "./ContextMenu";
+import { PlaylistPickerSubMenu } from "./PlaylistPickerSubMenu";
+import { ContextMenu, ContextMenuItem } from "./ContextMenu";
 import type { View } from "./Sidebar";
 
 // -----------------------------------------------------------------------
@@ -224,7 +222,7 @@ export function AlbumContextMenu({
             title: track.title,
             artist: track.artist,
             trackNumber: idx + 1,
-            fileName: sanitizeFilename(track.title || "track"),
+            fileName: safeTrackFileName(track.title),
           };
         });
         return saveAlbumToMp3({
@@ -238,6 +236,7 @@ export function AlbumContextMenu({
           albumArtist: album.byline ?? null,
           year: null,
           coverUrl: album.cover ?? null,
+          format: getSetting("exportFormat"),
           tracks: resolvedTracks,
         });
       },
@@ -362,59 +361,13 @@ function AlbumPlaylistSubMenu({
   resolver: (query: string) => Promise<PlaylistSearchResult[]>;
   initialTracksLabel?: string;
 }) {
-  const [query, setQuery] = useState("");
-  const [results, setResults] = useState<PlaylistSearchResult[]>([]);
-  const [loading, setLoading] = useState(true);
-
-  useEffect(() => {
-    let cancelled = false;
-    setLoading(true);
-    void resolver(query)
-      .then((list) => {
-        if (cancelled) return;
-        setResults(list);
-        setLoading(false);
-      })
-      .catch(() => {
-        if (cancelled) return;
-        setResults([]);
-        setLoading(false);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [query, resolver]);
-
   return (
-    <NestedSubMenuPanel anchorRef={anchorRef} onClose={onClose}>
-      <ContextMenuSection label={initialTracksLabel ?? "Search playlists"}>
-        <div className="px-3 pb-2">
-          <input
-            autoFocus
-            value={query}
-            onChange={(event) => setQuery(event.target.value)}
-            placeholder="Type a playlist name…"
-            className="w-full rounded-md border border-white/10 bg-white/5 px-3 py-1.5 text-sm text-white placeholder-white/40 outline-none transition-colors focus:border-white/20 focus:bg-white/10"
-          />
-        </div>
-      </ContextMenuSection>
-      <div className="max-h-64 overflow-y-auto">
-        {loading && results.length === 0 ? (
-          <div className="px-4 py-3 text-xs text-white/40">Searching…</div>
-        ) : results.length === 0 ? (
-          <div className="px-4 py-3 text-xs text-white/40">
-            No playlists yet. Create one from the sidebar.
-          </div>
-        ) : (
-          results.map((playlist) => (
-            <ContextMenuItem
-              key={playlist.browseId + playlist.title}
-              label={playlist.title}
-              onClick={() => onPick(playlist)}
-            />
-          ))
-        )}
-      </div>
-    </NestedSubMenuPanel>
+    <PlaylistPickerSubMenu
+      anchorRef={anchorRef}
+      onClose={onClose}
+      onPick={onPick}
+      resolver={resolver}
+      label={initialTracksLabel ?? "Search playlists"}
+    />
   );
 }

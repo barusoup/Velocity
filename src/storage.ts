@@ -13,6 +13,8 @@ let _initFailed = false;
  */
 const _writeQueue = new Map<string, { type: "set" | "delete"; key: string; value?: string }>();
 let _writeQueueFlushing = false;
+let _flushTimer: ReturnType<typeof setTimeout> | null = null;
+const FLUSH_DEBOUNCE_MS = 120;
 
 function isVelocityKey(key: string): boolean {
   return key.startsWith(VELOCITY_PREFIX);
@@ -20,6 +22,10 @@ function isVelocityKey(key: string): boolean {
 
 async function flushWriteQueue(): Promise<void> {
   if (_writeQueueFlushing) return;
+  if (_flushTimer) {
+    clearTimeout(_flushTimer);
+    _flushTimer = null;
+  }
   _writeQueueFlushing = true;
   try {
     while (_writeQueue.size > 0) {
@@ -32,18 +38,29 @@ async function flushWriteQueue(): Promise<void> {
       } catch (error) {
         console.warn("[storage] Backend batch write failed:", error);
       }
+      // If new writes arrived while the IPC was in flight, loop will batch them.
+      // Yield one microtask so the main thread can paint between large batches.
+      if (_writeQueue.size > 0) {
+        await new Promise<void>((r) => setTimeout(r, 0));
+      }
     }
   } finally {
     _writeQueueFlushing = false;
   }
 }
 
+function scheduleFlush(): void {
+  if (_flushTimer || _writeQueueFlushing) return;
+  _flushTimer = setTimeout(() => {
+    _flushTimer = null;
+    void flushWriteQueue();
+  }, FLUSH_DEBOUNCE_MS);
+}
+
 function enqueueBackendWrite(type: "set" | "delete", key: string, value?: string): void {
   if (_initFailed) return;
   _writeQueue.set(key, { type, key, value });
-  if (!_writeQueueFlushing) {
-    void flushWriteQueue();
-  }
+  scheduleFlush();
 }
 
 export async function init(): Promise<void> {
@@ -89,11 +106,19 @@ export function removeItem(key: string): void {
 }
 
 export async function flush(): Promise<void> {
+  if (_flushTimer) {
+    clearTimeout(_flushTimer);
+    _flushTimer = null;
+  }
   await flushWriteQueue();
 }
 
 export async function clearAll(): Promise<void> {
   // Ensure queued mirrors cannot repopulate the backend after it is cleared.
+  if (_flushTimer) {
+    clearTimeout(_flushTimer);
+    _flushTimer = null;
+  }
   await flushWriteQueue();
   const keys: string[] = [];
   for (let i = 0; i < localStorage.length; i++) {

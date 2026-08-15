@@ -4,12 +4,14 @@ import type { LeadingSilenceData } from "./types";
 const LEADING_SILENCE_CACHE_KEY = "velocity-leading-silence-cache";
 
 // Bump whenever the Rust detection parameters change to invalidate stale
-// cached results. v2 → v3: lowered SILENCE_NOISE_DB from -35 to -50,
-// added SILENCE_END_PREROLL of 0.15 s.
-export const LEADING_SILENCE_ANALYSIS_VERSION = 3;
-export const MIN_LEADING_SILENCE_SKIP = 1;
-export const MAX_LEADING_SILENCE_SKIP = 30;
-export const LEADING_SILENCE_DETECT_TIMEOUT_MS = 2500;
+// cached results. v5 → v6: robust stream trimming with -42 dB threshold
+// and 0.35s minimum skip.
+// v6 → v7: switch to sample-accurate atrim re-encode and cap at 8s to avoid
+// trimming intended quiet intros; lyrics no longer offset by silence.
+export const LEADING_SILENCE_ANALYSIS_VERSION = 7;
+export const MIN_LEADING_SILENCE_SKIP = 0.35;
+export const MAX_LEADING_SILENCE_SKIP = 8;
+export const LEADING_SILENCE_DETECT_TIMEOUT_MS = 8000;
 /** Cap persisted leading-silence entries so long sessions don't grow without bound. */
 export const LEADING_SILENCE_CACHE_MAX_ENTRIES = 500;
 
@@ -67,4 +69,8 @@ export function resolveLeadingSilenceSkipSeconds(trackId: string): number {
   if (typeof skip !== "number" || !Number.isFinite(skip)) return 0;
   if (skip < MIN_LEADING_SILENCE_SKIP) return 0;
   return Math.min(skip, MAX_LEADING_SILENCE_SKIP);
+}
+
+export function resetLeadingSilenceCacheForTests(): void {
+  _leadingSilenceCache = null;
 }

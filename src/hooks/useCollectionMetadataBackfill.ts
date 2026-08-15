@@ -1,4 +1,4 @@
-import { useLayoutEffect, useRef } from "react";
+import { useEffect, useRef } from "react";
 import type { MediaTrack } from "../types";
 import {
   peekTrackMetadataCache,
@@ -33,19 +33,7 @@ export function useCollectionMetadataBackfill(
   const batchRef = useRef(updateSongsMetadataBatch);
   batchRef.current = updateSongsMetadataBatch;
 
-  const songsKey = songs
-    .map((track) =>
-      [
-        track.id,
-        track.durationSeconds ?? "",
-        track.playCount ?? "",
-        track.album ?? "",
-        track.albumBrowseId ?? "",
-      ].join(":"),
-    )
-    .join("|");
-
-  useLayoutEffect(() => {
+  useEffect(() => {
     const missing = songs.filter(trackNeedsCollectionMetadataBackfill);
     if (missing.length === 0) return;
 
@@ -124,5 +112,5 @@ export function useCollectionMetadataBackfill(
     void backfill();
 
     return () => controller.abort();
-  }, [songsKey, songs]);
+  }, [songs]);
 }

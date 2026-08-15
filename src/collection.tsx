@@ -8,21 +8,33 @@ import {
   type ReactNode,
 } from "react";
 import type { MediaTrack, SearchItem } from "./types";
-import { getSyncedLyricsForTrack, saveOffline, removeOffline } from "./api";
-import { getEntityDetail } from "./api";
+import {
+  cacheSavedAlbumDetail,
+  getEntityDetail,
+  listOfflineSongs,
+  removeCachedSavedAlbumDetail,
+  removeOffline,
+} from "./api";
 import { getSetting } from "./settings";
 import { getItem, setItem } from "./storage";
-import { resolveStreamTrackAudio, songMetadataFromMatch } from "./utils/song-resolution";
 import {
   savedEntryMatchesTrack,
   savedSongMatches,
 } from "./utils/saved-collection-match";
 import { useCollectionStore } from "./store/collectionStore";
+import { useOfflineStatusStore, type OfflineStatus } from "./store/offlineStatusStore";
 import {
   mergeTrackListMetadataBatch,
   type TrackMetadataUpdates,
 } from "./utils/track-metadata-backfill";
 import { getSearchItemArtist } from "./utils/search";
+import { streamIdentityVideoIds } from "./utils/media";
+import {
+  cancelOfflineSyncForVideoIds,
+  enqueueOfflineSync,
+  enqueueOfflineSyncForSavedSongs,
+  type OfflineSyncMetadataUpdates,
+} from "./utils/offline-download-queue";
 
 // ---------------------------------------------------------------------------
 // Saved-collection state
@@ -103,82 +115,19 @@ function coerceSavedSong(input: SavedSongInput): MediaTrack {
   };
 }
 
-export type SavedSongMetadataUpdates = Partial<
-  Pick<
-    MediaTrack,
-    | "durationSeconds"
-    | "playCount"
-    | "resolvedVideoId"
-    | "kind"
-    | "title"
-    | "artist"
-    | "album"
-    | "albumBrowseId"
-    | "artistBrowseId"
-    | "artistCredits"
-    | "cover"
-  >
->;
+export type SavedSongMetadataUpdates = OfflineSyncMetadataUpdates;
 
+/**
+ * Enqueue an offline download for a track. Downloads run through a single
+ * bounded queue (see `utils/offline-download-queue.ts`), so saving a whole
+ * album no longer fires every track's yt-dlp download at once — the queue
+ * keeps the API from being rate-limited and retries failures silently.
+ */
 export function scheduleOfflineSyncForTrack(
   track: MediaTrack,
   updateSongMetadata?: (trackId: string, updates: SavedSongMetadataUpdates) => void,
 ): void {
-  if (track.source !== "stream" || !track.videoId) return;
-
-  void (async () => {
-    let downloadId = track.resolvedVideoId ?? track.videoId!;
-    const metadataUpdates: SavedSongMetadataUpdates = {};
-
-    try {
-      const resolved = await resolveStreamTrackAudio(track);
-      if (resolved) {
-        if (resolved.resolvedVideoId && resolved.resolvedVideoId !== track.videoId) {
-          downloadId = resolved.resolvedVideoId;
-          metadataUpdates.resolvedVideoId = resolved.resolvedVideoId;
-        }
-        if (track.kind === "video" && resolved.kind && resolved.kind !== "video") {
-          metadataUpdates.kind = resolved.kind;
-        }
-        const enriched = songMetadataFromMatch(resolved);
-        if (!track.albumBrowseId && enriched.albumBrowseId) {
-          Object.assign(metadataUpdates, enriched);
-        }
-      }
-    } catch {
-      // Fall back to the saved videoId.
-    }
-
-    if (updateSongMetadata && Object.keys(metadataUpdates).length > 0) {
-      updateSongMetadata(track.id, metadataUpdates);
-    }
-
-    // A resolved YouTube id can still be rejected by the CDN (403s are
-    // common for music-video uploads). Try the other known identities before
-    // giving up so one stale/restricted id does not poison offline sync.
-    const offlineIds = [
-      downloadId,
-      ...streamIdentityVideoIds(track).filter((id) => id !== downloadId),
-    ];
-    let offlineError: unknown = null;
-    for (const candidate of offlineIds) {
-      try {
-        await saveOffline(candidate);
-        offlineError = null;
-        break;
-      } catch (error) {
-        offlineError = error;
-      }
-    }
-    if (offlineError) throw offlineError;
-
-    const lyricsTrack: MediaTrack = {
-      ...track,
-      ...metadataUpdates,
-      resolvedVideoId: metadataUpdates.resolvedVideoId ?? track.resolvedVideoId ?? null,
-    };
-    await getSyncedLyricsForTrack(lyricsTrack, { persist: true });
-  })().catch(() => {});
+  enqueueOfflineSync(track, updateSongMetadata);
 }
 
 export type CollectionData = {
@@ -200,6 +149,8 @@ export type CollectionActions = {
   updateSongsMetadataBatch: (
     updatesById: ReadonlyMap<string, SavedSongMetadataUpdates>,
   ) => void;
+  /** Quietly enqueue downloads for every saved song missing a local file. */
+  resyncOfflineDownloads: () => void;
 };
 
 type CollectionContextValue = CollectionData & CollectionActions;
@@ -229,18 +180,49 @@ export function CollectionProvider({ children }: { children: ReactNode }) {
   );
 
   useEffect(() => {
-    persistArray(SAVED_SONGS_KEY, savedSongs);
+    const id = setTimeout(() => persistArray(SAVED_SONGS_KEY, savedSongs), 120);
+    return () => clearTimeout(id);
   }, [savedSongs]);
   useEffect(() => {
-    persistArray(SAVED_ALBUMS_KEY, savedAlbums);
+    const id = setTimeout(() => persistArray(SAVED_ALBUMS_KEY, savedAlbums), 120);
+    return () => clearTimeout(id);
   }, [savedAlbums]);
   useEffect(() => {
-    persistArray(SAVED_ARTISTS_KEY, savedArtists);
+    const id = setTimeout(() => persistArray(SAVED_ARTISTS_KEY, savedArtists), 120);
+    return () => clearTimeout(id);
   }, [savedArtists]);
 
   useEffect(() => {
     useCollectionStore.getState().syncSnapshot({ savedSongs, savedAlbums, savedArtists });
   }, [savedSongs, savedAlbums, savedArtists]);
+
+  // Seed the offline-status store from the files that actually exist on
+  // disk, then — when offline sync is enabled — quietly enqueue downloads
+  // for every saved song that is missing its local file. This is what makes
+  // a song that failed to download (or was saved while offline sync was
+  // off) get its file with zero manual effort; the bounded queue keeps the
+  // resulting download trickle from hammering the API. Best-effort: if the
+  // backend is unreachable the store just starts empty and the sweep is a
+  // no-op until the next save.
+  useEffect(() => {
+    let cancelled = false;
+    void listOfflineSongs()
+      .then((ids) => {
+        if (cancelled) return;
+        const statuses: Record<string, OfflineStatus> = {};
+        for (const id of ids) {
+          statuses[id] = "downloaded";
+        }
+        useOfflineStatusStore.getState().setStatuses(statuses);
+        if (getSetting("offlineSync")) {
+          enqueueOfflineSyncForSavedSongs(savedSongs, updateSongMetadata);
+        }
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const isSongSaved = useCallback(
     (trackId: string, videoId?: string | null) =>
@@ -284,6 +266,11 @@ export function CollectionProvider({ children }: { children: ReactNode }) {
     [],
   );
 
+  const resyncOfflineDownloads = useCallback(() => {
+    if (!getSetting("offlineSync")) return;
+    enqueueOfflineSyncForSavedSongs(savedSongs, updateSongMetadata);
+  }, [savedSongs, updateSongMetadata]);
+
   const toggleSong = useCallback((track: SavedSongInput): boolean => {
     const coerced = coerceSavedSong(track);
     if (coerced.source === "upload") return false;
@@ -317,7 +304,11 @@ export function CollectionProvider({ children }: { children: ReactNode }) {
         );
         for (const id of offlineIds) {
           removeOffline(id).catch(() => {});
+          useOfflineStatusStore.getState().clear(id);
         }
+        // Drop queued / retry-pending downloads so an in-flight job can't
+        // re-create the file after the user unsaved the song.
+        cancelOfflineSyncForVideoIds([...offlineIds]);
       } else if (!byVideo && getSetting("offlineSync")) {
         scheduleOfflineSyncForTrack(coerced, updateSongMetadata);
       }
@@ -337,25 +328,50 @@ export function CollectionProvider({ children }: { children: ReactNode }) {
     });
 
     if (isSaved) {
+      // Fetch (falling back to the disk cache) BEFORE dropping the cache
+      // key, so an offline unsave can still enumerate the album's tracks
+      // and remove their files. On success clear the registry + statuses
+      // and delete the cached copy.
       getEntityDetail(album.browseId)
         .then((detail) => {
+          removeCachedSavedAlbumDetail(album.browseId);
+          useOfflineStatusStore.getState().clearAlbum(album.browseId);
           if (detail.kind === "album") {
+            const removedIds: string[] = [];
             for (const track of detail.tracks) {
-              if (track.videoId) {
-                removeOffline(track.videoId).catch(() => {});
+              for (const id of streamIdentityVideoIds(track)) {
+                removeOffline(id).catch(() => {});
+                useOfflineStatusStore.getState().clear(id);
+                removedIds.push(id);
               }
             }
+            cancelOfflineSyncForVideoIds(removedIds);
           }
         })
-        .catch(() => {});
-    } else if (getSetting("offlineSync")) {
+        .catch(() => {
+          // No detail available (offline and nothing cached) — still drop
+          // the album registry + cached copy so the collection state is
+          // consistent even though orphaned files may remain.
+          removeCachedSavedAlbumDetail(album.browseId);
+          useOfflineStatusStore.getState().clearAlbum(album.browseId);
+        });
+    } else {
       getEntityDetail(album.browseId)
         .then((detail) => {
-          if (detail.kind === "album") {
-            for (const track of detail.tracks) {
-              if (track.source === "stream" && track.videoId) {
-                scheduleOfflineSyncForTrack(track);
-              }
+          if (detail.kind !== "album") return;
+          // Mirror the track list locally so the saved album opens offline
+          // (EntityPage falls back to this copy) and the grid shows a
+          // "N of M offline" pill. Written regardless of the offlineSync
+          // setting so a saved album is never network-gated.
+          cacheSavedAlbumDetail(album.browseId, detail);
+          const videoIds = detail.tracks
+            .map((track) => track.videoId)
+            .filter((id): id is string => typeof id === "string" && id.length > 0);
+          useOfflineStatusStore.getState().setAlbumTrackVideoIds(album.browseId, videoIds);
+          if (!getSetting("offlineSync")) return;
+          for (const track of detail.tracks) {
+            if (track.source === "stream" && track.videoId) {
+              scheduleOfflineSyncForTrack(track);
             }
           }
         })
@@ -395,6 +411,7 @@ export function CollectionProvider({ children }: { children: ReactNode }) {
       toggleArtist,
       updateSongMetadata,
       updateSongsMetadataBatch,
+      resyncOfflineDownloads,
     }),
     [
       isTrackSaved,
@@ -407,6 +424,7 @@ export function CollectionProvider({ children }: { children: ReactNode }) {
       toggleArtist,
       updateSongMetadata,
       updateSongsMetadataBatch,
+      resyncOfflineDownloads,
     ],
   );
 

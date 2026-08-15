@@ -17,6 +17,7 @@ import {
   isSameSongTrack,
 } from "./media";
 import { resolveAutoplayEntries } from "./song-resolution";
+import { isVariantRecordingTitle, titleLooksLikeMusicVideo } from "./track-titles";
 
 export const DAILY_RECOMMENDATIONS_TARGET = 15;
 export const NEW_SONG_MIN_RATIO = 0.75;
@@ -63,6 +64,14 @@ function canAddToPicked(track: MediaTrack, picked: MediaTrack[], excludedVideoId
   return !picked.some((row) => isSameSongTrack(row, track));
 }
 
+function isUnwantedRecommendationTrack(track: MediaTrack): boolean {
+  if (isLikelyMusicVideoTrack(track)) return true;
+  if (titleLooksLikeMusicVideo(track.title)) return true;
+  if (isVariantRecordingTitle(track.title)) return true;
+  if (track.kind === "video") return true;
+  return false;
+}
+
 async function fetchSeedCandidates(seedVideoId: string): Promise<MediaTrack[]> {
   try {
     const response = await getWatchPlaylist(seedVideoId);
@@ -74,7 +83,7 @@ async function fetchSeedCandidates(seedVideoId: string): Promise<MediaTrack[]> {
     const resolved = await resolveAutoplayEntries(queueable);
     return resolved
       .filter((track): track is MediaTrack => track !== null)
-      .filter((track) => !isLikelyMusicVideoTrack(track));
+      .filter((track) => !isUnwantedRecommendationTrack(track));
   } catch {
     return [];
   }

@@ -1,14 +1,18 @@
 import { convertFileSrc } from "@tauri-apps/api/core";
 import type { MediaTrack } from "../types";
 
-/** YT Music type labels that are never playable as songs in Velocity. */
-const EXCLUDED_NON_MUSIC_STREAM_KINDS = new Set([
-  "episode",
-  "podcast",
-  "mix",
-  "video",
-  "unknown",
-]);
+/**
+ * YT Music type labels that are never playable as songs in Velocity.
+ *
+ * Note: `"video"` is deliberately NOT in this set. YouTube Music routinely
+ * catalogs album/playlist rows as videos (official-video uploads, mislabeled
+ * rows), and those rows are still real music the user clicked. The player's
+ * resolution layer (`resolveStreamTrackAudio`) swaps them to their studio
+ * audio upload at load time; dropping them from the queue beforehand is what
+ * made songs like "Paranoid Android" silently fail to play. Only genuinely
+ * non-music media (podcasts, episodes, mixes) is excluded.
+ */
+const EXCLUDED_NON_MUSIC_STREAM_KINDS = new Set(["episode", "podcast", "mix", "unknown"]);
 
 export function isExcludedNonMusicStreamKind(kind: string | null | undefined): boolean {
   if (!kind) return false;
@@ -18,8 +22,9 @@ export function isExcludedNonMusicStreamKind(kind: string | null | undefined): b
 /**
  * Whether a track may appear in the queue or album/playlist track lists.
  * Uploads are always queueable. Stream tracks with no kind are treated as
- * songs (typical album/playlist rows). Music videos and other non-song media
- * are excluded — they must not masquerade as songs in the player UI.
+ * songs (typical album/playlist rows). Only genuinely non-music media
+ * (episodes, podcasts, mixes) is excluded — music-video rows are queueable
+ * and resolved to studio audio at load time.
  */
 export function isQueueableTrack(track: MediaTrack): boolean {
   if (track.source === "upload") return true;
@@ -89,17 +94,24 @@ export function readLiveMediaDuration(
   if (audio) {
     const direct = audio.duration;
     if (Number.isFinite(direct) && direct > 0) return direct;
-    if (audio.seekable.length > 0) {
-      const end = audio.seekable.end(audio.seekable.length - 1);
-      if (Number.isFinite(end) && end > 0) return end;
-    }
   }
+  // Prefer the catalog/metadata duration over the browser's current
+  // seekable range. For streamed sources `audio.duration` is Infinity and
+  // `seekable.end` only covers what has been buffered so far, so using it
+  // as the duration makes the seek bar's scale shrink/grow as the buffer
+  // fills and misaligns clicks with the painted position.
   if (
     typeof trackDurationSeconds === "number" &&
     Number.isFinite(trackDurationSeconds) &&
     trackDurationSeconds > 0
   ) {
     return trackDurationSeconds;
+  }
+  if (audio) {
+    if (audio.seekable.length > 0) {
+      const end = audio.seekable.end(audio.seekable.length - 1);
+      if (Number.isFinite(end) && end > 0) return end;
+    }
   }
   return 0;
 }
@@ -129,14 +141,41 @@ export function sanitizeFilename(name: string): string {
     .replace(/[<>:"/\\|?*\x00-\x1F]/g, "")
     .replace(/[\s.]+$/g, "")
     .trim();
-  return cleaned || "track";
+  const base = cleaned || "track";
+  // Mirror backend's Windows reserved names (CON, PRN, AUX, NUL, COM1-9, LPT1-9)
+  const upper = base.toUpperCase();
+  const reserved = new Set([
+    "CON",
+    "PRN",
+    "AUX",
+    "NUL",
+    "COM1",
+    "COM2",
+    "COM3",
+    "COM4",
+    "COM5",
+    "COM6",
+    "COM7",
+    "COM8",
+    "COM9",
+    "LPT1",
+    "LPT2",
+    "LPT3",
+    "LPT4",
+    "LPT5",
+    "LPT6",
+    "LPT7",
+    "LPT8",
+    "LPT9",
+  ]);
+  return reserved.has(upper) ? `${base}_` : base;
 }
 
 export function withResolvedAudioSrc(track: MediaTrack): MediaTrack {
   if (track.source !== "upload") return track;
   let result = track;
   if (!result.audioSrc && result.filePath) {
-    result = { ...result, audioSrc: convertFileSrc(result.filePath) };
+    result = { ...result, audioSrc: convertFileSrc(result.filePath, "stream") };
   }
   if (result.cover && !result.cover.startsWith("http") && !result.cover.startsWith("data:")) {
     result = {
@@ -147,6 +186,37 @@ export function withResolvedAudioSrc(track: MediaTrack): MediaTrack {
   }
   return result;
 }
+
+/**
+ * Resolve a local file path to a playable `<audio>` src.
+ *
+ * The Tauri `asset:` protocol caps every HTTP Range response at 1 MB
+ * (`MAX_LEN` in `tauri/src/protocol/asset.rs`), which truncates the range
+ * requests an `<audio>` element makes while loading a webm/m4a — the element
+ * then fails with `MEDIA_ERR_DECODE`. The app registers a custom `stream`
+ * scheme (see `stream_protocol_response` in `src-tauri/src/main.rs`) that
+ * serves the same files with UNCAPPED Range support.
+ *
+ * We additionally pull the file through `fetch()` into a blob URL: the stream
+ * handler responds to plain GETs with the FULL file (it only sends partial
+ * bodies to Range requests) and echoes `Access-Control-Allow-Origin: *`, so
+ * the blob always contains every byte and Chromium's blob storage decodes it
+ * reliably regardless of any serving-layer quirk.
+ */
+export async function resolveFileMediaSrc(filePath: string): Promise<string> {
+  const streamUrl = convertFileSrc(filePath, "stream");
+  try {
+    const response = await fetch(streamUrl);
+    if (!response.ok) throw new Error(`Stream fetch failed: HTTP ${response.status}`);
+    const blob = await response.blob();
+    if (blob.size === 0) throw new Error("Stream fetch returned an empty blob.");
+    return URL.createObjectURL(blob);
+  } catch (error) {
+    console.warn("Falling back to direct stream URL for media:", error);
+    return streamUrl;
+  }
+}
+
 
 export async function readFileImports(
   files: FileList | File[],
@@ -209,7 +279,8 @@ export type SongIdentityInput = Pick<
   title?: string | null;
 };
 
-function songIdentityLabel(track: SongIdentityInput): string | null {
+function songIdentityLabel(track: SongIdentityInput | null): string | null {
+  if (!track) return null;
   if (track.source === "upload") return null;
   const artist = track.artist?.trim() ?? "";
   const title = track.title?.trim() ?? "";

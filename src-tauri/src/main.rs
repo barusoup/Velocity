@@ -10,81 +10,103 @@ use std::{
     hash::{Hash, Hasher},
     io::Cursor,
     path::{Path, PathBuf},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+mod cache;
 mod data_store;
 mod discord_cover_publish;
 mod discord_presence;
+mod errors;
+mod innertube;
 mod lyrics;
 mod text_utils;
 mod window_drag;
 
 use base64::Engine;
 use lofty::config::{ParseOptions, WriteOptions};
-use lofty::file::{AudioFile, TaggedFileExt};
+use lofty::file::{AudioFile, TaggedFile, TaggedFileExt};
 use lofty::id3::v2::{Frame, FrameId, Id3v2Tag, TextInformationFrame};
 use lofty::mpeg::MpegFile;
+use lofty::ogg::OpusFile;
 use lofty::picture::{MimeType, Picture, PictureType};
 use lofty::prelude::Accessor;
 use lofty::probe::Probe;
+use lofty::tag::{ItemKey, ItemValue, Tag, TagItem, TagType};
 use lofty::TextEncoding;
 use once_cell::sync::Lazy;
 
 use regex::Regex;
-use reqwest::header::{HeaderMap, HeaderValue, ACCEPT_LANGUAGE, CONTENT_TYPE, ORIGIN, REFERER};
+use reqwest::header::{HeaderValue, ACCEPT_LANGUAGE, CONTENT_TYPE, ORIGIN, REFERER};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tauri::{AppHandle, Manager, State};
 use tokio::{
     process::Command,
-    sync::{oneshot, Mutex},
+    sync::{oneshot, Mutex, Notify, Semaphore},
 };
 
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
-const USER_AGENT: &str =
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36";
 const YT_DLP_WIN_URL: &str =
     "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe";
 const YT_DLP_MACOS_URL: &str =
     "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_macos";
 const YT_DLP_UNIX_URL: &str = "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp";
-/// Static Windows ffmpeg/ffprobe pair used by yt-dlp's MP3 postprocessor.
-/// Playback only needs yt-dlp; exports also need this bundle.
-#[cfg(target_os = "windows")]
-const FFMPEG_WIN_ZIP_URL: &str = "https://github.com/yt-dlp/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip";
-/// macOS static Intel binaries (run natively on Apple Silicon via Rosetta).
-#[cfg(target_os = "macos")]
-const FFMPEG_MACOS_URL: &str = "https://evermeet.cx/ffmpeg/get/zip";
-#[cfg(target_os = "macos")]
-const FFPROBE_MACOS_URL: &str = "https://evermeet.cx/ffmpeg/get/ffprobe/zip";
+/// Single cross-platform source for static ffmpeg/ffprobe binaries
+/// (`eugeneware/ffmpeg-static`). One URL scheme covers macOS arm64 + x64,
+/// Windows x64, and Linux x64/arm64 — replacing the old mix of a per-OS zip
+/// archive (Windows) and Intel-only mirrors (evermeet.cx on macOS, which
+/// forced Apple Silicon to run ffmpeg under Rosetta 2). Assets are plain
+/// executables served as `.gz`; the download is a gunzip + chmod.
+const FFMPEG_STATIC_BASE: &str =
+    "https://github.com/eugeneware/ffmpeg-static/releases/latest/download";
 /// Deno download URLs — yt-dlp needs a JavaScript runtime for YouTube extraction.
 #[cfg(target_os = "windows")]
 const DENO_WIN_URL: &str =
     "https://github.com/denoland/deno/releases/latest/download/deno-x86_64-pc-windows-msvc.zip";
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", not(target_arch = "aarch64")))]
 const DENO_MACOS_URL: &str =
     "https://github.com/denoland/deno/releases/latest/download/deno-x86_64-apple-darwin.zip";
+/// Native Apple Silicon build — the x86_64 zip above runs under Rosetta 2 on
+/// M-series Macs, measurably slowing every yt-dlp invocation that shells out
+/// to deno for YouTube JS extraction.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const DENO_MACOS_ARM64_URL: &str =
+    "https://github.com/denoland/deno/releases/latest/download/deno-aarch64-apple-darwin.zip";
 #[cfg(target_os = "linux")]
 const DENO_LINUX_URL: &str =
     "https://github.com/denoland/deno/releases/latest/download/deno-x86_64-unknown-linux-gnu.zip";
-const FFMPEG_EXPORT_UNAVAILABLE: &str = "MP3 export isn't available right now. Try again later.";
-const CLIENT_CACHE_TTL: Duration = Duration::from_secs(60 * 60 * 6);
+const FFMPEG_EXPORT_UNAVAILABLE: &str = "Export isn't available right now. Try again later.";
 const STREAM_CACHE_TTL: Duration = Duration::from_secs(60 * 45);
+/// Minimum size (bytes) a cached stream file must have to be considered a
+/// complete download. A rate-limited or interrupted yt-dlp run can leave a
+/// partial file behind; serving it makes the webview report MEDIA_ERR_DECODE
+/// on every attempt until the TTL expires. Real audio tracks are far larger.
+const MIN_STREAM_CACHE_BYTES: u64 = 128 * 1024;
 /// Per-invocation bound for yt-dlp audio fetches (offline save + export).
 /// Without this, a rate-limited or wedged child process left the Saving
 /// panel spinning indefinitely with no error to dismiss.
 const YT_DLP_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(120);
+/// Upper bound for a single `resolve_stream` yt-dlp download. Playback already
+/// has a short frontend timeout, but the backend must also reap a wedged
+/// yt-dlp (kill_on_drop) so a stalled download can't hold a tokio worker and
+/// its child process forever — the macOS "inputs freeze / loads extremely
+/// slowly" failure mode is exactly the runtime starving under leaked child
+/// processes.
+const STREAM_RESOLVE_TIMEOUT: Duration = Duration::from_secs(90);
+/// Bound for per-track ffmpeg analysis (loudness + leading-silence detection).
+/// Each decodes up to ~45s of audio; healthy runs finish in seconds, so this
+/// is generous but still prevents a wedged ffmpeg from pinning a worker.
+const FFMPEG_ANALYSIS_TIMEOUT: Duration = Duration::from_secs(30);
 const WATCH_PLAYLIST_CACHE_TTL: Duration = Duration::from_secs(60 * 30);
 const TRACK_DURATION_CACHE_TTL: Duration = Duration::from_secs(60 * 60 * 24 * 7);
-const PREFERRED_THUMBNAIL_WIDTH: u64 = 640;
-const ARTIST_AVATAR_SIZE: u64 = 640;
-const ARTIST_BANNER_WIDTH: u64 = 2880;
-const ARTIST_BANNER_HEIGHT: u64 = 1200;
-const MAX_CACHED_ARTWORK_BYTES: usize = 8 * 1024 * 1024;
-const ARTIST_TOP_SONG_LIMIT: usize = 10;
+const MAX_CACHED_ARTWORK_BYTES: usize = 8 * 1024 * 1024;const ARTIST_TOP_SONG_LIMIT: usize = 10;
 // Imported playlists may be arbitrarily long; paginate until the shelf
 // runs out or we hit a generous safety bound.
 const PLAYLIST_IMPORT_TRACK_LIMIT: usize = 10_000;
@@ -98,49 +120,35 @@ const ARTIST_MONTHLY_LISTENERS_MAX_ATTEMPTS: u32 = 3;
 // is more reliable than re-parsing the cached payload.
 const ARTIST_MONTHLY_LISTENERS_RETRY_BACKOFF_MS: [u64; 2] = [250, 750];
 
-static HTTP: Lazy<reqwest::Client> = Lazy::new(|| {
-    reqwest::Client::builder()
-        .user_agent(USER_AGENT)
-        .timeout(Duration::from_secs(15))
-        .build()
-        .expect("http client")
-});
+use innertube::{
+    HTTP, HTTP_NO_REDIRECT, USER_AGENT, YT_PLAYLIST_ID_RE, as_str_path, banner_artist_thumbnail_url,
+    best_banner_thumbnail, best_thumbnail, extract_duration_from_row, extract_play_count_from_row,
+    extract_play_count_from_text, fallback_artist_from_meta, is_excluded_type_label,
+    is_explicit_music_video_title, is_type_label, looks_like_non_artist_meta, normalize_bullet_text,
+    normalize_kind, parse_duration, parse_duration_from_text, parse_shelf_continuation_items,
+    post_ytmusic, post_ytmusic_continuation, split_bullets_fixed,
+    square_artist_thumbnail_url, text_from_value, text_indicates_video, watch_next_payload,
+};
 
-static HTTP_NO_REDIRECT: Lazy<reqwest::Client> = Lazy::new(|| {
-    reqwest::Client::builder()
-        .user_agent(USER_AGENT)
-        .timeout(Duration::from_secs(15))
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .expect("http client no-redirect")
-});
+/// Serializes vocal-onset ffmpeg analyses. Each run decodes ~45s of audio via
+/// ffmpeg and then scans it in-process — genuinely CPU/IO heavy. Without a
+/// bound, loading a playlist spawns one such job per track and the machine
+/// thrashes (the macOS "inputs freeze / loads extremely slowly" symptom).
+/// One-at-a-time is plenty: the offset is a background enhancement, and a
+/// missed warm-up is simply recomputed on the next lyrics fetch.
+static VOCAL_ANALYSIS_SEMAPHORE: Lazy<Arc<Semaphore>> =
+    Lazy::new(|| Arc::new(Semaphore::new(1)));
 
-static API_KEY_RE: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r#""INNERTUBE_API_KEY":"([^"]+)""#).expect("api key regex"));
-static CLIENT_VERSION_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r#""INNERTUBE_CLIENT_VERSION":"([^"]+)""#).expect("client version regex")
-});
-static VISITOR_DATA_RE: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r#""VISITOR_DATA":"([^"]+)""#).expect("visitor data regex"));
-
-// Extract the `list` query parameter from a YT Music playlist URL. Used
-// to seed the InnerTube `next` call (which needs both a videoId and a
-// playlistId to return the full queue) and to build the browseId for the
-// playlist header (browseId = "VL" + playlistId).
-static YT_PLAYLIST_ID_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r#"[?&]list=([A-Za-z0-9_-]+)"#).expect("yt playlist id regex")
-});
-
-
-
-#[derive(Default)]
-struct AppState {
-    client_config: Mutex<Option<InnerTubeConfig>>,
-    stream_cache: Mutex<HashMap<String, CachedStream>>,
-    watch_playlist_cache: Mutex<HashMap<String, CachedWatchPlaylist>>,
-    track_duration_cache: Mutex<HashMap<String, CachedTrackDuration>>,
+pub(crate) struct AppState {
+    client_config: Mutex<Option<innertube::InnerTubeConfig>>,
+    stream_cache: Mutex<crate::cache::TtlCache<String, CachedStream>>,
+    watch_playlist_cache: Mutex<crate::cache::TtlCache<String, CachedWatchPlaylist>>,
+    track_duration_cache: Mutex<crate::cache::TtlCache<String, CachedTrackDuration>>,
     import_library: Mutex<()>,
     musixmatch_token: Mutex<Option<lyrics::MusixmatchTokenCache>>,
+    /// In-memory cache of per-video lyric offsets (vocal-onset correction for
+    /// third-party LRC). Persisted to the data store; this map is the fast path.
+    lyric_offset_cache: Mutex<HashMap<String, lyrics::LyricOffsetRecord>>,
     /// Active "Save to my device" exports, keyed by the frontend's
     /// `request_id`. When the user clicks Cancel the frontend fires
     /// `cancel_save_export(request_id)`, which pulls the sender out
@@ -148,28 +156,112 @@ struct AppState {
     /// at the next checkpoint. Entries are removed on completion so
     /// a stale id from a previous session can never be canceled.
     active_save_exports: Mutex<HashMap<String, oneshot::Sender<()>>>,
+    /// In-flight `resolve_stream` downloads, keyed by video id. A retry (or
+    /// a prefetch) that arrives while the same id is already downloading
+    /// waits for the shared result instead of spawning a second yt-dlp —
+    /// parallel downloads of one id were getting the app rate-limited and
+    /// leaving partial files. Entries are removed when the leader finishes.
+    in_flight_streams: Mutex<HashMap<String, InFlightStream>>,
 }
 
-struct InnerTubeConfig {
-    api_key: String,
-    client_version: String,
-    visitor_data: String,
-    fetched_at: Instant,
+impl Default for AppState {
+    fn default() -> Self {
+        Self {
+            client_config: Default::default(),
+            stream_cache: Mutex::new(crate::cache::TtlCache::new(
+                300,
+                STREAM_CACHE_TTL,
+            )),
+            watch_playlist_cache: Mutex::new(crate::cache::TtlCache::new(
+                50,
+                WATCH_PLAYLIST_CACHE_TTL,
+            )),
+            track_duration_cache: Mutex::new(crate::cache::TtlCache::new(
+                500,
+                TRACK_DURATION_CACHE_TTL,
+            )),
+            import_library: Default::default(),
+            musixmatch_token: Default::default(),
+            lyric_offset_cache: Default::default(),
+            active_save_exports: Default::default(),
+            in_flight_streams: Default::default(),
+        }
+    }
 }
+
+/// Shared handle for a yt-dlp download that is already running for a video
+/// id. Followers clone the handle out of `in_flight_streams`, wait on
+/// `notify`, and read the leader's outcome; the leader publishes the outcome
+/// and removes its entry on completion (success OR error, including the
+/// 90s timeout), so a follower can never hang on a dropped leader.
+#[derive(Clone)]
+struct InFlightStream {
+    notify: Arc<Notify>,
+    result: Arc<Mutex<Option<Result<StreamResponse, String>>>>,
+}
+
+impl InFlightStream {
+    fn new() -> Self {
+        Self {
+            notify: Arc::new(Notify::new()),
+            result: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    async fn finish(&self, outcome: Result<StreamResponse, String>) {
+        *self.result.lock().await = Some(outcome);
+        self.notify.notify_waiters();
+    }
+
+    async fn await_result(&self) -> Result<StreamResponse, String> {
+        loop {
+            let notified = self.notify.notified();
+            {
+                let slot = self.result.lock().await;
+                if let Some(outcome) = slot.as_ref() {
+                    return match outcome {
+                        Ok(response) => Ok(response.clone()),
+                        Err(error) => Err(error.clone()),
+                    };
+                }
+            }
+            notified.await;
+        }
+    }
+}
+
 pub(crate) struct CachedStream {
     source: String,
     fetched_at: Instant,
 }
 
-struct CachedWatchPlaylist {
+impl crate::cache::Cached for CachedStream {
+    fn fetched_at(&self) -> Instant {
+        self.fetched_at
+    }
+}
+
+pub(crate) struct CachedWatchPlaylist {
     tracks: Vec<MediaTrack>,
     playlist_id: Option<String>,
     fetched_at: Instant,
 }
 
-struct CachedTrackDuration {
+impl crate::cache::Cached for CachedWatchPlaylist {
+    fn fetched_at(&self) -> Instant {
+        self.fetched_at
+    }
+}
+
+pub(crate) struct CachedTrackDuration {
     duration: Option<u32>,
     fetched_at: Instant,
+}
+
+impl crate::cache::Cached for CachedTrackDuration {
+    fn fetched_at(&self) -> Instant {
+        self.fetched_at
+    }
 }
 
 type SyncedLyricsResponse = lyrics::SyncedLyricsResponse;
@@ -283,7 +375,7 @@ struct ArtistDetail {
     shelves: Vec<ArtistShelf>,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct StreamResponse {
     url: Option<String>,
@@ -386,6 +478,31 @@ struct ExtractedMetadata {
 //      created up front and a single "Album Artist"/"Album" tag set on
 //      every file so the album metadata round-trips intact.
 
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum ExportFormat {
+    Native,
+    Opus,
+    Mp3,
+}
+
+impl ExportFormat {
+    /// File extension for this format, WITHOUT the leading dot. `Native`
+    /// is a verbatim copy of whatever container yt-dlp pulled down, so it
+    /// has no fixed extension of its own — the caller resolves it.
+    fn ext(self) -> &'static str {
+        match self {
+            ExportFormat::Native => "",
+            ExportFormat::Opus => "opus",
+            ExportFormat::Mp3 => "mp3",
+        }
+    }
+}
+
+fn default_export_format() -> ExportFormat {
+    ExportFormat::Opus
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SaveTrackToMp3Request {
@@ -425,8 +542,12 @@ struct SaveTrackToMp3Request {
     target_dir: String,
     /// File name WITHOUT extension. The frontend builds this from the
     /// track title (sanitized for the local FS). The command always
-    /// appends `.mp3`.
+    /// appends the extension implied by `format`.
     file_name: String,
+    /// Output format. `native` copies the original container verbatim,
+    /// `opus` re-encodes to Opus 160kbps, `mp3` re-encodes via LAME.
+    #[serde(default = "default_export_format")]
+    format: ExportFormat,
 }
 
 #[derive(Deserialize)]
@@ -449,6 +570,9 @@ struct SaveAlbumToMp3Request {
     year: Option<u32>,
     /// Cover URL applied to every track as the front-cover artwork.
     cover_url: Option<String>,
+    /// Output format, see `SaveTrackToMp3Request::format`.
+    #[serde(default = "default_export_format")]
+    format: ExportFormat,
     /// Ordered list of tracks to export. The order here defines the
     /// track numbers stamped on the files (1-based) when the request
     /// itself doesn't carry a `trackNumber`.
@@ -512,6 +636,9 @@ struct SavePlaylistToMp3Request {
     /// for tracks that don't carry their own. Pass `None` for a
     /// cover-less playlist.
     cover_url: Option<String>,
+    /// Output format, see `SaveTrackToMp3Request::format`.
+    #[serde(default = "default_export_format")]
+    format: ExportFormat,
     /// Ordered list of tracks to export. Order here is the order on
     /// disk (and drives the track-number stamp when the entry omits
     /// one).
@@ -919,7 +1046,7 @@ async fn fetch_ytm_playlist_via_browse(
     playlist_id: &str,
 ) -> Result<Option<EntityDetail>, String> {
     let browse_id = format!("VL{playlist_id}");
-    let response = post_ytmusic(state, "browse", json!({ "browseId": &browse_id })).await?;
+    let response = post_ytmusic(&state.client_config, "browse", json!({ "browseId": &browse_id })).await?;
     let mut detail = parse_entity_detail(&browse_id, &response)?;
     if detail.tracks.is_empty() {
         return Ok(None);
@@ -1023,7 +1150,7 @@ async fn import_youtube_playlist(
 
         media_tracks = if let Some(seed_video_id) = first_video_id {
             match post_ytmusic(
-                state,
+                &state.client_config,
                 "next",
                 watch_next_payload(&seed_video_id, Some(playlist_id.as_str())),
             )
@@ -2640,7 +2767,7 @@ async fn ensure_streaming_backend(app: AppHandle) -> Result<BackendStatus, Strin
 #[tauri::command]
 async fn search_music(state: State<'_, AppState>, query: String) -> Result<SearchResponse, String> {
     let payload = json!({ "query": query });
-    let response = post_ytmusic(&state, "search", payload).await?;
+    let response = post_ytmusic(&state.client_config, "search", payload).await?;
     Ok(parse_search_response(&query, &response))
 }
 
@@ -2654,7 +2781,7 @@ async fn search_suggestions(
         return Ok(Vec::new());
     }
     let payload = json!({ "input": trimmed });
-    let response = post_ytmusic(&state, "music/get_search_suggestions", payload).await?;
+    let response = post_ytmusic(&state.client_config, "music/get_search_suggestions", payload).await?;
     Ok(parse_search_suggestions(&response))
 }
 
@@ -2668,7 +2795,7 @@ async fn get_entity_detail(
     state: State<'_, AppState>,
     browse_id: String,
 ) -> Result<EntityDetail, String> {
-    let response = post_ytmusic(&state, "browse", json!({ "browseId": browse_id })).await?;
+    let response = post_ytmusic(&state.client_config, "browse", json!({ "browseId": browse_id })).await?;
     Ok(parse_entity_detail(&browse_id, &response)?)
 }
 
@@ -2799,7 +2926,7 @@ async fn get_artist_detail(
     state: State<'_, AppState>,
     browse_id: String,
 ) -> Result<ArtistDetail, String> {
-    let response = post_ytmusic(&state, "browse", json!({ "browseId": browse_id })).await?;
+    let response = post_ytmusic(&state.client_config, "browse", json!({ "browseId": browse_id })).await?;
     let mut detail = parse_artist_detail(&browse_id, &response)?;
     let has_more_hint = extract_top_songs_continuation(&response).is_some()
         || artist_overview_sections(&response)
@@ -2822,7 +2949,7 @@ async fn get_artist_top_songs_extended(
     state: State<'_, AppState>,
     browse_id: String,
 ) -> Result<Vec<MediaTrack>, String> {
-    let response = post_ytmusic(&state, "browse", json!({ "browseId": browse_id })).await?;
+    let response = post_ytmusic(&state.client_config, "browse", json!({ "browseId": browse_id })).await?;
     let detail = parse_artist_detail(&browse_id, &response)?;
     let mut tracks =
         load_extended_artist_top_songs(&state, &response, &detail.title, detail.cover.as_deref())
@@ -2853,7 +2980,7 @@ async fn load_extended_artist_top_songs(
     if tracks.len() < ARTIST_TOP_SONG_LIMIT {
         if let Some(playlist_browse_id) = top_songs_playlist_browse_id(shelf) {
             let playlist_response =
-                post_ytmusic(state, "browse", json!({ "browseId": playlist_browse_id })).await?;
+                post_ytmusic(&state.client_config, "browse", json!({ "browseId": playlist_browse_id })).await?;
             if let Some(playlist_shelf) = find_track_shelf_in_browse_response(&playlist_response) {
                 let playlist_tracks = fetch_shelf_tracks_with_continuations(
                     state,
@@ -2908,7 +3035,7 @@ async fn fetch_artist_monthly_listeners_once(
     state: &State<'_, AppState>,
     browse_id: &str,
 ) -> Result<Option<String>, String> {
-    let response = post_ytmusic(state, "browse", json!({ "browseId": browse_id })).await?;
+    let response = post_ytmusic(&state.client_config, "browse", json!({ "browseId": browse_id })).await?;
     Ok(extract_monthly_listeners_from_response(&response))
 }
 
@@ -3004,15 +3131,13 @@ async fn fetch_track_duration(
     video_id: &str,
 ) -> Result<Option<u32>, String> {
     {
-        let cache = state.track_duration_cache.lock().await;
-        if let Some(entry) = cache.get(video_id) {
-            if entry.fetched_at.elapsed() < TRACK_DURATION_CACHE_TTL {
-                return Ok(entry.duration);
-            }
+        let mut cache = state.track_duration_cache.lock().await;
+        if let Some(entry) = cache.get(&video_id.to_string()) {
+            return Ok(entry.duration);
         }
     }
 
-    let response = post_ytmusic(state, "next", watch_next_payload(video_id, None)).await?;
+    let response = post_ytmusic(&state.client_config, "next", watch_next_payload(video_id, None)).await?;
     let (tracks, _) = extract_watch_playlist(&response, Some(video_id));
     let duration = tracks
         .iter()
@@ -3021,7 +3146,7 @@ async fn fetch_track_duration(
         .and_then(|t| t.duration_seconds);
 
     let mut cache = state.track_duration_cache.lock().await;
-    cache.retain(|_, entry| entry.fetched_at.elapsed() < TRACK_DURATION_CACHE_TTL);
+    cache.cleanup_expired();
     cache.insert(
         video_id.to_string(),
         CachedTrackDuration {
@@ -3068,14 +3193,14 @@ fn watch_playlist_cache_key(video_id: &str, playlist_id: Option<&str>) -> String
     }
 }
 
-fn cleanup_expired_stream_cache(cache: &mut HashMap<String, CachedStream>) {
-    cache.retain(|_, entry| {
-        entry.fetched_at.elapsed() < STREAM_CACHE_TTL && Path::new(&entry.source).exists()
-    });
+fn cleanup_expired_stream_cache(cache: &mut crate::cache::TtlCache<String, CachedStream>) {
+    cache.retain(|_, entry| Path::new(&entry.source).exists());
 }
 
-fn cleanup_expired_watch_playlist_cache(cache: &mut HashMap<String, CachedWatchPlaylist>) {
-    cache.retain(|_, entry| entry.fetched_at.elapsed() < WATCH_PLAYLIST_CACHE_TTL);
+fn cleanup_expired_watch_playlist_cache(
+    cache: &mut crate::cache::TtlCache<String, CachedWatchPlaylist>,
+) {
+    cache.cleanup_expired();
 }
 
 async fn find_disk_stream_cache(cache_dir: &Path, video_id: &str) -> Option<String> {
@@ -3094,6 +3219,14 @@ async fn find_disk_stream_cache(cache_dir: &Path, video_id: &str) -> Option<Stri
             continue;
         };
         if !metadata.is_file() || metadata.len() == 0 {
+            continue;
+        }
+        // A failed yt-dlp run (rate limit, dropped connection) can leave a
+        // PARTIAL file at the output template that passes a non-empty check.
+        // Serving it makes the webview fail with MEDIA_ERR_DECODE on every
+        // attempt. Any real audio track is far larger than this floor, so a
+        // file below it is treated as a broken download and re-fetched.
+        if metadata.len() < MIN_STREAM_CACHE_BYTES {
             continue;
         }
         let Ok(modified) = metadata.modified() else {
@@ -3139,20 +3272,18 @@ async fn get_watch_playlist(
 ) -> Result<WatchPlaylistResponse, String> {
     let key = watch_playlist_cache_key(&video_id, playlist_id.as_deref());
     {
-        let cache = state.watch_playlist_cache.lock().await;
+        let mut cache = state.watch_playlist_cache.lock().await;
         if let Some(entry) = cache.get(&key) {
-            if entry.fetched_at.elapsed() < WATCH_PLAYLIST_CACHE_TTL {
-                return Ok(WatchPlaylistResponse {
-                    tracks: entry.tracks.clone(),
-                    playlist_id: entry.playlist_id.clone(),
-                });
-            }
+            return Ok(WatchPlaylistResponse {
+                tracks: entry.tracks.clone(),
+                playlist_id: entry.playlist_id.clone(),
+            });
         }
     }
 
     let payload = watch_next_payload(&video_id, playlist_id.as_deref());
 
-    let response = post_ytmusic(&state, "next", payload).await?;
+    let response = post_ytmusic(&state.client_config, "next", payload).await?;
     let (tracks, next_playlist_id) = extract_watch_playlist(&response, Some(&video_id));
 
     let trimmed_tracks: Vec<MediaTrack> = tracks.into_iter().take(25).collect();
@@ -3184,7 +3315,7 @@ async fn resolve_track_album(
     video_id: String,
 ) -> Result<TrackAlbumResolution, String> {
     let payload = watch_next_payload(&video_id, None);
-    let response = post_ytmusic(&state, "next", payload).await?;
+    let response = post_ytmusic(&state.client_config, "next", payload).await?;
     let track = find_playlist_panel_video_renderer(&response, &video_id)
         .and_then(parse_playlist_panel_video);
     Ok(TrackAlbumResolution {
@@ -3202,10 +3333,21 @@ async fn get_synced_lyrics(
 ) -> Result<Option<SyncedLyricsResponse>, String> {
     let cached_meta = find_cached_lyric_track(&state, &video_id).await;
 
-    // Always hit `next` for stream tracks so we can reach YouTube Music's
-    // native timed lyrics (same clock as playback). Metadata still comes
-    // from the watch-playlist cache when available.
-    let next_response = post_ytmusic(&state, "next", watch_next_payload(&video_id, None)).await.ok();
+    // Always hit `next` so we can source accurate seed metadata from the
+    // watch-playlist panel when the watch-playlist cache doesn't hold it.
+    // YouTube Music's native timed lyrics are intentionally NOT fetched —
+    // they aren't aligned to the resolved stream, so "no lyrics" is
+    // preferred over serving them.
+    //
+    // Bound the InnerTube call so a hung request can't block lyrics for 15s
+    // and pin the IPC slot (macOS beachball).
+    let next_response = tokio::time::timeout(
+        Duration::from_secs(4),
+        post_ytmusic(&state.client_config, "next", watch_next_payload(&video_id, None)),
+    )
+    .await
+    .ok()
+    .and_then(|r| r.ok());
 
     let seed_meta = cached_meta.clone().or_else(|| {
         next_response
@@ -3221,21 +3363,236 @@ async fn get_synced_lyrics(
         return Ok(None);
     };
 
-    let mut ctx = lyrics::build_resolve_context(
+    let ctx = lyrics::build_resolve_context(
         &app,
         &state.stream_cache,
         STREAM_CACHE_TTL,
         Some(&video_id),
     )
     .await;
-    ctx.next_response = next_response.clone();
 
-    let ytm_lyrics = match next_response.as_ref().and_then(lyrics::extract_lyrics_browse_id_from_next) {
-        Some(browse_id) => fetch_ytm_timed_lyrics_browse(&state, &browse_id).await.ok(),
-        None => None,
+    let mut result = lyrics::resolve_synced_lyrics(&lyrics_deps(&state), meta, &ctx).await;
+
+    // Vocal-onset correction for third-party LRC (permanent per-video cache).
+    // Only the fast cache-only check stays on the critical path (microseconds);
+    // a miss warms the cache in the background so the current response is
+    // never blocked by the ffmpeg DSP scan (the #1 macOS pinwheel cause).
+    if let Some(ref mut lyrics) = result {
+        if !is_ytm_native_lyrics(lyrics) && !lyrics.lines.is_empty() {
+            if let Some(offset) =
+                try_cached_vocal_offset(&state, &video_id, lyrics, ctx.leading_silence_skip_ms).await
+            {
+                if offset != 0 {
+                    *lyrics = lyrics::apply_vocal_offset(
+                        std::mem::replace(lyrics, empty_synced_lyrics()),
+                        offset,
+                    );
+                }
+            } else {
+                warm_vocal_offset_cache(
+                    app.clone(),
+                    video_id.clone(),
+                    lyrics.clone(),
+                    ctx.leading_silence_skip_ms,
+                );
+            }
+        }
+    }
+
+    Ok(result)
+}
+
+fn empty_synced_lyrics() -> SyncedLyricsResponse {
+    SyncedLyricsResponse {
+        lines: Vec::new(),
+        source: None,
+        has_per_word_sync: None,
+        applied_offset_ms: None,
+    }
+}
+
+fn is_ytm_native_lyrics(lyrics: &SyncedLyricsResponse) -> bool {
+    lyrics
+        .source
+        .as_deref()
+        .is_some_and(|s| s.contains("YouTube Music"))
+}
+
+/// Fast cache-only check for a vocal offset — no ffmpeg work.
+/// Returns `Some(offset)` on hit (including `Some(0)` meaning "no offset"),
+/// `None` on miss so the caller knows to spawn background work.
+async fn try_cached_vocal_offset(
+    state: &State<'_, AppState>,
+    video_id: &str,
+    lyrics: &SyncedLyricsResponse,
+    leading_silence_ms: u32,
+) -> Option<i32> {
+    if lyrics.lines.is_empty() {
+        return Some(0);
+    }
+    let lyrics_hash = lyrics::lyrics_content_hash(lyrics);
+    let cache_key = lyrics::offset_cache_key(video_id);
+    {
+        let cache = state.lyric_offset_cache.lock().await;
+        if let Some(rec) = cache.get(&cache_key) {
+            if rec.lyrics_hash == lyrics_hash && rec.leading_silence_ms == leading_silence_ms {
+                return Some(rec.offset_ms);
+            }
+        }
+    }
+    if let Ok(store) = data_store::current_store() {
+        if let Some(val) = store.get(&cache_key).await {
+            if let Ok(rec) = serde_json::from_value::<lyrics::LyricOffsetRecord>(val) {
+                if rec.lyrics_hash == lyrics_hash && rec.leading_silence_ms == leading_silence_ms {
+                    let mut cache = state.lyric_offset_cache.lock().await;
+                    cache.insert(cache_key, rec.clone());
+                    return Some(rec.offset_ms);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Warm the vocal-offset cache off the critical path. Spawns ffmpeg to decode
+/// 45s of audio and run the DSP scan; the current lyrics response returns
+/// immediately and the next `get_synced_lyrics` (or `get_lyric_offset`) picks
+/// up the cached offset.
+fn warm_vocal_offset_cache(
+    app: AppHandle,
+    video_id: String,
+    lyrics: SyncedLyricsResponse,
+    leading_silence_ms: u32,
+) {
+    // Fire-and-forget enhancement: skip if an analysis is already running so
+    // we never pile ffmpeg decodes onto the machine (see the semaphore's doc
+    // comment for the macOS failure mode this guards against).
+    let permit = match VOCAL_ANALYSIS_SEMAPHORE.clone().try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => return,
     };
+    tokio::spawn(async move {
+        let _permit = permit;
+        let Some(app_state) = app.try_state::<AppState>() else { return };
+        // Re-resolve the stream file via the lyrics module's cache + disk-scan
+        // lookup (avoids duplicating that logic here; `app_state` obtained via
+        // `try_state` lives for the whole spawned task, so borrowing its cache
+        // mutex is fine).
+        let file_path = lyrics::resolve_stream_file_path(
+            &app,
+            &app_state.stream_cache,
+            STREAM_CACHE_TTL,
+            &video_id,
+        )
+        .await;
+        let Some(path) = file_path else { return };
+        let Some(vocal_onset) = lyrics::detect_vocal_onset_ms(&app, &path).await else { return };
+        let Some((offset, confidence, method)) = lyrics::compute_vocal_offset(
+            lyrics.lines.first().map(|l| l.start_time_ms).unwrap_or(0),
+            vocal_onset,
+            leading_silence_ms,
+        ) else {
+            return;
+        };
+        let rec = lyrics::LyricOffsetRecord {
+            offset_ms: offset,
+            confidence,
+            method,
+            lyrics_hash: lyrics::lyrics_content_hash(&lyrics),
+            computed_at_ms: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0),
+            first_lyric_ms: lyrics.lines.first().map(|l| l.start_time_ms).unwrap_or(0),
+            vocal_onset_ms: vocal_onset,
+            leading_silence_ms,
+        };
+        {
+            let mut cache = app_state.lyric_offset_cache.lock().await;
+            cache.insert(lyrics::offset_cache_key(&video_id), rec.clone());
+        }
+        let key = lyrics::offset_cache_key(&video_id);
+        let _ = data_store::write(&app, &key, &serde_json::to_string(&rec).unwrap_or_default()).await;
+    });
+}
 
-    Ok(lyrics::resolve_synced_lyrics(&lyrics_deps(&state), meta, &ctx, ytm_lyrics).await)
+#[tauri::command]
+async fn probe_lyrics_availability(
+    state: State<'_, AppState>,
+    title: String,
+    artist: String,
+    album: Option<String>,
+    duration_seconds: Option<u32>,
+    video_id: Option<String>,
+) -> Result<lyrics::LyricsAvailability, String> {
+    let meta = LyricTrack {
+        title,
+        artist,
+        album,
+        duration_seconds,
+    };
+    if meta.title.trim().is_empty() || meta.artist.trim().is_empty() {
+        return Ok(lyrics::LyricsAvailability {
+            available: false,
+            confidence: 0.0,
+            source: None,
+            first_lyric_ms: None,
+            ytm_has_tab: false,
+        });
+    }
+    // Fast YTM tab check — only when we have a videoId; with a 650ms budget.
+    let mut ytm_has_tab: Option<bool> = None;
+    if let Some(ref vid) = video_id {
+        if let Ok(next) = tokio::time::timeout(
+            Duration::from_millis(650),
+            post_ytmusic(&state.client_config, "next", watch_next_payload(vid, None)),
+        )
+        .await
+        {
+            if let Ok(resp) = next {
+                let browse_id = innertube::extract_lyrics_browse_id_from_next(&resp);
+                ytm_has_tab = Some(browse_id.is_some());
+            }
+        }
+    }
+    let avail = lyrics::probe_lyrics_availability(&lyrics_deps(&state), &meta, ytm_has_tab).await;
+    Ok(avail)
+}
+
+#[tauri::command]
+async fn get_lyric_offset(
+    state: State<'_, AppState>,
+    video_id: String,
+) -> Result<Option<lyrics::LyricOffsetRecord>, String> {
+    let key = lyrics::offset_cache_key(&video_id);
+    {
+        let cache = state.lyric_offset_cache.lock().await;
+        if let Some(rec) = cache.get(&key) {
+            return Ok(Some(rec.clone()));
+        }
+    }
+    if let Ok(store) = data_store::current_store() {
+        if let Some(val) = store.get(&key).await {
+            if let Ok(rec) = serde_json::from_value::<lyrics::LyricOffsetRecord>(val) {
+                let mut cache = state.lyric_offset_cache.lock().await;
+                cache.insert(key, rec.clone());
+                return Ok(Some(rec));
+            }
+        }
+    }
+    Ok(None)
+}
+
+#[tauri::command]
+async fn clear_lyric_offset(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    video_id: String,
+) -> Result<(), String> {
+    let key = lyrics::offset_cache_key(&video_id);
+    state.lyric_offset_cache.lock().await.remove(&key);
+    let _ = data_store::delete(&app, &key).await;
+    Ok(())
 }
 
 #[tauri::command]
@@ -3267,7 +3624,7 @@ async fn get_synced_lyrics_by_meta(
     )
     .await;
 
-    Ok(lyrics::resolve_synced_lyrics(&lyrics_deps(&state), &meta, &ctx, None).await)
+    Ok(lyrics::resolve_synced_lyrics(&lyrics_deps(&state), &meta, &ctx).await)
 }
 
 fn lyrics_deps<'a>(state: &'a State<'_, AppState>) -> lyrics::LyricsDeps<'a> {
@@ -3277,23 +3634,6 @@ fn lyrics_deps<'a>(state: &'a State<'_, AppState>) -> lyrics::LyricsDeps<'a> {
         user_agent: USER_AGENT,
         musixmatch_token: &state.musixmatch_token,
     }
-}
-
-async fn fetch_ytm_timed_lyrics_browse(
-    state: &State<'_, AppState>,
-    browse_id: &str,
-) -> Result<SyncedLyricsResponse, String> {
-    let response = post_ytmusic_with_client(
-        state,
-        "browse",
-        json!({ "browseId": browse_id }),
-        "ANDROID_MUSIC",
-        lyrics::ANDROID_MUSIC_CLIENT_VERSION,
-        None,
-    )
-    .await?;
-    lyrics::parse_ytm_timed_lyrics_response(&response)
-        .ok_or_else(|| "YouTube Music returned no timed lyrics.".to_string())
 }
 
 async fn find_cached_lyric_track(
@@ -3335,9 +3675,9 @@ async fn resolve_stream(
     video_id: String,
 ) -> Result<StreamResponse, String> {
     {
-        let cache = state.stream_cache.lock().await;
+        let mut cache = state.stream_cache.lock().await;
         if let Some(entry) = cache.get(&video_id) {
-            if entry.fetched_at.elapsed() < STREAM_CACHE_TTL && Path::new(&entry.source).exists() {
+            if Path::new(&entry.source).exists() {
                 return Ok(StreamResponse {
                     url: None,
                     file_path: Some(entry.source.clone()),
@@ -3346,25 +3686,13 @@ async fn resolve_stream(
         }
     }
 
-    let yt_dlp = ensure_yt_dlp(&app).await?;
-    let deno = ensure_deno(&app).await.ok();
-    let js_runtime_arg = deno
-        .as_ref()
-        .map(|p| format!("deno:{}", p.display()));
-    let watch_url = format!("https://music.youtube.com/watch?v={video_id}");
     let cache_dir = stream_cache_dir(&app)?;
-    tokio::fs::create_dir_all(&cache_dir)
-        .await
-        .map_err(|error| format!("Failed to create stream cache folder: {error}"))?;
-    // Best-effort janitor: purge stale files and in-memory entries before
-    // downloading so the cache can't grow without bound over a long session.
-    let _ = cleanup_old_stream_cache_files(&cache_dir).await;
-    {
-        let mut cache = state.stream_cache.lock().await;
-        cleanup_expired_stream_cache(&mut cache);
-    }
-
     if let Some(file_path) = find_disk_stream_cache(&cache_dir, &video_id).await {
+        let file_path = if let Some(trimmed) = trim_leading_silence_if_needed(&app, Path::new(&file_path)).await {
+            trimmed.to_string_lossy().to_string()
+        } else {
+            file_path
+        };
         let mut cache = state.stream_cache.lock().await;
         cleanup_expired_stream_cache(&mut cache);
         cache.insert(
@@ -3380,7 +3708,261 @@ async fn resolve_stream(
         });
     }
 
-    remove_cached_streams(&cache_dir, &video_id).await?;
+    // In-flight dedupe: a retry / prefetch that arrives while this id is
+    // already downloading becomes a follower and waits for the leader's
+    // outcome instead of spawning a second yt-dlp for the same video.
+    let (entry, is_leader) = {
+        let mut in_flight = state.in_flight_streams.lock().await;
+        match in_flight.get(&video_id) {
+            Some(existing) => (existing.clone(), false),
+            None => {
+                let entry = InFlightStream::new();
+                in_flight.insert(video_id.clone(), entry.clone());
+                (entry, true)
+            }
+        }
+    };
+    if !is_leader {
+        return entry.await_result().await;
+    }
+
+    let outcome = resolve_stream_download(&app, &*state, &video_id).await;
+    {
+        let mut in_flight = state.in_flight_streams.lock().await;
+        in_flight.remove(&video_id);
+    }
+    entry.finish(outcome.clone()).await;
+    outcome
+}
+
+/// Extract the downloaded audio path from yt-dlp's `--print after_move:filepath`
+/// stdout. Scans every line for the first one that names an existing file
+/// instead of trusting the LAST non-empty line to be the path — yt-dlp can
+/// append post-download output (warnings, post-processor notes) after the
+/// path, which previously failed every resolve with "yt-dlp did not return
+/// a playable audio file." even though the download succeeded.
+fn find_yt_dlp_output_file(output: &str) -> Option<String> {
+    output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .find(|line| Path::new(line).is_file())
+        .map(str::to_string)
+}
+
+/// Build the `--js-runtimes` value for the bundled deno binary. Forward
+/// slashes are used deliberately: Windows accepts them in paths, and a
+/// backslash / mixed-separator value has been observed making yt-dlp exit 0
+/// with NO output and NO file — which the caller misreads as a failed
+/// download ("yt-dlp did not return a playable audio file.").
+fn deno_js_runtime_arg(deno: &Path) -> String {
+    let path = deno.to_string_lossy().replace('\\', "/");
+    format!("deno:{path}")
+}
+
+/// Result of a yt-dlp download attempt, rich enough to distinguish a real
+/// (self-explanatory) failure from a SILENT death — every variant exiting
+/// non-zero with empty stdout AND stderr — which is the corrupt-binary /
+/// antivirus-kill signature. Keeps the exact command and per-attempt
+/// outcomes so the caller can log a full diagnostic.
+struct YtDlpRunFailure {
+    silent: bool,
+    message: String,
+    command: String,
+    attempts: Vec<String>,
+}
+
+/// Run a yt-dlp audio download, preferring the run WITH the deno JS runtime.
+/// The `--js-runtimes` run can fail SILENTLY in this environment — deno
+/// spawns but dies without any output, so yt-dlp exits non-zero with empty
+/// stderr (surfaced by `run_command_with_timeout` as the bare
+/// "<exe> exited with exit code: N") or exits 0 without printing a file.
+/// deno is optional — yt-dlp warns and downloads fine without a runtime — so
+/// any silent failure is retried once WITHOUT `--js-runtimes` before giving
+/// up. Real yt-dlp errors (403, age gate, ...) always carry their
+/// "ERROR: ..." line on stderr and are returned as-is.
+async fn run_yt_dlp_download(
+    yt_dlp: &Path,
+    base_args: &[&str],
+    js_runtime: Option<&str>,
+    timeout: Duration,
+) -> Result<String, YtDlpRunFailure> {
+    let variants: [Option<&str>; 2] = [js_runtime, None];
+    let mut command = String::new();
+    let mut attempts: Vec<String> = Vec::new();
+    for (index, runtime) in variants.into_iter().enumerate() {
+        let mut args: Vec<&str> = base_args.to_vec();
+        if let Some(arg) = runtime {
+            args.insert(0, "--js-runtimes");
+            args.insert(1, arg);
+        }
+        if command.is_empty() {
+            command = format!("{} {}", yt_dlp.display(), args.join(" "));
+        }
+        match run_command_with_timeout(yt_dlp, args, timeout).await {
+            Err(error) if error.contains("exited with") => {
+                // Empty stderr: the silent `--js-runtimes` death. Retry the
+                // no-runtime variant before reporting.
+                attempts.push(format!("{error} (empty stderr)"));
+                if index == 0 {
+                    continue;
+                }
+                return Err(YtDlpRunFailure {
+                    silent: true,
+                    message: error,
+                    command,
+                    attempts,
+                });
+            }
+            Err(error) => {
+                attempts.push(error.clone());
+                return Err(YtDlpRunFailure {
+                    silent: false,
+                    message: error,
+                    command,
+                    attempts,
+                });
+            }
+            Ok(output) => {
+                if find_yt_dlp_output_file(&output).is_some() {
+                    return Ok(output);
+                }
+                // Exit 0 but no file reported: silent success. Fall through
+                // to the no-runtime variant.
+                attempts.push("exited 0 but printed no file path".to_string());
+                if index == 0 {
+                    continue;
+                }
+                return Err(YtDlpRunFailure {
+                    silent: false,
+                    message: "yt-dlp did not return a playable audio file.".to_string(),
+                    command,
+                    attempts,
+                });
+            }
+        }
+    }
+    unreachable!("variants always contains a no-runtime fallback")
+}
+
+/// Append a yt-dlp failure to `app_local_data_dir/ytdlp-errors.log` so a
+/// machine-specific failure (silent deaths especially) can be diagnosed
+/// from the user's actual environment instead of guessed at.
+async fn log_yt_dlp_failure(app: &AppHandle, context: &str, failure: &YtDlpRunFailure) {
+    let Ok(root) = app.path().app_local_data_dir() else {
+        return;
+    };
+    let log_path = root.join("ytdlp-errors.log");
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|value| value.as_millis())
+        .unwrap_or(0);
+    let entry = format!(
+        "[{now_ms}] context={context}\n  silent={} attempts: {}\n  command: {}\n  message: {}\n\n",
+        failure.silent,
+        failure.attempts.join(" | "),
+        failure.command,
+        failure.message
+    );
+    use tokio::io::AsyncWriteExt;
+    if let Ok(mut file) = tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .await
+    {
+        let _ = file.write_all(entry.as_bytes()).await;
+    }
+}
+
+/// Delete the cached yt-dlp binary so the next `ensure_yt_dlp` re-downloads
+/// it. Used when the downloader dies silently on every variant — a corrupt
+/// or tampered copy is the prime suspect and a fresh download is the only
+/// code-level remedy.
+async fn force_refresh_yt_dlp(app: &AppHandle) {
+    if let Ok(path) = yt_dlp_path(app) {
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+}
+
+/// Shared download entry point for all yt-dlp audio downloads. Runs the
+/// with-runtime attempt, falls back to the no-runtime attempt on silent
+/// failure, and — when BOTH die silently — refreshes the downloader binary
+/// and retries once before giving up with an actionable error. A diagnostic
+/// entry is appended to ytdlp-errors.log for every silent or repeated
+/// failure so the real cause is never hidden again.
+async fn run_yt_dlp_download_with_recovery(
+    app: &AppHandle,
+    yt_dlp: &Path,
+    base_args: &[&str],
+    js_runtime: Option<&str>,
+    timeout: Duration,
+    context: &str,
+) -> Result<String, String> {
+    match run_yt_dlp_download(yt_dlp, base_args, js_runtime, timeout).await {
+        Ok(output) => Ok(output),
+        Err(failure) if failure.silent => {
+            log_yt_dlp_failure(app, context, &failure).await;
+            // Silent death on every variant: re-download the binary and try
+            // once more. A corrupt downloader is the common cause and a
+            // fresh copy either fixes it or proves the block is environmental.
+            force_refresh_yt_dlp(app).await;
+            let fresh = match ensure_yt_dlp(app).await {
+                Ok(path) => path,
+                Err(error) => {
+                    return Err(format!(
+                        "{}. Also failed to re-download the downloader: {error}",
+                        failure.message
+                    ));
+                }
+            };
+            match run_yt_dlp_download(&fresh, base_args, js_runtime, timeout).await {
+                Ok(output) => Ok(output),
+                Err(retry) => {
+                    log_yt_dlp_failure(app, context, &retry).await;
+                    Err(format!(
+                        "{}. Even after re-downloading the downloader it exited \
+                         without printing any error message — antivirus software \
+                         is most likely blocking yt-dlp. A diagnostic log was \
+                         written to the app's data folder (ytdlp-errors.log).",
+                        retry.message
+                    ))
+                }
+            }
+        }
+        Err(failure) => {
+            if !failure.attempts.is_empty() {
+                log_yt_dlp_failure(app, context, &failure).await;
+            }
+            Err(failure.message)
+        }
+    }
+}
+
+/// The actual yt-dlp download for `resolve_stream`, shared by the leader
+/// (runs it) and published to every follower via the in-flight handle.
+async fn resolve_stream_download(
+    app: &AppHandle,
+    state: &AppState,
+    video_id: &str,
+) -> Result<StreamResponse, String> {
+    let yt_dlp = ensure_yt_dlp(app).await?;
+    let deno = ensure_deno(app).await.ok();
+    let js_runtime_arg = deno.as_ref().map(|p| deno_js_runtime_arg(p.as_path()));
+    let watch_url = format!("https://music.youtube.com/watch?v={video_id}");
+    let cache_dir = stream_cache_dir(app)?;
+    tokio::fs::create_dir_all(&cache_dir)
+        .await
+        .map_err(|error| format!("Failed to create stream cache folder: {error}"))?;
+    // Best-effort janitor: purge stale files and in-memory entries before
+    // downloading so the cache can't grow without bound over a long session.
+    let _ = cleanup_old_stream_cache_files(&cache_dir).await;
+    {
+        let mut cache = state.stream_cache.lock().await;
+        cleanup_expired_stream_cache(&mut cache);
+    }
+
+    remove_cached_streams(&cache_dir, video_id).await?;
 
     // Never reuse the final cache filename while a player may still have the
     // previous stream open. Windows refuses to rename over an open file
@@ -3391,7 +3973,7 @@ async fn resolve_stream(
         .unwrap_or(0);
     let output_template = cache_dir.join(format!("{video_id}.{nonce}.%(ext)s"));
     let output_template = output_template.to_string_lossy().to_string();
-    let mut args: Vec<&str> = vec![
+    let base_args: Vec<&str> = vec![
         "-f",
         // Avoid extension/client constraints: YouTube may expose only SABR
         // formats for one client, while another available audio format is
@@ -3401,44 +3983,67 @@ async fn resolve_stream(
         "--no-progress",
         "--no-part",
         "--force-overwrites",
+        // Never let a stray yt-dlp config file (e.g. a stale cookies or
+        // proxy option) silently change how downloads run.
+        "--ignore-config",
         "--retries",
-        "3",
+        "5",
         "--fragment-retries",
-        "3",
+        "5",
         "--retry-sleep",
-        "exp=1:5",
+        "exp=2:8",
         "--print",
         "after_move:filepath",
         "-o",
         &output_template,
         &watch_url,
     ];
-    if let Some(ref arg) = js_runtime_arg {
-        args.insert(0, "--js-runtimes");
-        args.insert(1, arg);
-    }
-    let output = run_command(&yt_dlp, args).await?;
-    let file_path = output
-        .lines()
-        .rev()
-        .map(str::trim)
-        .find(|line| !line.is_empty())
-        .filter(|line| Path::new(line).exists())
-        .ok_or_else(|| "yt-dlp did not return a playable audio file.".to_string())?
-        .to_string();
+    let output = match run_yt_dlp_download_with_recovery(
+        app,
+        &yt_dlp,
+        &base_args,
+        js_runtime_arg.as_deref(),
+        STREAM_RESOLVE_TIMEOUT,
+        "resolve_stream",
+    )
+    .await
+    {
+        Ok(output) => output,
+        Err(error) => {
+            // A failed yt-dlp run can leave a partial file at the output
+            // template; remove it so the next attempt re-downloads instead of
+            // serving a truncated file (which decodes as MEDIA_ERR_DECODE).
+            let _ = remove_cached_streams(&cache_dir, video_id).await;
+            return Err(error);
+        }
+    };
+    let file_path = match find_yt_dlp_output_file(&output) {
+        Some(path) => path,
+        None => {
+            let _ = remove_cached_streams(&cache_dir, video_id).await;
+            return Err("yt-dlp did not return a playable audio file.".to_string());
+        }
+    };
 
     let metadata = tokio::fs::metadata(&file_path)
         .await
         .map_err(|error| format!("Failed to inspect cached audio: {error}"))?;
-    if metadata.len() == 0 {
-        return Err("The downloaded audio file was empty.".to_string());
+    if metadata.len() < MIN_STREAM_CACHE_BYTES {
+        let _ = remove_cached_streams(&cache_dir, video_id).await;
+        return Err("The downloaded audio file was incomplete.".to_string());
     }
+
+    let file_path = if let Some(trimmed) = trim_leading_silence_if_needed(app, Path::new(&file_path)).await {
+        trimmed.to_string_lossy().to_string()
+    } else {
+        file_path
+    };
 
     {
         let mut cache = state.stream_cache.lock().await;
         cleanup_expired_stream_cache(&mut cache);
         cache.insert(
-            video_id,
+            video_id.to_string(),
             CachedStream {
                 source: file_path.clone(),
                 fetched_at: Instant::now(),
@@ -3450,6 +4055,250 @@ async fn resolve_stream(
         url: None,
         file_path: Some(file_path),
     })
+}
+
+/// If the stream file starts with leading silence / gap,
+/// actual ffmpeg trimming is performed so the audio starts cleanly at 0:00.
+///
+/// Only leading silence is considered (silence_start <= 0.25s). The trim is
+/// sample-accurate via `atrim` + re-encode so it works for Opus/WebM where
+/// `-ss` + `-c copy` is imprecise. MAX is capped at 8s to avoid trimming
+/// intended quiet intros; MIN 0.35s avoids micro-gaps.
+async fn trim_leading_silence_if_needed(app: &AppHandle, file_path: &Path) -> Option<PathBuf> {
+    const ANALYSIS_MAX_SECONDS: f64 = 45.0;
+    const SILENCE_NOISE_DB: f64 = -42.0;
+    const SILENCE_MIN_DURATION: f64 = 0.3;
+    const MIN_SKIP_SECONDS: f64 = 0.35;
+    const MAX_SKIP_SECONDS: f64 = 8.0;
+    const LEADING_SILENCE_START_TOLERANCE: f64 = 0.25;
+    const SILENCE_END_PREROLL: f64 = 0.08;
+
+    let ffmpeg = resolve_ffmpeg(app).await?;
+    let null_device = if cfg!(target_os = "windows") { "NUL" } else { "/dev/null" };
+    let filter = format!("silencedetect=noise={SILENCE_NOISE_DB}dB:d={SILENCE_MIN_DURATION}");
+
+    let mut command = Command::new(&ffmpeg);
+    command.args([
+        "-nostdin",
+        "-hide_banner",
+        "-nostats",
+        "-vn",
+        "-t",
+        &format!("{ANALYSIS_MAX_SECONDS:.3}"),
+        "-i",
+        &file_path.to_string_lossy(),
+        "-af",
+        &filter,
+        "-f",
+        "null",
+        null_device,
+        "-y",
+    ]);
+    #[cfg(target_os = "windows")]
+    command.creation_flags(CREATE_NO_WINDOW);
+    command.kill_on_drop(true);
+
+    let output = match tokio::time::timeout(FFMPEG_ANALYSIS_TIMEOUT, command.output()).await {
+        Ok(Ok(output)) if output.status.success() => output,
+        _ => return None,
+    };
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let mut current_silence_start: Option<f64> = None;
+    let mut leading_skip: Option<f64> = None;
+
+    fn parse_val(line: &str, key: &str) -> Option<f64> {
+        let marker = format!("{key}:");
+        let start = line.find(&marker)? + marker.len();
+        let raw = line[start..].trim();
+        let token = raw.split_whitespace().next()?;
+        token.parse::<f64>().ok().filter(|v| v.is_finite())
+    }
+
+    for line in stderr.lines() {
+        if line.contains("silence_start:") {
+            current_silence_start = parse_val(line, "silence_start");
+            continue;
+        }
+        if line.contains("silence_end:") {
+            let silence_end = parse_val(line, "silence_end");
+            let silence_dur = parse_val(line, "silence_duration");
+            if let Some(end) = silence_end {
+                let start = current_silence_start
+                    .or_else(|| silence_dur.map(|dur| (end - dur).max(0.0)))
+                    .unwrap_or(0.0);
+                if start <= LEADING_SILENCE_START_TOLERANCE {
+                    leading_skip = Some(end);
+                    break;
+                }
+            }
+            current_silence_start = None;
+        }
+    }
+
+    let skip = leading_skip.and_then(|seconds| {
+        let with_preroll = (seconds - SILENCE_END_PREROLL).max(0.0);
+        if with_preroll < MIN_SKIP_SECONDS {
+            None
+        } else {
+            Some(with_preroll.min(MAX_SKIP_SECONDS))
+        }
+    })?;
+
+    // Perform actual trimming using ffmpeg — sample-accurate via atrim.
+    // `-ss` + `-c copy` is imprecise for Opus/WebM (packet boundaries) and
+    // silently produced untrimmed files on Windows. Using `atrim` with
+    // re-encode guarantees the silence is physically removed.
+    let parent = file_path.parent()?;
+    let stem = file_path.file_stem()?.to_str()?;
+    let ext_raw = file_path.extension().and_then(|e| e.to_str()).unwrap_or("opus");
+    let ext = ext_raw.to_ascii_lowercase();
+    let trimmed_path = parent.join(format!("{stem}.trimmed.{ext_raw}"));
+
+    // Pick a codec compatible with the container. For webm/opus we must stay
+    // opus; for m4a/mp4 aac; for mp3 lamer etc. Using a mismatched codec
+    // would create an unplayable file (e.g. aac in webm).
+    let (codec, needs_bitrate): (&str, bool) = match ext.as_str() {
+        "opus" | "webm" => ("libopus", true),
+        "ogg" | "oga" => ("libvorbis", true),
+        "mp3" => ("libmp3lame", true),
+        "m4a" | "mp4" | "aac" => ("aac", true),
+        "flac" => ("flac", false),
+        "wav" => ("pcm_s16le", false),
+        _ => ("aac", true),
+    };
+    // atrim filter: keep from `skip` to end, reset PTS so output starts at 0.
+    let atrim_filter = format!("atrim=start={skip:.3},asetpts=PTS-STARTPTS");
+
+    let trimmed_ok = {
+        let mut cmd = Command::new(&ffmpeg);
+        // Input
+        cmd.args([
+            "-nostdin",
+            "-hide_banner",
+            "-nostats",
+            "-i",
+            &file_path.to_string_lossy(),
+        ]);
+        // Audio trim
+        cmd.args(["-af", &atrim_filter]);
+        cmd.args(["-vn"]);
+        // Re-encode audio with container-appropriate codec
+        cmd.args(["-c:a", codec]);
+        if needs_bitrate {
+            // Preserve quality — 128k is transparent for the trimmed prefix and
+            // keeps file size comparable to the source yt-dlp bestaudio.
+            // libopus also benefits from vbr.
+            if codec == "libopus" {
+                cmd.args(["-b:a", "128k", "-vbr", "on"]);
+            } else {
+                cmd.args(["-b:a", "128k"]);
+            }
+        }
+        // Work around ffmpeg's default that stops encoding at the shortest
+        // stream — atrim alone can make the encoder think duration is unknown.
+        // Let the output run until the trimmed audio ends.
+        cmd.args([&trimmed_path.to_string_lossy(), "-y"]);
+        #[cfg(target_os = "windows")]
+        cmd.creation_flags(CREATE_NO_WINDOW);
+        cmd.kill_on_drop(true);
+
+        let res = tokio::time::timeout(FFMPEG_ANALYSIS_TIMEOUT, cmd.output()).await;
+        match res {
+            Ok(Ok(out)) if out.status.success() => true,
+            Ok(Ok(out)) => {
+                eprintln!(
+                    "[trim] atrim re-encode failed for {} (skip={:.3}s): {}",
+                    file_path.display(),
+                    skip,
+                    String::from_utf8_lossy(&out.stderr).trim()
+                );
+                false
+            }
+            Ok(Err(e)) => {
+                eprintln!("[trim] failed to spawn ffmpeg for {}: {e}", file_path.display());
+                false
+            }
+            Err(_) => {
+                eprintln!("[trim] ffmpeg atrim timed out for {}", file_path.display());
+                false
+            }
+        }
+    };
+
+    // Fallback: if atrim re-encode failed (e.g. missing encoder), try the
+    // legacy fast path `-ss` + copy which at least removes the prefix for many
+    // containers even if not sample-accurate. This keeps trimming best-effort
+    // rather than silently doing nothing.
+    let trimmed_ok = if trimmed_ok {
+        true
+    } else {
+        let mut fallback = Command::new(&ffmpeg);
+        fallback.args([
+            "-nostdin",
+            "-hide_banner",
+            "-nostats",
+            "-ss",
+            &format!("{skip:.3}"),
+            "-i",
+            &file_path.to_string_lossy(),
+            "-c",
+            "copy",
+            &trimmed_path.to_string_lossy(),
+            "-y",
+        ]);
+        #[cfg(target_os = "windows")]
+        fallback.creation_flags(CREATE_NO_WINDOW);
+        fallback.kill_on_drop(true);
+        match tokio::time::timeout(FFMPEG_ANALYSIS_TIMEOUT, fallback.output()).await {
+            Ok(Ok(out)) if out.status.success() => {
+                // Verify file actually shrank somewhat — copy+seek can succeed
+                // but leave the file nearly identical if it couldn't seek.
+                if let (Ok(src_meta), Ok(dst_meta)) = (
+                    tokio::fs::metadata(file_path).await,
+                    tokio::fs::metadata(&trimmed_path).await,
+                ) {
+                    // For a true trim, dst should be smaller than src.
+                    // If not, treat as failure so we don't replace with a
+                    // useless file.
+                    if dst_meta.len() >= src_meta.len() {
+                        eprintln!(
+                            "[trim] fallback copy produced no size reduction for {} (src={}, dst={})",
+                            file_path.display(),
+                            src_meta.len(),
+                            dst_meta.len()
+                        );
+                        false
+                    } else {
+                        true
+                    }
+                } else {
+                    true
+                }
+            }
+            _ => false,
+        }
+    };
+
+    if trimmed_ok {
+        if let Ok(meta) = tokio::fs::metadata(&trimmed_path).await {
+            if meta.len() >= MIN_STREAM_CACHE_BYTES {
+                let _ = tokio::fs::remove_file(file_path).await;
+                if tokio::fs::rename(&trimmed_path, file_path).await.is_ok() {
+                    return Some(file_path.to_path_buf());
+                }
+                return Some(trimmed_path);
+            } else {
+                eprintln!(
+                    "[trim] trimmed file too small for {} (len={}), discarding",
+                    file_path.display(),
+                    meta.len()
+                );
+            }
+        }
+    }
+    let _ = tokio::fs::remove_file(&trimmed_path).await;
+    None
 }
 
 async fn remove_cached_streams(cache_dir: &Path, video_id: &str) -> Result<(), String> {
@@ -3505,6 +4354,11 @@ async fn find_offline_file(dir: &Path, video_id: &str) -> Option<PathBuf> {
     while let Some(entry) = entries.next_entry().await.ok()? {
         let path = entry.path();
         let name = path.file_name().and_then(|v| v.to_str())?;
+        // Never resolve an in-flight compact-encode temp file as the
+        // "real" offline file (it is only valid once renamed in place).
+        if name.contains(".compact-tmp.") {
+            continue;
+        }
         if name.starts_with(&prefix) && path.is_file() {
             return Some(path);
         }
@@ -3540,59 +4394,165 @@ async fn remove_offline_video(dir: &Path, video_id: &str) -> Result<(), String> 
     Ok(())
 }
 
-#[tauri::command]
-async fn save_offline(app: AppHandle, video_id: String) -> Result<(), String> {
-    let offline = offline_dir(&app)?;
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq)]
+struct OfflineManifestEntry {
+    mode: String,
+    #[serde(default)]
+    bitrate: Option<u32>,
+    ext: String,
+}
+
+fn offline_manifest_path(dir: &Path) -> PathBuf {
+    dir.join("offline-manifest.json")
+}
+
+async fn load_offline_manifest(dir: &Path) -> HashMap<String, OfflineManifestEntry> {
+    match tokio::fs::read_to_string(offline_manifest_path(dir)).await {
+        Ok(raw) => serde_json::from_str(&raw).unwrap_or_default(),
+        Err(_) => HashMap::new(),
+    }
+}
+
+async fn save_offline_manifest(dir: &Path, manifest: &HashMap<String, OfflineManifestEntry>) {
+    if let Ok(raw) = serde_json::to_string(manifest) {
+        let _ = tokio::fs::write(offline_manifest_path(dir), raw).await;
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum OfflineSaveOutcome {
+    Skipped,
+    Reencoded,
+    Redownloaded,
+}
+
+async fn encode_compact_opus(app: &AppHandle, input: &Path, output: &Path) -> Result<(), String> {
+    let ffmpeg = resolve_ffmpeg(app)
+        .await
+        .ok_or_else(|| "ffmpeg is required for compact downloads.".to_string())?;
+    let mut cmd = Command::new(&ffmpeg);
+    cmd.args([
+        "-nostdin",
+        "-hide_banner",
+        "-nostats",
+        "-y",
+        "-i",
+        &input.to_string_lossy(),
+        "-vn",
+        "-c:a",
+        "libopus",
+        "-b:a",
+        "64k",
+        "-vbr",
+        "on",
+        &output.to_string_lossy(),
+    ]);
+    #[cfg(target_os = "windows")]
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    cmd.kill_on_drop(true);
+    let out = cmd
+        .output()
+        .await
+        .map_err(|error| format!("Failed to run ffmpeg: {error}"))?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        return Err(if stderr.is_empty() {
+            "Failed to encode compact audio.".to_string()
+        } else {
+            stderr
+        });
+    }
+    let metadata = tokio::fs::metadata(output)
+        .await
+        .map_err(|error| format!("Failed to inspect compact audio: {error}"))?;
+    if metadata.len() == 0 {
+        return Err("The compact audio file was empty.".to_string());
+    }
+    Ok(())
+}
+
+async fn download_offline_file(
+    app: &AppHandle,
+    video_id: &str,
+    compact: bool,
+) -> Result<OfflineSaveOutcome, String> {
+    let offline = offline_dir(app)?;
     tokio::fs::create_dir_all(&offline)
         .await
         .map_err(|error| format!("Failed to create offline folder: {error}"))?;
 
-    // Already downloaded — skip.
-    if find_offline_file(&offline, &video_id).await.is_some() {
-        return Ok(());
+    let mut manifest = load_offline_manifest(&offline).await;
+    let existing_is_compact = manifest
+        .get(video_id)
+        .map(|entry| entry.mode == "compact")
+        .unwrap_or(false);
+
+    if let Some(existing) = find_offline_file(&offline, video_id).await {
+        if existing_is_compact == compact {
+            return Ok(OfflineSaveOutcome::Skipped);
+        }
+        if compact {
+            // Full → compact: re-encode the existing file locally, no re-download.
+            let target = offline.join(format!("{video_id}.opus"));
+            let temp = offline.join(format!("{video_id}.compact-tmp.opus"));
+            encode_compact_opus(app, &existing, &temp).await?;
+            remove_offline_video(&offline, video_id).await?;
+            tokio::fs::rename(&temp, &target).await.map_err(|error| {
+                format!("Failed to finalize compact audio: {error}")
+            })?;
+            manifest.insert(
+                video_id.to_string(),
+                OfflineManifestEntry {
+                    mode: "compact".into(),
+                    bitrate: Some(64),
+                    ext: "opus".into(),
+                },
+            );
+            save_offline_manifest(&offline, &manifest).await;
+            return Ok(OfflineSaveOutcome::Reencoded);
+        }
+        // Compact → full: drop the compact file and re-download at full quality.
+        remove_offline_video(&offline, video_id).await?;
     }
 
-    let yt_dlp = ensure_yt_dlp(&app).await?;
-    let deno = ensure_deno(&app).await.ok();
-    let js_runtime_arg = deno
-        .as_ref()
-        .map(|p| format!("deno:{}", p.display()));
+    let yt_dlp = ensure_yt_dlp(app).await?;
+    let deno = ensure_deno(app).await.ok();
+    let js_runtime_arg = deno.as_ref().map(|p| deno_js_runtime_arg(p.as_path()));
     let watch_url = format!("https://music.youtube.com/watch?v={video_id}");
-    remove_offline_video(&offline, &video_id).await?;
 
     let output_template = offline.join(format!("{video_id}.%(ext)s"));
     let output_template = output_template.to_string_lossy().to_string();
-    let mut args: Vec<&str> = vec![
+    let base_args: Vec<&str> = vec![
         "-f",
         "bestaudio/best",
         "--no-playlist",
         "--no-progress",
         "--no-part",
         "--force-overwrites",
+        "--ignore-config",
         "--retries",
-        "3",
+        "5",
         "--fragment-retries",
-        "3",
+        "5",
         "--retry-sleep",
-        "exp=1:5",
+        "exp=2:8",
         "--print",
         "after_move:filepath",
         "-o",
         &output_template,
         &watch_url,
     ];
-    if let Some(ref arg) = js_runtime_arg {
-        args.insert(0, "--js-runtimes");
-        args.insert(1, arg);
-    }
-    let output = run_command_with_timeout(&yt_dlp, args, YT_DLP_DOWNLOAD_TIMEOUT).await?;
+    let output = run_yt_dlp_download_with_recovery(
+        app,
+        &yt_dlp,
+        &base_args,
+        js_runtime_arg.as_deref(),
+        YT_DLP_DOWNLOAD_TIMEOUT,
+        "save_offline",
+    )
+    .await?;
 
-    let file_path = output
-        .lines()
-        .rev()
-        .map(str::trim)
-        .find(|line| !line.is_empty())
-        .filter(|line| Path::new(line).exists())
+    let file_path = find_yt_dlp_output_file(&output)
         .ok_or_else(|| "yt-dlp did not return a playable audio file.".to_string())?;
 
     let metadata = tokio::fs::metadata(&file_path)
@@ -3602,7 +4562,111 @@ async fn save_offline(app: AppHandle, video_id: String) -> Result<(), String> {
         return Err("The downloaded audio file was empty.".to_string());
     }
 
-    Ok(())
+    if compact {
+        let target = offline.join(format!("{video_id}.opus"));
+        let temp = offline.join(format!("{video_id}.compact-tmp.opus"));
+        encode_compact_opus(app, Path::new(&file_path), &temp).await?;
+        let _ = tokio::fs::remove_file(&file_path).await;
+        tokio::fs::rename(&temp, &target).await
+            .map_err(|error| format!("Failed to finalize compact audio: {error}"))?;
+        manifest.insert(
+            video_id.to_string(),
+            OfflineManifestEntry {
+                mode: "compact".into(),
+                bitrate: Some(64),
+                ext: "opus".into(),
+            },
+        );
+    } else {
+        let ext = Path::new(&file_path)
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or("webm")
+            .to_string();
+        manifest.insert(
+            video_id.to_string(),
+            OfflineManifestEntry {
+                mode: "full".into(),
+                bitrate: None,
+                ext,
+            },
+        );
+    }
+    save_offline_manifest(&offline, &manifest).await;
+    Ok(OfflineSaveOutcome::Redownloaded)
+}
+
+#[tauri::command]
+async fn save_offline(app: AppHandle, video_id: String, compact: bool) -> Result<(), String> {
+    download_offline_file(&app, &video_id, compact).await.map(|_| ())
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ReconcileOfflineResult {
+    reencoded: usize,
+    redownloaded: usize,
+    skipped: usize,
+    failed: Vec<String>,
+}
+
+#[tauri::command]
+async fn reconcile_offline_quality(
+    app: AppHandle,
+    compact: bool,
+) -> Result<ReconcileOfflineResult, String> {
+    let offline = offline_dir(&app)?;
+    if !offline.exists() {
+        return Ok(ReconcileOfflineResult {
+            reencoded: 0,
+            redownloaded: 0,
+            skipped: 0,
+            failed: Vec::new(),
+        });
+    }
+    let mut result = ReconcileOfflineResult {
+        reencoded: 0,
+        redownloaded: 0,
+        skipped: 0,
+        failed: Vec::new(),
+    };
+    let mut entries = tokio::fs::read_dir(&offline)
+        .await
+        .map_err(|error| format!("Failed to read offline folder: {error}"))?;
+    let mut ids = Vec::new();
+    while let Some(entry) = entries
+        .next_entry()
+        .await
+        .map_err(|error| format!("Failed to inspect offline entry: {error}"))?
+    {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|v| v.to_str()) else {
+            continue;
+        };
+        if name == "offline-manifest.json" || name.contains(".compact-tmp.") {
+            continue;
+        }
+        if let Some(dot) = name.rfind('.') {
+            let id = &name[..dot];
+            if !id.is_empty() {
+                ids.push(id.to_string());
+            }
+        }
+    }
+    ids.sort();
+    ids.dedup();
+    for id in ids {
+        match download_offline_file(&app, &id, compact).await {
+            Ok(OfflineSaveOutcome::Skipped) => result.skipped += 1,
+            Ok(OfflineSaveOutcome::Reencoded) => result.reencoded += 1,
+            Ok(OfflineSaveOutcome::Redownloaded) => result.redownloaded += 1,
+            Err(_) => result.failed.push(id),
+        }
+    }
+    Ok(result)
 }
 
 #[tauri::command]
@@ -3674,6 +4738,9 @@ async fn list_offline(app: AppHandle) -> Result<Vec<String>, String> {
         let Some(name) = path.file_name().and_then(|v| v.to_str()) else {
             continue;
         };
+        if name == "offline-manifest.json" || name.contains(".compact-tmp.") {
+            continue;
+        }
         // Extract videoId from "{videoId}.ext"
         if let Some(dot) = name.rfind('.') {
             let id = &name[..dot];
@@ -3773,14 +4840,14 @@ async fn ensure_dir(dir: &Path) -> Result<(), String> {
 /// Find a non-clobbering destination filename inside `dir`. If
 /// `{stem}.mp3` already exists, appends ` (2)`, ` (3)`, etc. Also strips
 /// any existing extension on `stem` and forces `.mp3`.
-async fn unique_mp3_path(dir: &Path, stem: &str) -> Result<PathBuf, String> {
+async fn unique_export_path(dir: &Path, stem: &str, ext: &str) -> Result<PathBuf, String> {
     let cleaned_stem = sanitize_filename(stem);
-    let mut candidate = dir.join(format!("{cleaned_stem}.mp3"));
+    let mut candidate = dir.join(format!("{cleaned_stem}.{ext}"));
     if !candidate.exists() {
         return Ok(candidate);
     }
     for n in 2.. {
-        candidate = dir.join(format!("{cleaned_stem} ({n}).mp3"));
+        candidate = dir.join(format!("{cleaned_stem} ({n}).{ext}"));
         if !candidate.exists() {
             return Ok(candidate);
         }
@@ -3818,14 +4885,12 @@ async fn find_cached_audio_source(
     video_ids: &[String],
 ) -> Option<PathBuf> {
     {
-        let cache = state.stream_cache.lock().await;
+        let mut cache = state.stream_cache.lock().await;
         for id in video_ids {
             if let Some(entry) = cache.get(id) {
-                if entry.fetched_at.elapsed() < STREAM_CACHE_TTL {
-                    let path = PathBuf::from(&entry.source);
-                    if cached_audio_file_valid(&path).await {
-                        return Some(path);
-                    }
+                let path = PathBuf::from(&entry.source);
+                if cached_audio_file_valid(&path).await {
+                    return Some(path);
                 }
             }
         }
@@ -3857,10 +4922,43 @@ async fn find_cached_audio_source(
     None
 }
 
-async fn convert_cached_audio_to_mp3(
+/// Probe the audio stream bitrate (kbps) of a local media file via the
+/// bundled ffprobe. Falls back to `None` when ffprobe is missing or the
+/// probe fails, so callers can pick a safe default.
+async fn probe_audio_bitrate_kbps(app: &AppHandle, path: &Path) -> Option<u32> {
+    let ffprobe = resolve_ffprobe(app).await?;
+    let mut cmd = Command::new(&ffprobe);
+    cmd.args([
+        "-v",
+        "error",
+        "-select_streams",
+        "a:0",
+        "-show_entries",
+        "stream=bit_rate",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+        &path.to_string_lossy(),
+    ]);
+    #[cfg(target_os = "windows")]
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    cmd.kill_on_drop(true);
+    let output = cmd.output().await.ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let rate: u64 = text.trim().parse().ok()?;
+    if rate == 0 {
+        return None;
+    }
+    Some((rate as f64 / 1000.0).round() as u32)
+}
+
+async fn convert_cached_audio_to_format(
     app: &AppHandle,
     source: &Path,
     target_path: &Path,
+    format: ExportFormat,
 ) -> Result<PathBuf, String> {
     let parent = target_path
         .parent()
@@ -3869,40 +4967,68 @@ async fn convert_cached_audio_to_mp3(
         .file_stem()
         .and_then(|s| s.to_str())
         .ok_or_else(|| "Could not derive a file stem from the target path.".to_string())?;
-    let temp_mp3 = parent.join(format!(".velocity-export-{stem}.tmp.mp3"));
 
-    let is_mp3 = source
-        .extension()
-        .and_then(|value| value.to_str())
-        .map(|value| value.eq_ignore_ascii_case("mp3"))
-        .unwrap_or(false);
-    if is_mp3 {
-        tokio::fs::copy(source, &temp_mp3)
+    // Native export is a verbatim copy — the container is already what
+    // the user wants, so we skip any transcode. We also skip tagging
+    // for native (the tags live in the source container, which for a
+    // typical webm/mka from yt-dlp we can't rewrite anyway). The temp
+    // file keeps the source extension so the caller can resolve the
+    // final on-disk name from the produced file.
+    if format == ExportFormat::Native {
+        let source_ext = source
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or("webm");
+        let temp = parent.join(format!(".velocity-export-{stem}.tmp.{source_ext}"));
+        tokio::fs::copy(source, &temp)
             .await
             .map_err(|error| format!("Failed to copy cached audio: {error}"))?;
-        return Ok(temp_mp3);
+        return Ok(temp);
+    }
+
+    let temp = parent.join(format!(".velocity-export-{stem}.tmp.{}", format.ext()));
+
+    let is_already_encoded = source
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| value.eq_ignore_ascii_case(format.ext()))
+        .unwrap_or(false);
+    if is_already_encoded {
+        tokio::fs::copy(source, &temp)
+            .await
+            .map_err(|error| format!("Failed to copy cached audio: {error}"))?;
+        return Ok(temp);
     }
 
     let ffmpeg = resolve_ffmpeg(app)
         .await
         .ok_or_else(|| FFMPEG_EXPORT_UNAVAILABLE.to_string())?;
     let source_arg = source.to_string_lossy().to_string();
-    let output_arg = temp_mp3.to_string_lossy().to_string();
+    let output_arg = temp.to_string_lossy().to_string();
     let mut command = Command::new(&ffmpeg);
-    command.args([
-        "-nostdin",
-        "-hide_banner",
-        "-nostats",
-        "-y",
-        "-i",
-        &source_arg,
-        "-vn",
-        "-codec:a",
-        "libmp3lame",
-        "-q:a",
-        "0",
-        &output_arg,
-    ]);
+    match format {
+        ExportFormat::Mp3 => {
+            command.args([
+                "-nostdin", "-hide_banner", "-nostats", "-y", "-i", &source_arg, "-vn",
+                "-codec:a", "libmp3lame", "-q:a", "0", &output_arg,
+            ]);
+        }
+        ExportFormat::Opus => {
+            // Match the source quality: probe the cached file's audio
+            // bitrate and encode at that rate, clamped to [96, 256].
+            // Unprobeable sources fall back to 160 kbps.
+            let probed = probe_audio_bitrate_kbps(app, source).await;
+            let bitrate = probed
+                .map(|kbps| kbps.clamp(96, 256))
+                .unwrap_or(160)
+                .to_string();
+            command.args([
+                "-nostdin", "-hide_banner", "-nostats", "-y", "-i", &source_arg, "-vn",
+                "-c:a", "libopus", "-b:a", &bitrate, "-vbr", "on", &output_arg,
+            ]);
+        }
+        ExportFormat::Native => unreachable!(),
+    }
     #[cfg(target_os = "windows")]
     command.creation_flags(CREATE_NO_WINDOW);
 
@@ -3911,34 +5037,37 @@ async fn convert_cached_audio_to_mp3(
         .await
         .map_err(|error| format!("Failed to run ffmpeg: {error}"))?;
     if !output.status.success() {
-        let _ = tokio::fs::remove_file(&temp_mp3).await;
+        let _ = tokio::fs::remove_file(&temp).await;
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         return Err(if stderr.is_empty() {
-            "ffmpeg failed to convert cached audio to MP3.".to_string()
+            "ffmpeg failed to convert cached audio.".to_string()
         } else {
             stderr
         });
     }
-    if !cached_audio_file_valid(&temp_mp3).await {
-        let _ = tokio::fs::remove_file(&temp_mp3).await;
-        return Err("ffmpeg produced an empty MP3 file.".to_string());
+    if !cached_audio_file_valid(&temp).await {
+        let _ = tokio::fs::remove_file(&temp).await;
+        return Err("ffmpeg produced an empty audio file.".to_string());
     }
-    Ok(temp_mp3)
+    Ok(temp)
 }
 
-/// Produce a tagged-ready MP3 temp file for export. Consults cached
+/// Produce a tagged-ready temp file for export. Consults cached
 /// playback/offline audio first, then walks the supplied video ids
 /// through yt-dlp until one succeeds.
-async fn acquire_export_mp3(
+async fn acquire_export_audio(
     app: &AppHandle,
     state: &State<'_, AppState>,
     video_ids: &[String],
     target: &Path,
+    format: ExportFormat,
     cancel_rx: &mut Option<&mut oneshot::Receiver<()>>,
 ) -> Result<PathBuf, String> {
     if !video_ids.is_empty() {
         if let Some(source) = find_cached_audio_source(app, state, video_ids).await {
-            if let Ok(produced) = convert_cached_audio_to_mp3(app, &source, target).await {
+            if let Ok(produced) =
+                convert_cached_audio_to_format(app, &source, target, format).await
+            {
                 return Ok(produced);
             }
         }
@@ -3947,7 +5076,7 @@ async fn acquire_export_mp3(
     let yt_dlp = ensure_yt_dlp(app).await?;
     let mut last_error = "No streamable video id was provided.".to_string();
     for video_id in video_ids {
-        let attempt = download_track_mp3(app, &yt_dlp, video_id, target);
+        let attempt = download_track_audio(app, &yt_dlp, video_id, target, format);
         let result = if let Some(rx) = cancel_rx.as_mut() {
             tokio::select! {
                 result = attempt => result,
@@ -3964,18 +5093,23 @@ async fn acquire_export_mp3(
     Err(last_error)
 }
 
-/// Pull a single track through yt-dlp into an MP3 at `target_path`. Used
-/// by both the song and album exports.
+/// Pull a single track through yt-dlp at `target_path`. Used by both the
+/// song and album exports.
 ///
 /// The output template yt-dlp uses is intentionally a placeholder name;
 /// after yt-dlp returns we don't care about the literal name it used —
 /// we re-tag the file with lofty and rename to `target_path` at the end.
-async fn download_track_mp3(
+async fn download_track_audio(
     app: &AppHandle,
     yt_dlp: &Path,
     video_id: &str,
     target_path: &Path,
+    format: ExportFormat,
 ) -> Result<PathBuf, String> {
+    if format == ExportFormat::Native {
+        return download_track_native(app, yt_dlp, video_id, target_path).await;
+    }
+
     let ffmpeg = resolve_ffmpeg(app)
         .await
         .ok_or_else(|| FFMPEG_EXPORT_UNAVAILABLE.to_string())?;
@@ -3985,9 +5119,7 @@ async fn download_track_mp3(
         .to_string_lossy()
         .to_string();
     let deno = ensure_deno(app).await.ok();
-    let js_runtime_arg = deno
-        .as_ref()
-        .map(|p| format!("deno:{}", p.display()));
+    let js_runtime_arg = deno.as_ref().map(|p| deno_js_runtime_arg(p.as_path()));
     let watch_url = format!("https://music.youtube.com/watch?v={video_id}");
     let parent = target_path
         .parent()
@@ -4000,9 +5132,10 @@ async fn download_track_mp3(
         .file_stem()
         .and_then(|s| s.to_str())
         .ok_or_else(|| "Could not derive a file stem from the target path.".to_string())?;
+    let audio_format = if format == ExportFormat::Mp3 { "mp3" } else { "opus" };
     let temp_template = parent.join(format!(".velocity-export-{stem}-%(ext)s"));
     let temp_template = temp_template.to_string_lossy().to_string();
-    // `-x` (extract-audio) plus `--audio-format mp3` walks the standard
+    // `-x` (extract-audio) plus `--audio-format` walks the standard
     // format postprocessor chain. yt-dlp picks ffmpeg when available
     // (which is the typical case) and falls back to its own remuxer for
     // MP3-in-source cases. `--audio-quality 0` requests best quality.
@@ -4014,10 +5147,10 @@ async fn download_track_mp3(
     // `--embed-thumbnail` — we re-tag with lofty afterwards so the
     // user-supplied (and possibly enriched) metadata wins over whatever
     // yt-dlp scraped from the page.
-    let mut args: Vec<&str> = vec![
+    let args: Vec<&str> = vec![
         "-x",
         "--audio-format",
-        "mp3",
+        audio_format,
         "--audio-quality",
         "0",
         "--ffmpeg-location",
@@ -4026,6 +5159,7 @@ async fn download_track_mp3(
         "--no-progress",
         "--no-part",
         "--force-overwrites",
+        "--ignore-config",
         "--retries",
         "3",
         "--fragment-retries",
@@ -4038,30 +5172,99 @@ async fn download_track_mp3(
         &temp_template,
         &watch_url,
     ];
-    if let Some(ref arg) = js_runtime_arg {
-        args.insert(0, "--js-runtimes");
-        args.insert(1, arg);
-    }
-    let output = run_command_with_timeout(yt_dlp, args, YT_DLP_DOWNLOAD_TIMEOUT).await?;
-    let produced = output
-        .lines()
-        .rev()
-        .map(str::trim)
-        .find(|line| !line.is_empty())
-        .filter(|line| Path::new(line).exists())
+    let output = run_yt_dlp_download_with_recovery(
+        app,
+        yt_dlp,
+        &args,
+        js_runtime_arg.as_deref(),
+        YT_DLP_DOWNLOAD_TIMEOUT,
+        "audio_export",
+    )
+    .await?;
+    let produced = find_yt_dlp_output_file(&output)
         .ok_or_else(|| {
-            "yt-dlp did not produce an MP3 file. Try again in a moment.".to_string()
-        })?
-        .to_string();
-    Ok(PathBuf::from(produced))
+            format!(
+                "yt-dlp did not produce a {audio_format} file. Try again in a moment."
+            )
+        })?;
+    let produced_path = PathBuf::from(produced);
+    let final_path = trim_leading_silence_if_needed(app, &produced_path)
+        .await
+        .unwrap_or(produced_path);
+    Ok(final_path)
 }
 
-/// Apply our authoritative ID3 tag set + cover art to the produced MP3.
-/// Reads the freshly-downloaded file, mutates the ID3v2 tag in-place,
+/// Native export: grab the source container verbatim via yt-dlp (no
+/// `-x`, no post-processing) and copy it into place. We don't re-tag
+/// these files — the tags live in whatever container yt-dlp pulled
+/// down (webm/mka most often), which lofty can't rewrite.
+async fn download_track_native(
+    app: &AppHandle,
+    yt_dlp: &Path,
+    video_id: &str,
+    target_path: &Path,
+) -> Result<PathBuf, String> {
+    let deno = ensure_deno(app).await.ok();
+    let js_runtime_arg = deno.as_ref().map(|p| deno_js_runtime_arg(p.as_path()));
+    let watch_url = format!("https://music.youtube.com/watch?v={video_id}");
+    let parent = target_path
+        .parent()
+        .ok_or_else(|| "Target path has no parent directory.".to_string())?;
+    let stem = target_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| "Could not derive a file stem from the target path.".to_string())?;
+    let temp_template = parent.join(format!(".velocity-export-{stem}-%(ext)s"));
+    let temp_template = temp_template.to_string_lossy().to_string();
+    let args: Vec<&str> = vec![
+        "-f",
+        "bestaudio/best",
+        "--no-playlist",
+        "--no-progress",
+        "--no-part",
+        "--force-overwrites",
+        "--ignore-config",
+        "--retries",
+        "3",
+        "--fragment-retries",
+        "3",
+        "--retry-sleep",
+        "exp=1:5",
+        "--print",
+        "after_move:filepath",
+        "-o",
+        &temp_template,
+        &watch_url,
+    ];
+    let output = run_yt_dlp_download_with_recovery(
+        app,
+        yt_dlp,
+        &args,
+        js_runtime_arg.as_deref(),
+        YT_DLP_DOWNLOAD_TIMEOUT,
+        "native_export",
+    )
+    .await?;
+    let produced = find_yt_dlp_output_file(&output)
+        .ok_or_else(|| "yt-dlp did not produce a playable audio file. Try again in a moment.".to_string())?;
+    let produced_path = PathBuf::from(produced);
+    let final_path = trim_leading_silence_if_needed(app, &produced_path)
+        .await
+        .unwrap_or(produced_path);
+    Ok(final_path)
+}
+
+/// Apply our authoritative tag set + cover art to the produced export.
+/// Reads the freshly-downloaded file, mutates the native tag in-place,
 /// then writes the result back. We do this in a blocking task because
 /// lofty's file ops are sync (and CPU-bound for the thumbnail embed).
-async fn tag_mp3(
+///
+/// Native exports skip tagging entirely: the tags live in whatever
+/// container yt-dlp pulled down (webm/mka most often), which lofty
+/// can't rewrite.
+async fn tag_export(
     produced: &Path,
+    format: ExportFormat,
     title: &str,
     artist: &str,
     album: Option<&str>,
@@ -4071,6 +5274,9 @@ async fn tag_mp3(
     year: Option<u32>,
     cover_bytes: Option<Vec<u8>>,
 ) -> Result<(), String> {
+    if format == ExportFormat::Native {
+        return Ok(());
+    }
     // The spawned task needs owned data ('static). Copy the small string
     // fields into owned `String`s so the closure can move them in. The
     // cover bytes are already owned.
@@ -4079,8 +5285,8 @@ async fn tag_mp3(
     let artist = artist.to_string();
     let album = album.map(str::to_string);
     let album_artist = album_artist.map(str::to_string);
-    tokio::task::spawn_blocking(move || {
-        tag_mp3_blocking(
+    tokio::task::spawn_blocking(move || match format {
+        ExportFormat::Mp3 => tag_mp3_blocking(
             &produced,
             &title,
             &artist,
@@ -4090,7 +5296,19 @@ async fn tag_mp3(
             track_total,
             year,
             cover_bytes,
-        )
+        ),
+        ExportFormat::Opus => tag_opus_blocking(
+            &produced,
+            &title,
+            &artist,
+            album.as_deref(),
+            album_artist.as_deref(),
+            track_number,
+            track_total,
+            year,
+            cover_bytes,
+        ),
+        ExportFormat::Native => unreachable!(),
     })
     .await
     .map_err(|error| format!("Tagging task failed to run: {error}"))?
@@ -4172,6 +5390,73 @@ fn tag_mp3_blocking(
     Ok(())
 }
 
+/// Opus variant of `tag_mp3_blocking`. Ogg Vorbis comments use a flat
+/// `KEY=Value` item map plus `METADATA_BLOCK_PICTURE` for artwork, so we
+/// drive the unified `Tag` type instead of hand-rolling Ogg item frames.
+fn tag_opus_blocking(
+    path: &Path,
+    title: &str,
+    artist: &str,
+    album: Option<&str>,
+    album_artist: Option<&str>,
+    track_number: Option<u32>,
+    track_total: Option<u32>,
+    year: Option<u32>,
+    cover_bytes: Option<Vec<u8>>,
+) -> Result<(), String> {
+    let mut file = std::fs::File::open(path)
+        .map_err(|error| format!("Failed to open {}: {error}", path.display()))?;
+    let mut opus: TaggedFile = OpusFile::read_from(&mut file, ParseOptions::new())
+        .map_err(|error| format!("Failed to parse Opus {}: {error}", path.display()))?
+        .into();
+    // Build a fresh Vorbis-comments tag with the authoritative metadata,
+    // mirroring the MP3 path (fresh tag, no yt-dlp leftovers).
+    let mut tag = Tag::new(TagType::VorbisComments);
+    if !title.is_empty() {
+        tag.set_title(title.to_string());
+    }
+    if !artist.is_empty() {
+        tag.set_artist(artist.to_string());
+    }
+    if let Some(album) = album.filter(|value| !value.is_empty()) {
+        tag.set_album(album.to_string());
+    }
+    // Vorbis' album-artist is the `ALBUMARTIST` comment; the unified
+    // `Tag` has a canonical `ItemKey::AlbumArtist` for it.
+    if let Some(album_artist) = album_artist.filter(|value| !value.is_empty()) {
+        tag.insert(TagItem::new(
+            ItemKey::AlbumArtist,
+            ItemValue::Text(album_artist.to_string()),
+        ));
+    }
+    if let Some(year) = year {
+        tag.set_year(year);
+    }
+    if let Some(track) = track_number {
+        tag.set_track(track);
+    }
+    if let Some(total) = track_total {
+        tag.set_track_total(total);
+    }
+    if let Some(bytes) = cover_bytes {
+        let mime = match infer_cover_mime(&bytes) {
+            Some(MimeType::Jpeg) => Some(MimeType::Jpeg),
+            Some(MimeType::Png) => Some(MimeType::Png),
+            _ => None,
+        };
+        let picture = Picture::new_unchecked(PictureType::CoverFront, mime, None, bytes);
+        tag.push_picture(picture);
+    }
+    // Replace whatever comments the file came with. Ogg Opus holds a
+    // single Vorbis-comments packet, so removing the old one first
+    // guarantees the fresh tag is the only one on disk.
+    let _ = opus.remove(TagType::VorbisComments);
+    opus.insert_tag(tag);
+    opus.save_to_path(path, WriteOptions::default())
+        .map_err(|error| format!("Failed to write tags to {}: {error}", path.display()))?;
+    Ok(())
+}
+
 fn infer_cover_mime(bytes: &[u8]) -> Option<MimeType> {
     if bytes.len() >= 8 && bytes[..8] == [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1A, b'\n'] {
         Some(MimeType::Png)
@@ -4202,6 +5487,35 @@ async fn move_to_target(produced: &Path, target: &Path) -> Result<(), String> {
                 target.display()
             )
         })
+}
+
+/// Resolve the final on-disk path and move the produced temp file into
+/// place. Non-native exports already know their extension up front (from
+/// `ExportFormat::ext`), so `target` is final. Native exports learn the
+/// container extension from the produced file itself, so we compute the
+/// destination after the download and rename the produced file to
+/// `<stem>.<ext>`.
+async fn finalize_export_target(
+    produced: &Path,
+    target: &Path,
+    stem: &str,
+    native: bool,
+) -> Result<PathBuf, String> {
+    if native {
+        let parent = target
+            .parent()
+            .ok_or_else(|| "Target path has no parent directory.".to_string())?;
+        let ext = produced
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or("webm")
+            .to_string();
+        let final_target = unique_export_path(parent, stem, &ext).await?;
+        move_to_target(produced, &final_target).await?;
+        return Ok(final_target);
+    }
+    move_to_target(produced, target).await?;
+    Ok(target.to_path_buf())
 }
 
 /// Fetch a cover image into memory, returning the raw bytes.
@@ -4317,8 +5631,17 @@ async fn save_track_to_mp3_inner(
             target_dir.display()
         ));
     }
+    let native = request.format == ExportFormat::Native;
     let stem = sanitize_filename(&request.file_name);
-    let target = unique_mp3_path(&target_dir, &stem).await?;
+    // Native exports keep the source container's extension, which we
+    // only learn after the download — reserve the bare stem as the
+    // pre-download placeholder and resolve the real path in
+    // `finalize_export_target` once the produced file exists.
+    let target = if native {
+        target_dir.join(&stem)
+    } else {
+        unique_export_path(&target_dir, &stem, request.format.ext()).await?
+    };
     let video_ids = collect_export_video_ids(&request.video_id, &request.fallback_video_ids);
 
     // Register a cancellation sender for this request. The frontend
@@ -4343,11 +5666,12 @@ async fn save_track_to_mp3_inner(
         None
     };
     let work = async {
-        let produced = acquire_export_mp3(
+        let produced = acquire_export_audio(
             app,
             state,
             &video_ids,
             &target,
+            request.format,
             &mut cancel_rx_slot,
         )
         .await?;
@@ -4366,8 +5690,9 @@ async fn save_track_to_mp3_inner(
         let track_total = request.track_total;
         let (cover_bytes, ()) = tokio::join!(cover_future, async {});
 
-        tag_mp3(
+        tag_export(
             &produced,
+            request.format,
             &request.title,
             &request.artist,
             request.album.as_deref(),
@@ -4383,8 +5708,8 @@ async fn save_track_to_mp3_inner(
         )
         .await?;
 
-        move_to_target(&produced, &target).await?;
-        Ok(target.to_string_lossy().to_string())
+        let final_path = finalize_export_target(&produced, &target, &stem, native).await?;
+        Ok(final_path.to_string_lossy().to_string())
     };
 
     let result = work.await;
@@ -4528,6 +5853,7 @@ async fn save_album_to_mp3_inner(
         // sanitize for the FS) and its unique on-disk path. The
         // unique-file lookup also avoids the per-track command
         // clobbering itself if two tracks somehow share a name.
+        let native = request.format == ExportFormat::Native;
         let track_total: u32 = request.tracks.len() as u32;
         let mut file_paths: Vec<String> = Vec::with_capacity(track_total as usize);
         for (idx, track) in request.tracks.iter().enumerate() {
@@ -4535,14 +5861,21 @@ async fn save_album_to_mp3_inner(
                 .track_number
                 .unwrap_or_else(|| (idx + 1) as u32);
             let stem = sanitize_filename(&track.file_name);
-            let target = unique_mp3_path(&album_dir, &stem).await?;
+            // Native: reserve the bare stem (extension resolved after
+            // download), see `save_track_to_mp3_inner`.
+            let target = if native {
+                album_dir.join(&stem)
+            } else {
+                unique_export_path(&album_dir, &stem, request.format.ext()).await?
+            };
             let video_ids =
                 collect_export_video_ids(&track.video_id, &track.fallback_video_ids);
-            let produced = acquire_export_mp3(
+            let produced = acquire_export_audio(
                 app,
                 state,
                 &video_ids,
                 &target,
+                request.format,
                 &mut cancel_rx_slot,
             )
             .await?;
@@ -4550,8 +5883,9 @@ async fn save_album_to_mp3_inner(
             // the resulting folder round-trips through any standard
             // player.
             let album = Some(request.album_name.as_str());
-            tag_mp3(
+            tag_export(
                 &produced,
+                request.format,
                 &track.title,
                 &track.artist,
                 album,
@@ -4562,15 +5896,14 @@ async fn save_album_to_mp3_inner(
                 cover_bytes.clone(),
             )
             .await?;
-            move_to_target(&produced, &target).await?;
-            file_paths.push(target.to_string_lossy().to_string());
+            let final_target = finalize_export_target(&produced, &target, &stem, native).await?;
+            file_paths.push(final_target.to_string_lossy().to_string());
         }
         Ok(SaveAlbumResult {
             album_dir: album_dir.to_string_lossy().to_string(),
             file_paths,
         })
     };
-
     let result = work.await;
 
     if cancellable {
@@ -4610,10 +5943,12 @@ async fn save_album_to_mp3_inner(
 }
 
 /// Best-effort cleanup of an album export that the user cancelled.
-/// Removes every `.velocity-export-*.mp3` and every already-landed
-/// `*.mp3` in the album directory. Best-effort: errors are swallowed
-/// because the user has already cancelled and a "cleanup failed"
-/// error would override the cancellation acknowledgement.
+/// Removes every file the export could have left in the album directory:
+/// in-flight `.velocity-export-*.tmp.*` files AND any fully-landed
+/// track (whatever extension the chosen format uses). Best-effort:
+/// errors are swallowed because the user has already cancelled and a
+/// "cleanup failed" error would override the cancellation
+/// acknowledgement.
 async fn sweep_cancel_album_artifacts(album_dir: &Path) {
     let Ok(mut entries) = tokio::fs::read_dir(album_dir).await else {
         return;
@@ -4627,11 +5962,11 @@ async fn sweep_cancel_album_artifacts(album_dir: &Path) {
         let Some(name) = file_name.to_str() else {
             continue;
         };
-        // Both the in-flight temp file (`.velocity-export-...mp3`)
-        // and any fully-landed track (any other `.mp3`) get cleaned
-        // up. The user pulled the ripcord, so we don't leave any
-        // partial state behind.
-        if name.ends_with(".mp3") {
+        // The album directory is ours (freshly created via
+        // `unique_album_dir`), so removing every file is safe. The
+        // user pulled the ripcord, so we don't leave any partial
+        // state behind.
+        if name.starts_with(".velocity-export-") || entry.path().is_file() {
             let _ = tokio::fs::remove_file(entry.path()).await;
         }
     }
@@ -4716,6 +6051,7 @@ async fn save_playlist_to_mp3_inner(
         None
     };
     let work = async {
+        let native = request.format == ExportFormat::Native;
         let track_total: u32 = request.tracks.len() as u32;
         let mut file_paths: Vec<String> = Vec::with_capacity(track_total as usize);
         let mut skipped: u32 = 0;
@@ -4741,14 +6077,21 @@ async fn save_playlist_to_mp3_inner(
             };
             let track_number = track.track_number.unwrap_or_else(|| (idx + 1) as u32);
             let stem = sanitize_filename(&track.file_name);
-            let target = unique_mp3_path(&playlist_dir, &stem).await?;
+            // Native: reserve the bare stem (extension resolved after
+            // download), see `save_track_to_mp3_inner`.
+            let target = if native {
+                playlist_dir.join(&stem)
+            } else {
+                unique_export_path(&playlist_dir, &stem, request.format.ext()).await?
+            };
             let video_ids =
                 collect_export_video_ids(&track.video_id, &track.fallback_video_ids);
-            let produced = match acquire_export_mp3(
+            let produced = match acquire_export_audio(
                 app,
                 state,
                 &video_ids,
                 &target,
+                request.format,
                 &mut cancel_rx_slot,
             )
             .await
@@ -4770,8 +6113,9 @@ async fn save_playlist_to_mp3_inner(
             // album artist" would only ever be "Various Artists" and
             // that tag is more confusing than helpful when applied to
             // a single track from a real album.
-            tag_mp3(
+            tag_export(
                 &produced,
+                request.format,
                 &track.title,
                 &track.artist,
                 track.album.as_deref(),
@@ -4782,8 +6126,8 @@ async fn save_playlist_to_mp3_inner(
                 track_cover,
             )
             .await?;
-            move_to_target(&produced, &target).await?;
-            file_paths.push(target.to_string_lossy().to_string());
+            let final_target = finalize_export_target(&produced, &target, &stem, native).await?;
+            file_paths.push(final_target.to_string_lossy().to_string());
         }
         Ok(SavePlaylistResult {
             playlist_dir: playlist_dir.to_string_lossy().to_string(),
@@ -4838,6 +6182,42 @@ fn artwork_cache_dir(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(root.join("artwork"))
 }
 
+/// Largest edge (px) covers are stored at. Covers are rendered at <= 224px,
+/// so caching anything larger just burns renderer decode memory for no visible
+/// gain. Downscaling here also shrinks the on-disk cache.
+const MAX_CACHED_ARTWORK_DIMENSION: u32 = 512;
+
+/// Bump when the on-disk format changes so stale full-size entries are bypassed.
+const ARTWORK_CACHE_VERSION: u32 = 1;
+
+/// Downscale oversized artwork to [`MAX_CACHED_ARTWORK_DIMENSION`]. Returns
+/// `(Some(bytes), extension)` when the image was re-encoded, `(None, None)`
+/// when the source is already small enough (or is not a decodable raster).
+fn downscale_artwork(bytes: &[u8]) -> (Option<Vec<u8>>, Option<&'static str>) {
+    use image::imageops::FilterType;
+
+    let Ok(image) = image::load_from_memory(bytes) else {
+        return (None, None);
+    };
+    let (width, height) = (image.width(), image.height());
+    if width <= MAX_CACHED_ARTWORK_DIMENSION && height <= MAX_CACHED_ARTWORK_DIMENSION {
+        return (None, None);
+    }
+
+    let scaled = image.resize(
+        MAX_CACHED_ARTWORK_DIMENSION,
+        MAX_CACHED_ARTWORK_DIMENSION,
+        FilterType::Lanczos3,
+    );
+
+    let mut out = std::io::Cursor::new(Vec::new());
+    let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 88);
+    if scaled.write_with_encoder(encoder).is_err() {
+        return (None, None);
+    }
+    (Some(out.into_inner()), Some("jpg"))
+}
+
 async fn cache_remote_artwork(app: &AppHandle, url: &str) -> Result<String, String> {
     let parsed = reqwest::Url::parse(url).map_err(|_| "Invalid artwork URL.".to_string())?;
     if parsed.scheme() != "https" && parsed.scheme() != "http" {
@@ -4853,7 +6233,9 @@ async fn cache_remote_artwork(app: &AppHandle, url: &str) -> Result<String, Stri
         .map_err(|error| format!("Failed to create artwork cache folder: {error}"))?;
 
     for extension in ["jpg", "png", "webp"] {
-        let cached_path = cache_dir.join(format!("{cache_key:016x}.{extension}"));
+        let cached_path = cache_dir.join(format!(
+            "{cache_key:016x}-v{ARTWORK_CACHE_VERSION}-{MAX_CACHED_ARTWORK_DIMENSION}.{extension}"
+        ));
         if cached_path.exists() {
             return Ok(cached_path.to_string_lossy().to_string());
         }
@@ -4895,7 +6277,6 @@ async fn cache_remote_artwork(app: &AppHandle, url: &str) -> Result<String, Stri
         .get(CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .map(str::to_string);
-    let extension = artwork_extension(url, content_type.as_deref());
     let bytes = response
         .bytes()
         .await
@@ -4908,7 +6289,23 @@ async fn cache_remote_artwork(app: &AppHandle, url: &str) -> Result<String, Stri
         return Err("Artwork download was too large.".to_string());
     }
 
-    let cached_path = cache_dir.join(format!("{cache_key:016x}.{extension}"));
+    let (bytes, extension) = {
+        let url = url.to_string();
+        let content_type = content_type.clone();
+        tauri::async_runtime::spawn_blocking(move || {
+            let bytes = bytes.to_vec();
+            let (downscaled, downscaled_extension) = downscale_artwork(&bytes);
+            let extension =
+                downscaled_extension.unwrap_or_else(|| artwork_extension(&url, content_type.as_deref()));
+            (downscaled.unwrap_or(bytes), extension)
+        })
+        .await
+        .map_err(|error| format!("Failed to process artwork: {error}"))?
+    };
+
+    let cached_path = cache_dir.join(format!(
+        "{cache_key:016x}-v{ARTWORK_CACHE_VERSION}-{MAX_CACHED_ARTWORK_DIMENSION}.{extension}"
+    ));
     tokio::fs::write(&cached_path, &bytes)
         .await
         .map_err(|error| format!("Failed to cache artwork: {error}"))?;
@@ -5224,10 +6621,11 @@ async fn analyze_loudness_slice(
     ]);
     #[cfg(target_os = "windows")]
     command.creation_flags(CREATE_NO_WINDOW);
+    command.kill_on_drop(true);
 
-    let output = command.output().await.ok();
-    let Some(output) = output else {
-        return Ok(empty_loudness_data());
+    let output = match tokio::time::timeout(FFMPEG_ANALYSIS_TIMEOUT, command.output()).await {
+        Ok(Ok(output)) => output,
+        _ => return Ok(empty_loudness_data()),
     };
 
     if !output.status.success() {
@@ -5261,19 +6659,14 @@ async fn analyze_loudness_slice(
 async fn detect_leading_silence(app: AppHandle, file_path: String) -> Result<LeadingSilenceData, String> {
     // Bump LEADING_SILENCE_ANALYSIS_VERSION whenever detection parameters
     // change to invalidate stale cached results on the frontend.
-    const LEADING_SILENCE_ANALYSIS_VERSION: u8 = 3;
+    const LEADING_SILENCE_ANALYSIS_VERSION: u8 = 7;
     const ANALYSIS_MAX_SECONDS: f64 = 45.0;
-    // Reduced threshold: -50 dB is much less likely to classify quiet music,
-    // fade-ins, tape hiss, or low-level intros as digital silence.
-    const SILENCE_NOISE_DB: f64 = -50.0;
-    const SILENCE_MIN_DURATION: f64 = 0.75;
-    const MIN_SKIP_SECONDS: f64 = 1.0;
-    const MAX_SKIP_SECONDS: f64 = 30.0;
-    const LEADING_SILENCE_START_TOLERANCE: f64 = 0.05;
-    // Pre-roll in seconds: after detecting the end of leading silence, start
-    // playback SHORTLY BEFORE that point so quiet attacks and fade-ins are
-    // fully audible instead of being cut off by the silence detector.
-    const SILENCE_END_PREROLL: f64 = 0.15;
+    const SILENCE_NOISE_DB: f64 = -42.0;
+    const SILENCE_MIN_DURATION: f64 = 0.3;
+    const MIN_SKIP_SECONDS: f64 = 0.35;
+    const MAX_SKIP_SECONDS: f64 = 8.0;
+    const LEADING_SILENCE_START_TOLERANCE: f64 = 0.25;
+    const SILENCE_END_PREROLL: f64 = 0.08;
 
     fn empty_leading_silence_data() -> LeadingSilenceData {
         LeadingSilenceData {
@@ -5323,10 +6716,11 @@ async fn detect_leading_silence(app: AppHandle, file_path: String) -> Result<Lea
     ]);
     #[cfg(target_os = "windows")]
     command.creation_flags(CREATE_NO_WINDOW);
+    command.kill_on_drop(true);
 
-    let output = match command.output().await {
-        Ok(output) => output,
-        Err(_) => return Ok(empty_leading_silence_data()),
+    let output = match tokio::time::timeout(FFMPEG_ANALYSIS_TIMEOUT, command.output()).await {
+        Ok(Ok(output)) => output,
+        _ => return Ok(empty_leading_silence_data()),
     };
 
     if !output.status.success() {
@@ -5344,7 +6738,11 @@ async fn detect_leading_silence(app: AppHandle, file_path: String) -> Result<Lea
         }
         if line.contains("silence_end:") {
             let silence_end = parse_silence_value(line, "silence_end");
-            if let (Some(start), Some(end)) = (current_silence_start, silence_end) {
+            let silence_dur = parse_silence_value(line, "silence_duration");
+            if let Some(end) = silence_end {
+                let start = current_silence_start
+                    .or_else(|| silence_dur.map(|dur| (end - dur).max(0.0)))
+                    .unwrap_or(0.0);
                 if start <= LEADING_SILENCE_START_TOLERANCE {
                     leading_skip = Some(end);
                     break;
@@ -5355,8 +6753,6 @@ async fn detect_leading_silence(app: AppHandle, file_path: String) -> Result<Lea
     }
 
     let skip_seconds = leading_skip.and_then(|seconds| {
-        // Apply a short pre-roll before the silence_end so quiet attacks and
-        // fade-ins are audible rather than being cut off.
         let with_preroll = (seconds - SILENCE_END_PREROLL).max(0.0);
         if with_preroll < MIN_SKIP_SECONDS {
             None
@@ -5389,13 +6785,54 @@ async fn backend_status(app: &AppHandle) -> Result<BackendStatus, String> {
     })
 }
 
+/// Floor size for a downloaded helper binary (yt-dlp ~18MB, deno ~97MB).
+/// `path.exists()` alone is not enough: a truncated download (interrupted
+/// fetch, disk full, AV interference) leaves a non-empty file that then
+/// makes EVERY invocation fail forever — the "yt-dlp critically failing
+/// entirely" failure mode. Anything below this floor is treated as corrupt
+/// and re-fetched.
+const MIN_BOOTSTRAP_BINARY_BYTES: u64 = 1024 * 1024;
+
+/// Set once per process after the cached yt-dlp binary has been verified to
+/// actually run (`--version` probe), so a corrupt-but-large binary is caught
+/// at first use instead of silently failing every download.
+static YT_DLP_VERIFIED: AtomicBool = AtomicBool::new(false);
+
+async fn binary_file_usable(path: &Path) -> bool {
+    let Ok(metadata) = tokio::fs::metadata(path).await else {
+        return false;
+    };
+    metadata.is_file() && metadata.len() > MIN_BOOTSTRAP_BINARY_BYTES
+}
+
 async fn ensure_yt_dlp(app: &AppHandle) -> Result<PathBuf, String> {
     let path = yt_dlp_path(app)?;
-    if path.exists() {
-        #[cfg(unix)]
-        prepare_downloaded_binary(&path).await?;
-        return Ok(path);
+    if binary_file_usable(&path).await {
+        if !YT_DLP_VERIFIED.load(Ordering::Relaxed) {
+            let runs = match run_command_with_timeout(
+                &path,
+                ["--version"],
+                Duration::from_secs(15),
+            )
+            .await
+            {
+                Ok(version) => !version.trim().is_empty(),
+                Err(_) => false,
+            };
+            YT_DLP_VERIFIED.store(true, Ordering::Relaxed);
+            if runs {
+                return Ok(path);
+            }
+            // Binary exists and looks the right size but won't execute —
+            // treat it as corrupt and fall through to a fresh download.
+            let _ = tokio::fs::remove_file(&path).await;
+        } else {
+            return Ok(path);
+        }
     }
+    // Corrupt cached binary — drop it so the fresh download replaces it
+    // instead of failing every call with an opaque error.
+    let _ = tokio::fs::remove_file(&path).await;
 
     let parent = path
         .parent()
@@ -5404,7 +6841,7 @@ async fn ensure_yt_dlp(app: &AppHandle) -> Result<PathBuf, String> {
         .await
         .map_err(|error| error.to_string())?;
 
-    let response = HTTP
+    let response = DOWNLOAD
         .get(yt_dlp_download_url())
         .send()
         .await
@@ -5472,7 +6909,9 @@ fn deno_executable_name() -> &'static str {
 fn deno_download_url() -> &'static str {
     #[cfg(target_os = "windows")]
     { DENO_WIN_URL }
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    { DENO_MACOS_ARM64_URL }
+    #[cfg(all(target_os = "macos", not(target_arch = "aarch64")))]
     { DENO_MACOS_URL }
     #[cfg(target_os = "linux")]
     { DENO_LINUX_URL }
@@ -5482,13 +6921,62 @@ fn deno_path(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(app_bin_dir(app)?.join(deno_executable_name()))
 }
 
+/// Returns `true` when the cached binary at `path` matches the host
+/// architecture (or when we can't tell). On Apple Silicon this guards
+/// against a stale Intel `deno` that predates the arm64 download URL:
+/// `ensure_deno` skips the download whenever the file exists, so an
+/// Intel binary cached before `DENO_MACOS_ARM64_URL` was introduced
+/// would keep running under Rosetta 2 forever. Reading the Mach-O
+/// cputype lets us re-fetch the native build instead of trusting
+/// `path.exists()`.
+#[cfg(not(target_os = "macos"))]
+fn binary_arch_matches_expected(_path: &Path) -> bool {
+    true
+}
+
+#[cfg(target_os = "macos")]
+fn binary_arch_matches_expected(path: &Path) -> bool {
+    use std::io::Read;
+
+    let Ok(mut file) = std::fs::File::open(path) else {
+        // Unreadable — let the "exists" branch decide.
+        return true;
+    };
+    let mut header = [0u8; 8];
+    if file.read_exact(&mut header).is_err() {
+        return true;
+    }
+    // Mach-O 64-bit little-endian magic (0xfeedfacf).
+    if header[0..4] != [0xcf, 0xfa, 0xed, 0xfe] {
+        // FAT/universal binary or unknown format — don't force a
+        // re-download over an arch we can't verify.
+        return true;
+    }
+    // The next 4 bytes are `cputype` (little-endian):
+    //   CPU_TYPE_ARM64  = 0x0100000c
+    //   CPU_TYPE_X86_64 = 0x01000007
+    #[cfg(target_arch = "aarch64")]
+    {
+        header[4..8] == [0x0c, 0x00, 0x00, 0x01]
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        header[4..8] == [0x07, 0x00, 0x00, 0x01]
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    {
+        true
+    }
+}
+
 async fn ensure_deno(app: &AppHandle) -> Result<PathBuf, String> {
     let path = deno_path(app)?;
-    if path.exists() {
-        #[cfg(unix)]
-        prepare_downloaded_binary(&path).await?;
+    if binary_file_usable(&path).await && binary_arch_matches_expected(&path) {
         return Ok(path);
     }
+    // Corrupt cached binary — drop it so the fresh download replaces it
+    // instead of failing every yt-dlp invocation that needs a JS runtime.
+    let _ = tokio::fs::remove_file(&path).await;
 
     let parent = path
         .parent()
@@ -5497,7 +6985,7 @@ async fn ensure_deno(app: &AppHandle) -> Result<PathBuf, String> {
         .await
         .map_err(|error| error.to_string())?;
 
-    let response = HTTP
+    let response = DOWNLOAD
         .get(deno_download_url())
         .send()
         .await
@@ -5577,10 +7065,38 @@ fn ffprobe_executable_name() -> &'static str {
     }
 }
 
+/// Asset name for `tool` ("ffmpeg" or "ffprobe") on the current platform.
+/// eugeneware/ffmpeg-static names binaries `<tool>-<platform>-<arch>.gz`.
+fn ffmpeg_static_asset(tool: &str) -> String {
+    let platform = if cfg!(target_os = "windows") {
+        "win32"
+    } else if cfg!(target_os = "macos") {
+        "darwin"
+    } else {
+        "linux"
+    };
+    let arch = if cfg!(target_arch = "aarch64") {
+        "arm64"
+    } else if cfg!(target_arch = "x86_64") {
+        "x64"
+    } else if cfg!(target_arch = "arm") {
+        "arm"
+    } else {
+        "x64"
+    };
+    format!("{}/{}-{}-{}.gz", FFMPEG_STATIC_BASE, tool, platform, arch)
+}
+
 async fn ffmpeg_bundle_ready(bin_dir: &Path) -> bool {
     let ffmpeg = bin_dir.join(ffmpeg_executable_name());
     let ffprobe = bin_dir.join(ffprobe_executable_name());
-    cached_audio_file_valid(&ffmpeg).await && cached_audio_file_valid(&ffprobe).await
+    if !(binary_file_usable(&ffmpeg).await && binary_file_usable(&ffprobe).await) {
+        return false;
+    }
+    // Reject a cached binary of the wrong architecture (e.g. an Intel ffmpeg
+    // left over from the old evermeet.cx download on an Apple Silicon Mac),
+    // so `resolve_ffmpeg` falls through to re-download the native build.
+    binary_arch_matches_expected(&ffmpeg) && binary_arch_matches_expected(&ffprobe)
 }
 
 async fn ffmpeg_on_path() -> Option<PathBuf> {
@@ -5596,13 +7112,34 @@ async fn ffmpeg_on_path() -> Option<PathBuf> {
     Some(PathBuf::from(name))
 }
 
+/// reqwest client for one-time binary downloads (yt-dlp/deno/ffmpeg/ffprobe).
+/// The shared 15s `HTTP` client is tuned for API calls; a ~40 MB static
+/// ffmpeg build needs a much longer budget on a slow link.
+static DOWNLOAD: Lazy<reqwest::Client> = Lazy::new(|| {
+    reqwest::Client::builder()
+        .user_agent(USER_AGENT)
+        .timeout(Duration::from_secs(180))
+        .build()
+        .expect("download client")
+});
+
 async fn download_bytes_quiet(url: &str) -> Option<Vec<u8>> {
-    let response = HTTP.get(url).send().await.ok()?;
+    let response = DOWNLOAD.get(url).send().await.ok()?;
     if !response.status().is_success() {
         return None;
     }
     let bytes = response.bytes().await.ok()?;
     Some(bytes.to_vec())
+}
+
+/// Decompress a gzip stream (the ffmpeg-static assets are single-file `.gz`).
+fn gunzip_bytes(bytes: &[u8]) -> Option<Vec<u8>> {
+    use std::io::Read;
+
+    let mut decoder = flate2::read::GzDecoder::new(bytes);
+    let mut out = Vec::new();
+    decoder.read_to_end(&mut out).ok()?;
+    Some(out)
 }
 
 fn extract_binary_from_zip(bytes: &[u8], out_path: &Path, binary_name: &str) -> Result<(), String> {
@@ -5636,39 +7173,23 @@ fn extract_binary_from_zip(bytes: &[u8], out_path: &Path, binary_name: &str) -> 
     Err(format!("ffmpeg archive did not contain {binary_name}."))
 }
 
-fn extract_ffmpeg_zip(bytes: &[u8], bin_dir: &Path) -> Result<(), String> {
-    for name in [ffmpeg_executable_name(), ffprobe_executable_name()] {
-        extract_binary_from_zip(bytes, &bin_dir.join(name), name)?;
-    }
-    Ok(())
-}
-
-#[cfg(target_os = "windows")]
-async fn download_bundled_ffmpeg(app: &AppHandle) -> Option<PathBuf> {
-    let bin_dir = app_bin_dir(app).ok()?;
-    tokio::fs::create_dir_all(&bin_dir).await.ok()?;
-    let bytes = download_bytes_quiet(FFMPEG_WIN_ZIP_URL).await?;
-    extract_ffmpeg_zip(&bytes, &bin_dir).ok()?;
-    if ffmpeg_bundle_ready(&bin_dir).await {
-        Some(bin_dir.join(ffmpeg_executable_name()))
-    } else {
-        None
-    }
-}
-
-#[cfg(target_os = "macos")]
-async fn download_macos_ffmpeg_bundle(app: &AppHandle) -> Option<PathBuf> {
+async fn download_ffmpeg_bundle(app: &AppHandle) -> Option<PathBuf> {
     let bin_dir = app_bin_dir(app).ok()?;
     tokio::fs::create_dir_all(&bin_dir).await.ok()?;
 
     let pairs = [
-        (FFMPEG_MACOS_URL, ffmpeg_executable_name()),
-        (FFPROBE_MACOS_URL, ffprobe_executable_name()),
+        (ffmpeg_static_asset("ffmpeg"), ffmpeg_executable_name()),
+        (ffmpeg_static_asset("ffprobe"), ffprobe_executable_name()),
     ];
     for (url, name) in pairs {
-        let bytes = download_bytes_quiet(url).await?;
+        let bytes = download_bytes_quiet(&url).await?;
+        let Some(decoded) = gunzip_bytes(&bytes) else {
+            return None;
+        };
         let out_path = bin_dir.join(name);
-        extract_binary_from_zip(&bytes, &out_path, name).ok()?;
+        if tokio::fs::write(&out_path, &decoded).await.is_err() {
+            return None;
+        }
         prepare_downloaded_binary(&out_path).await.ok()?;
     }
 
@@ -5680,7 +7201,8 @@ async fn download_macos_ffmpeg_bundle(app: &AppHandle) -> Option<PathBuf> {
 }
 
 /// Resolve ffmpeg for export/analysis. Uses a bundled copy when present,
-/// then PATH, then a one-shot platform download. Any failure is silent.
+/// then PATH, then a one-shot cross-platform download (ffmpeg-static). Any
+/// failure is silent.
 pub(crate) async fn resolve_ffmpeg(app: &AppHandle) -> Option<PathBuf> {
     let bin_dir = app_bin_dir(app).ok()?;
     if ffmpeg_bundle_ready(&bin_dir).await {
@@ -5690,16 +7212,18 @@ pub(crate) async fn resolve_ffmpeg(app: &AppHandle) -> Option<PathBuf> {
         return Some(path);
     }
 
-    #[cfg(target_os = "windows")]
-    {
-        return download_bundled_ffmpeg(app).await;
-    }
-    #[cfg(target_os = "macos")]
-    {
-        return download_macos_ffmpeg_bundle(app).await;
-    }
-    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-    {
+    download_ffmpeg_bundle(app).await
+}
+
+/// Resolve ffprobe for audio probing. ffprobe is always bundled/downloaded
+/// alongside ffmpeg, so we piggyback on `resolve_ffmpeg` and take the
+/// sibling binary in the same directory.
+pub(crate) async fn resolve_ffprobe(app: &AppHandle) -> Option<PathBuf> {
+    let ffmpeg = resolve_ffmpeg(app).await?;
+    let sibling = ffmpeg.parent()?.join(ffprobe_executable_name());
+    if binary_file_usable(&sibling).await {
+        Some(sibling)
+    } else {
         None
     }
 }
@@ -5773,7 +7297,19 @@ where
     I: IntoIterator<Item = &'a str>,
 {
     let mut command = Command::new(program);
-    command.args(args).kill_on_drop(true);
+    command
+        .args(args)
+        .kill_on_drop(true)
+        // CRITICAL: pipe the child's stdio explicitly. `wait_with_output`
+        // only captures output that was piped at spawn time — with
+        // inherited handles (the default) it returns empty stdout/stderr,
+        // which made every yt-dlp run look like a silent failure (exit 0
+        // "no file" or exit 1 "empty stderr") while the real output went
+        // to an invisible console. Stdin is nulled so a child can never
+        // block waiting for input the GUI app will never send.
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
     #[cfg(target_os = "windows")]
     command.creation_flags(CREATE_NO_WINDOW);
 
@@ -5982,189 +7518,6 @@ fn extract_metadata_from_bytes(bytes: &[u8], name: &str) -> ExtractedAudioMetada
     }
 }
 
-async fn post_ytmusic(
-    state: &State<'_, AppState>,
-    endpoint: &str,
-    payload: Value,
-) -> Result<Value, String> {
-    let config = get_client_config(state).await?;
-    post_ytmusic_with_client(
-        state,
-        endpoint,
-        payload,
-        "WEB_REMIX",
-        &config.client_version,
-        None,
-    )
-    .await
-}
-
-async fn post_ytmusic_continuation(
-    state: &State<'_, AppState>,
-    token: &str,
-) -> Result<Value, String> {
-    let config = get_client_config(state).await?;
-    let encoded = urlencoding::encode(token);
-    let query_suffix = format!("&ctoken={encoded}&continuation={encoded}");
-    let with_query = post_ytmusic_with_client(
-        state,
-        "browse",
-        json!({ "continuation": token }),
-        "WEB_REMIX",
-        &config.client_version,
-        Some(query_suffix.as_str()),
-    )
-    .await?;
-    if parse_shelf_continuation_items(&with_query).is_some() {
-        return Ok(with_query);
-    }
-
-    post_ytmusic_with_client(
-        state,
-        "browse",
-        json!({ "continuation": token }),
-        "WEB_REMIX",
-        &config.client_version,
-        None,
-    )
-    .await
-}
-
-async fn post_ytmusic_with_client(
-    state: &State<'_, AppState>,
-    endpoint: &str,
-    payload: Value,
-    client_name: &str,
-    client_version: &str,
-    query_suffix: Option<&str>,
-) -> Result<Value, String> {
-    let config = get_client_config(state).await?;
-    let mut headers = HeaderMap::new();
-    headers.insert(ACCEPT_LANGUAGE, HeaderValue::from_static("en-US,en;q=0.9"));
-    headers.insert(
-        ORIGIN,
-        HeaderValue::from_static("https://music.youtube.com"),
-    );
-    headers.insert(
-        REFERER,
-        HeaderValue::from_static("https://music.youtube.com/"),
-    );
-    headers.insert(
-        "x-goog-visitor-id",
-        HeaderValue::from_str(&config.visitor_data).map_err(|error| error.to_string())?,
-    );
-
-    let mut body = match payload {
-        Value::Object(map) => map,
-        _ => return Err("Invalid request payload.".to_string()),
-    };
-    let mut client = json!({
-        "clientName": client_name,
-        "clientVersion": client_version,
-        "hl": "en",
-        "gl": "US"
-    });
-    if client_name != "ANDROID_MUSIC" {
-        client["platform"] = json!("DESKTOP");
-        client["clientFormFactor"] = json!("UNKNOWN_FORM_FACTOR");
-    }
-    client["visitorData"] = json!(config.visitor_data);
-    body.insert(
-        "context".to_string(),
-        json!({
-            "client": client,
-            "capabilities": {},
-            "request": {
-                "useSsl": true
-            },
-            "user": {
-                "lockedSafetyMode": false
-            }
-        }),
-    );
-
-    let url = format!(
-        "https://music.youtube.com/youtubei/v1/{endpoint}?key={}{}",
-        config.api_key,
-        query_suffix.unwrap_or_default()
-    );
-
-    let response = HTTP
-        .post(url)
-        .headers(headers)
-        .json(&Value::Object(body))
-        .send()
-        .await
-        .map_err(|error| format!("YouTube Music request failed: {error}"))?;
-
-    if !response.status().is_success() {
-        return Err(format!("YouTube Music returned HTTP {}", response.status()));
-    }
-
-    response
-        .json::<Value>()
-        .await
-        .map_err(|error| format!("Failed to decode YouTube Music response: {error}"))
-}
-
-async fn get_client_config(state: &State<'_, AppState>) -> Result<InnerTubeConfig, String> {
-    {
-        let cache = state.client_config.lock().await;
-        if let Some(config) = cache.as_ref() {
-            if config.fetched_at.elapsed() < CLIENT_CACHE_TTL {
-                return Ok(InnerTubeConfig {
-                    api_key: config.api_key.clone(),
-                    client_version: config.client_version.clone(),
-                    visitor_data: config.visitor_data.clone(),
-                    fetched_at: config.fetched_at,
-                });
-            }
-        }
-    }
-
-    let html = HTTP
-        .get("https://music.youtube.com/")
-        .send()
-        .await
-        .map_err(|error| format!("Failed to load YouTube Music shell: {error}"))?
-        .text()
-        .await
-        .map_err(|error| format!("Failed to read YouTube Music shell: {error}"))?;
-
-    let api_key = API_KEY_RE
-        .captures(&html)
-        .and_then(|caps| caps.get(1))
-        .map(|value| value.as_str().to_string())
-        .ok_or_else(|| "Could not find the YouTube Music API key.".to_string())?;
-    let client_version = CLIENT_VERSION_RE
-        .captures(&html)
-        .and_then(|caps| caps.get(1))
-        .map(|value| value.as_str().to_string())
-        .ok_or_else(|| "Could not find the YouTube Music client version.".to_string())?;
-    let visitor_data = VISITOR_DATA_RE
-        .captures(&html)
-        .and_then(|caps| caps.get(1))
-        .map(|value| value.as_str().to_string())
-        .ok_or_else(|| "Could not find the YouTube Music visitor data.".to_string())?;
-
-    let config = InnerTubeConfig {
-        api_key,
-        client_version,
-        visitor_data,
-        fetched_at: Instant::now(),
-    };
-
-    let mut cache = state.client_config.lock().await;
-    *cache = Some(InnerTubeConfig {
-        api_key: config.api_key.clone(),
-        client_version: config.client_version.clone(),
-        visitor_data: config.visitor_data.clone(),
-        fetched_at: config.fetched_at,
-    });
-
-    Ok(config)
-}
-
 fn parse_search_suggestions(value: &Value) -> Vec<SearchSuggestion> {
     let raw_suggestions = value
         .get("contents")
@@ -6271,10 +7624,12 @@ fn parse_search_response(query: &str, value: &Value) -> SearchResponse {
 
     let mut results = Vec::new();
     for item in &contents {
-        if let Some(card) = item.get("musicCardShelfRenderer") {
-            if let Some(shelf_contents) = card.get("contents").and_then(Value::as_array) {
-                collect_search_rows_from_entries(shelf_contents, &mut results, &mut seen);
-            }
+        if item.get("musicCardShelfRenderer").is_some() {
+            // The top-result card's own row is captured separately by
+            // `parse_top_result`. Its `contents` list is entirely "More from
+            // YouTube" related videos (fan uploads, live recordings, music-video
+            // re-uploads) — none of which are YT Music "Song" rows, so none of
+            // them belong in the search results.
             continue;
         }
 
@@ -6322,7 +7677,7 @@ fn parse_search_response(query: &str, value: &Value) -> SearchResponse {
 }
 
 fn should_include_search_item(item: &SearchItem) -> bool {
-    item.kind != "playlist" && item.kind != "video"
+    item.kind != "playlist" && item.kind != "unknown"
 }
 
 #[tauri::command]
@@ -6386,7 +7741,21 @@ fn parse_top_result(value: &Value) -> Option<SearchItem> {
         parsed_runs.type_label.as_deref(),
         meta.first().map(String::as_str),
     );
-    let kind = normalize_kind(kind_label, browse_id.is_some(), video_id.is_some());
+    if kind_label.is_some_and(|label| is_excluded_type_label(label)) {
+        return None;
+    }
+    let mut kind = normalize_kind(kind_label, browse_id.is_some(), video_id.is_some());
+    if kind == "unknown" {
+        return None;
+    }
+    if kind == "song" && video_id.is_some() && is_explicit_music_video_title(&title) {
+        kind = "video".to_string();
+    }
+    if kind == "song" && video_id.is_some() && text_indicates_video(&subtitle) {
+        // YT Music songs show a "plays" count; a row carrying a "views" count
+        // is a music video even when it has no "Video" type label.
+        kind = "video".to_string();
+    }
 
     let has_type_label = kind_label
         .map(|value| is_type_label(&value.to_ascii_lowercase()))
@@ -6509,9 +7878,17 @@ fn parse_search_row(value: &Value) -> Option<SearchItem> {
     if kind_label.is_some_and(|label| is_excluded_type_label(label)) {
         return None;
     }
-    let kind = normalize_kind(kind_label, browse_id.is_some(), video_id.is_some());
+    let mut kind = normalize_kind(kind_label, browse_id.is_some(), video_id.is_some());
     if kind == "unknown" {
         return None;
+    }
+    if kind == "song" && video_id.is_some() && is_explicit_music_video_title(&title) {
+        kind = "video".to_string();
+    }
+    if kind == "song" && video_id.is_some() && text_indicates_video(&subtitle) {
+        // YT Music songs show a "plays" count; a row carrying a "views" count
+        // is a music video even when it has no "Video" type label.
+        kind = "video".to_string();
     }
 
     let duration_seconds = row
@@ -6825,33 +8202,6 @@ fn shelf_continuation_token(shelf: &Value) -> Option<String> {
         .or_else(|| find_continuation_token(shelf))
 }
 
-fn parse_shelf_continuation_items(response: &Value) -> Option<Vec<Value>> {
-    if let Some(actions) = response.get("onResponseReceivedActions").and_then(Value::as_array) {
-        for action in actions {
-            if let Some(items) = action
-                .get("appendContinuationItemsAction")
-                .and_then(|value| value.get("continuationItems"))
-                .and_then(Value::as_array)
-            {
-                if !items.is_empty() {
-                    return Some(items.to_vec());
-                }
-            }
-        }
-    }
-
-    response
-        .get("continuationContents")
-        .and_then(|contents| {
-            contents
-                .get("musicShelfContinuation")
-                .or(contents.get("musicPlaylistShelfContinuation"))
-        })
-        .and_then(|shelf| shelf.get("contents").or_else(|| shelf.get("items")))
-        .and_then(Value::as_array)
-        .map(|items| items.to_vec())
-}
-
 fn continuation_token_from_continuation_response(response: &Value) -> Option<String> {
     if let Some(items) = response
         .get("onResponseReceivedActions")
@@ -7075,7 +8425,7 @@ async fn fetch_playlist_shelf_tracks_with_continuations(
             break;
         }
 
-        let cont_response = post_ytmusic_continuation(state, &token).await?;
+        let cont_response = post_ytmusic_continuation(&state.client_config, &token).await?;
         let Some(items) = parse_shelf_continuation_items(&cont_response) else {
             break;
         };
@@ -7142,7 +8492,7 @@ async fn fetch_shelf_tracks_with_continuations(
             break;
         }
 
-        let cont_response = post_ytmusic_continuation(state, &token).await?;
+        let cont_response = post_ytmusic_continuation(&state.client_config, &token).await?;
         let Some(items) = parse_shelf_continuation_items(&cont_response) else {
             break;
         };
@@ -7764,152 +9114,6 @@ fn normalize_menu_text(value: &str) -> String {
         .to_ascii_lowercase()
 }
 
-fn text_from_value(value: &Value) -> Option<String> {
-    if let Some(text) = value.as_str() {
-        return Some(text.to_string());
-    }
-    if let Some(text) = value.get("simpleText").and_then(Value::as_str) {
-        return Some(text.to_string());
-    }
-    if let Some(content) = value.get("content").and_then(Value::as_str) {
-        return Some(content.to_string());
-    }
-    if let Some(text) = value.get("text") {
-        return text_from_value(text);
-    }
-    if let Some(runs) = value.get("runs").and_then(Value::as_array) {
-        let joined = runs
-            .iter()
-            .filter_map(|run| run.get("text").and_then(Value::as_str))
-            .collect::<String>();
-        if !joined.is_empty() {
-            return Some(joined);
-        }
-    }
-    None
-}
-
-#[allow(dead_code)]
-fn split_bullets(value: &str) -> Vec<String> {
-    value
-        .split('•')
-        .map(str::trim)
-        .filter(|item| !item.is_empty())
-        .map(str::to_string)
-        .collect()
-}
-
-fn is_excluded_type_label(label: &str) -> bool {
-    matches!(
-        label.trim().to_ascii_lowercase().as_str(),
-        "episode" | "podcast" | "mix"
-    )
-}
-
-fn normalize_kind(label: Option<&str>, has_browse: bool, has_video: bool) -> String {
-    match label.map(|value| value.to_lowercase()) {
-        Some(label) if is_excluded_type_label(&label) => "unknown".to_string(),
-        Some(label) if label == "artist" => "artist".to_string(),
-        Some(label) if label == "album" || label == "single" || label == "ep" => {
-            "album".to_string()
-        }
-        Some(label) if label == "playlist" || label == "podcast" || label == "episode" => {
-            "playlist".to_string()
-        }
-        Some(label) if label == "video" => "video".to_string(),
-        Some(label) if label == "song" => "song".to_string(),
-        _ if has_video => "song".to_string(),
-        _ if has_browse => "playlist".to_string(),
-        _ => "unknown".to_string(),
-    }
-}
-
-fn normalize_bullet_text(value: &str) -> String {
-    value
-        .replace("â€¢", "\u{2022}")
-        .replace("Ã¢â‚¬Â¢", "\u{2022}")
-        .replace("ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¢", "\u{2022}")
-}
-
-fn split_bullets_fixed(value: &str) -> Vec<String> {
-    value
-        .replace("â€¢", "\u{2022}")
-        .replace("Ã¢â‚¬Â¢", "\u{2022}")
-        .split('\u{2022}')
-        .map(str::trim)
-        .filter(|item| !item.is_empty())
-        .map(str::to_string)
-        .collect()
-}
-
-fn is_type_label(value: &str) -> bool {
-    matches!(
-        value,
-        "song"
-            | "artist"
-            | "album"
-            | "single"
-            | "ep"
-            | "playlist"
-            | "podcast"
-            | "episode"
-            | "mix"
-            | "video"
-    )
-}
-
-fn looks_like_non_artist_meta(value: &str) -> bool {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        return true;
-    }
-
-    let lower = trimmed.to_ascii_lowercase();
-    if is_type_label(&lower) || lower == "explicit" {
-        return true;
-    }
-
-    if parse_duration(trimmed).is_some() {
-        return true;
-    }
-
-    if trimmed.len() == 4 && trimmed.chars().all(|ch| ch.is_ascii_digit()) {
-        return true;
-    }
-
-    if lower.contains("monthly listener") {
-        return true;
-    }
-
-    let has_digits = trimmed.chars().any(|ch| ch.is_ascii_digit());
-    has_digits
-        && lower
-            .split(|ch: char| !ch.is_ascii_alphanumeric())
-            .any(|token| {
-                matches!(
-                    token,
-                    "play"
-                        | "plays"
-                        | "view"
-                        | "views"
-                        | "stream"
-                        | "streams"
-                        | "listener"
-                        | "listeners"
-                        | "subscriber"
-                        | "subscribers"
-                )
-            })
-}
-
-fn fallback_artist_from_meta(meta_parts: &[String], has_type_label: bool) -> Option<String> {
-    meta_parts
-        .iter()
-        .skip(usize::from(has_type_label))
-        .find(|part| !looks_like_non_artist_meta(part))
-        .cloned()
-}
-
 fn artist_line_from_credits(credits: &[ArtistCredit]) -> Option<String> {
     let names: Vec<String> = credits
         .iter()
@@ -7954,367 +9158,6 @@ fn resolve_track_artist(
 fn infer_artist_from_text(value: &str, has_type_label: bool) -> Option<String> {
     let parts = split_bullets_fixed(value);
     fallback_artist_from_meta(&parts, has_type_label)
-}
-
-fn fixed_column_texts(row: &Value) -> Vec<String> {
-    row.get("fixedColumns")
-        .and_then(Value::as_array)
-        .map(|columns| {
-            columns
-                .iter()
-                .filter_map(|column| {
-                    column
-                        .get("musicResponsiveListItemFixedColumnRenderer")
-                        .and_then(|value| value.get("text"))
-                        .and_then(text_from_value)
-                })
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-fn flex_column_texts(row: &Value) -> Vec<String> {
-    row.get("flexColumns")
-        .and_then(Value::as_array)
-        .map(|columns| {
-            columns
-                .iter()
-                .filter_map(|column| {
-                    column
-                        .get("musicResponsiveListItemFlexColumnRenderer")
-                        .and_then(|value| value.get("text"))
-                        .and_then(text_from_value)
-                })
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-fn parse_duration_from_text(value: &str) -> Option<u32> {
-    parse_duration(value).or_else(|| {
-        split_bullets_fixed(value)
-            .into_iter()
-            .rev()
-            .find_map(|part| parse_duration(&part))
-    })
-}
-
-fn extract_duration_from_row(row: &Value) -> Option<u32> {
-    fixed_column_texts(row)
-        .iter()
-        .rev()
-        .find_map(|value| parse_duration_from_text(value))
-        .or_else(|| {
-            row.get("lengthText")
-                .or_else(|| row.get("durationText"))
-                .and_then(text_from_value)
-                .and_then(|value| parse_duration_from_text(&value))
-        })
-        .or_else(|| {
-            flex_column_texts(row)
-                .iter()
-                .skip(1)
-                .rev()
-                .find_map(|value| parse_duration_from_text(value))
-        })
-}
-
-fn strip_count_word(value: &str) -> String {
-    let mut current = value.trim().to_string();
-    loop {
-        let lower = current.to_ascii_lowercase();
-        let Some(word) = [
-            "plays",
-            "play",
-            "views",
-            "view",
-            "streams",
-            "stream",
-            "listeners",
-            "listener",
-        ]
-        .iter()
-        .find(|word| lower.ends_with(**word)) else {
-            break;
-        };
-
-        let next = current[..current.len() - word.len()]
-            .trim_end_matches(|ch: char| ch.is_whitespace() || ch == '-' || ch == ':')
-            .trim()
-            .to_string();
-        if next == current {
-            break;
-        }
-        current = next;
-    }
-    current
-}
-
-fn parse_play_count_candidate(value: &str) -> Option<String> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() || parse_duration(trimmed).is_some() {
-        return None;
-    }
-
-    let lower = trimmed.to_ascii_lowercase();
-    let has_count_word = [
-        "play",
-        "plays",
-        "view",
-        "views",
-        "stream",
-        "streams",
-        "listener",
-        "listeners",
-    ]
-    .iter()
-    .any(|word| lower.contains(word));
-    let stripped = strip_count_word(trimmed);
-    let compact = stripped
-        .chars()
-        .filter(|ch| !ch.is_whitespace() && *ch != ',')
-        .collect::<String>();
-    let has_digit = compact.chars().any(|ch| ch.is_ascii_digit());
-    if !has_digit {
-        return None;
-    }
-
-    let looks_plain_number = compact.len() >= 5 && compact.chars().all(|ch| ch.is_ascii_digit());
-    let looks_comma_number =
-        stripped.contains(',') && compact.chars().all(|ch| ch.is_ascii_digit());
-    let looks_abbreviated = compact
-        .chars()
-        .last()
-        .is_some_and(|ch| matches!(ch.to_ascii_uppercase(), 'K' | 'M' | 'B'))
-        && compact[..compact.len().saturating_sub(1)]
-            .chars()
-            .all(|ch| ch.is_ascii_digit() || ch == '.');
-
-    if has_count_word || looks_comma_number || looks_plain_number || looks_abbreviated {
-        Some(stripped)
-    } else {
-        None
-    }
-}
-
-fn extract_play_count_from_text(value: &str) -> Option<String> {
-    split_bullets_fixed(value)
-        .into_iter()
-        .find_map(|part| parse_play_count_candidate(&part))
-        .or_else(|| parse_play_count_candidate(value))
-}
-
-fn extract_play_count_from_row(row: &Value) -> Option<String> {
-    row.get("playCountText")
-        .or_else(|| row.get("viewCountText"))
-        .and_then(text_from_value)
-        .and_then(|value| extract_play_count_from_text(&value))
-        .or_else(|| {
-            fixed_column_texts(row)
-                .iter()
-                .find_map(|value| parse_play_count_candidate(value))
-        })
-        .or_else(|| {
-            flex_column_texts(row)
-                .iter()
-                .skip(1)
-                .find_map(|value| extract_play_count_from_text(value))
-        })
-}
-
-fn parse_duration(value: &str) -> Option<u32> {
-    let parts = value
-        .split(':')
-        .filter_map(|part| part.parse::<u32>().ok())
-        .collect::<Vec<_>>();
-    match parts.as_slice() {
-        [minutes, seconds] => Some(minutes * 60 + seconds),
-        [hours, minutes, seconds] => Some(hours * 3600 + minutes * 60 + seconds),
-        _ => None,
-    }
-}
-
-fn best_thumbnail(value: &Value) -> Option<String> {
-    let paths = [
-        [
-            "thumbnail",
-            "musicThumbnailRenderer",
-            "thumbnail",
-            "thumbnails",
-        ]
-        .as_slice(),
-        [
-            "thumbnailRenderer",
-            "musicThumbnailRenderer",
-            "thumbnail",
-            "thumbnails",
-        ]
-        .as_slice(),
-        ["musicThumbnailRenderer", "thumbnail", "thumbnails"].as_slice(),
-        ["thumbnail", "thumbnails"].as_slice(),
-    ];
-
-    for path in paths {
-        if let Some(url) = get_path(value, path)
-            .and_then(Value::as_array)
-            .and_then(|thumbnails| select_thumbnail_url(thumbnails))
-        {
-            return Some(url);
-        }
-    }
-    None
-}
-
-fn best_banner_thumbnail(value: &Value) -> Option<String> {
-    let paths = [
-        [
-            "thumbnail",
-            "musicThumbnailRenderer",
-            "thumbnail",
-            "thumbnails",
-        ]
-        .as_slice(),
-        [
-            "thumbnailRenderer",
-            "musicThumbnailRenderer",
-            "thumbnail",
-            "thumbnails",
-        ]
-        .as_slice(),
-        ["musicThumbnailRenderer", "thumbnail", "thumbnails"].as_slice(),
-        ["thumbnail", "thumbnails"].as_slice(),
-    ];
-
-    for path in paths {
-        if let Some(url) = get_path(value, path)
-            .and_then(Value::as_array)
-            .and_then(|thumbnails| select_largest_thumbnail_url(thumbnails))
-        {
-            return Some(url);
-        }
-    }
-    None
-}
-
-fn select_thumbnail_url(thumbnails: &[Value]) -> Option<String> {
-    let normalized = thumbnails
-        .iter()
-        .filter_map(|thumb| {
-            let url = thumb.get("url").and_then(Value::as_str)?;
-            Some((
-                normalize_thumbnail_url(url),
-                thumb.get("width").and_then(Value::as_u64).unwrap_or(0),
-            ))
-        })
-        .collect::<Vec<_>>();
-
-    normalized
-        .iter()
-        .find(|(_, width)| *width >= PREFERRED_THUMBNAIL_WIDTH)
-        .map(|(url, _)| url.clone())
-        // YouTube doesn't always emit a thumbnail at or above our preferred
-        // width (e.g. some album art tops out at 544×544). Don't assume the
-        // array is sorted — explicitly pick the largest available so we never
-        // accidentally serve a tiny placeholder.
-        .or_else(|| {
-            normalized
-                .iter()
-                .max_by_key(|(_, width)| *width)
-                .map(|(url, _)| url.clone())
-        })
-}
-
-fn select_largest_thumbnail_url(thumbnails: &[Value]) -> Option<String> {
-    thumbnails
-        .iter()
-        .filter_map(|thumb| {
-            let url = thumb.get("url").and_then(Value::as_str)?;
-            let width = thumb.get("width").and_then(Value::as_u64).unwrap_or(0);
-            let height = thumb.get("height").and_then(Value::as_u64).unwrap_or(0);
-            Some((normalize_thumbnail_url(url), width.saturating_mul(height)))
-        })
-        .max_by_key(|(_, area)| *area)
-        .map(|(url, _)| url)
-}
-
-fn normalize_thumbnail_url(url: &str) -> String {
-    if url.starts_with("//") {
-        format!("https:{url}")
-    } else {
-        url.to_string()
-    }
-}
-
-fn square_artist_thumbnail_url(url: &str) -> String {
-    let Some((base, query)) = url.split_once('?') else {
-        return square_artist_thumbnail_base(url);
-    };
-    format!("{}?{query}", square_artist_thumbnail_base(base))
-}
-
-fn banner_artist_thumbnail_url(url: &str) -> String {
-    let Some((base, query)) = url.split_once('?') else {
-        return banner_artist_thumbnail_base(url);
-    };
-    format!("{}?{query}", banner_artist_thumbnail_base(base))
-}
-
-fn square_artist_thumbnail_base(url: &str) -> String {
-    let Some((prefix, suffix)) = url.rsplit_once('=') else {
-        return url.to_string();
-    };
-
-    if !suffix.starts_with('w') {
-        return url.to_string();
-    }
-
-    format!("{prefix}=w{ARTIST_AVATAR_SIZE}-h{ARTIST_AVATAR_SIZE}-p-l90-rj")
-}
-
-fn banner_artist_thumbnail_base(url: &str) -> String {
-    let Some((prefix, suffix)) = url.rsplit_once('=') else {
-        return url.to_string();
-    };
-
-    if !suffix.starts_with('w') {
-        return url.to_string();
-    }
-
-    format!("{prefix}=w{ARTIST_BANNER_WIDTH}-h{ARTIST_BANNER_HEIGHT}-p-l90-rj")
-}
-
-fn as_str_path<'a>(value: &'a Value, path: &[&str]) -> Option<&'a str> {
-    get_path(value, path).and_then(Value::as_str)
-}
-
-fn watch_next_payload(video_id: &str, playlist_id: Option<&str>) -> Value {
-    let mut payload = json!({
-        "enablePersistentPlaylistPanel": true,
-        "isAudioOnly": true,
-        "tunerSettingValue": "AUTOMIX_SETTING_NORMAL",
-        "videoId": video_id,
-        "playlistId": format!("RDAMVM{video_id}"),
-        "watchEndpointMusicSupportedConfigs": {
-            "watchEndpointMusicConfig": {
-                "hasPersistentPlaylistPanel": true,
-                "musicVideoType": "MUSIC_VIDEO_TYPE_ATV"
-            }
-        }
-    });
-
-    if let Some(playlist_id) = playlist_id.filter(|value| !value.is_empty()) {
-        payload["playlistId"] = json!(playlist_id);
-    }
-
-    payload
-}
-
-fn get_path<'a>(value: &'a Value, path: &[&str]) -> Option<&'a Value> {
-    let mut current = value;
-    for key in path {
-        current = current.get(*key)?;
-    }
-    Some(current)
 }
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
@@ -8385,9 +9228,179 @@ fn spawn_startup_updater(app: &AppHandle) {
 }
 
 
+/// MIME type for a cached stream file, by extension.
+fn stream_mime_for_path(path: &std::path::Path) -> &'static str {
+    match path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("mp3") => "audio/mpeg",
+        Some("m4a") | Some("m4b") | Some("aac") | Some("mp4") => "audio/mp4",
+        Some("wav") => "audio/wav",
+        Some("ogg") | Some("oga") => "audio/ogg",
+        Some("flac") => "audio/flac",
+        Some("opus") => "audio/opus",
+        Some("webm") => "audio/webm",
+        _ => "application/octet-stream",
+    }
+}
+
+/// Parse a single HTTP byte-range (`bytes=start-end`, `bytes=start-`,
+/// `bytes=-suffix`). Returns `(start, end)` inclusive bounds.
+fn parse_single_range(range: &str, len: u64) -> Option<(u64, u64)> {
+    let range = range.strip_prefix("bytes=")?;
+    let (start_s, end_s) = range.split_once('-')?;
+    if start_s.is_empty() {
+        // suffix range: last N bytes
+        let n: u64 = end_s.parse().ok()?;
+        if n == 0 || len == 0 {
+            return None;
+        }
+        return Some((len.saturating_sub(n), len - 1));
+    }
+    let start: u64 = start_s.parse().ok()?;
+    if start >= len {
+        return None;
+    }
+    let end = if end_s.is_empty() {
+        len - 1
+    } else {
+        end_s.parse::<u64>().ok()?.min(len - 1)
+    };
+    if end < start {
+        return None;
+    }
+    Some((start, end))
+}
+
+/// Handler for the custom `stream://` scheme used to play cached audio.
+///
+/// The built-in `asset:` protocol caps every single HTTP Range response at
+/// 1 MB (`MAX_LEN` in `tauri/src/protocol/asset.rs`), which truncates the
+/// range requests an `<audio>` element makes while loading a webm/m4a — the
+/// element then fails with `MEDIA_ERR_DECODE`. This handler serves the same
+/// files with UNCAPPED Range support, so playback gets the full file.
+fn stream_protocol_response(
+    request: &tauri::http::Request<Vec<u8>>,
+    app: &tauri::AppHandle,
+) -> tauri::http::Response<std::borrow::Cow<'static, [u8]>> {
+    use std::borrow::Cow;
+    use std::io::{Read, Seek, SeekFrom};
+    use tauri::http::header::{
+        ACCEPT_RANGES, ACCESS_CONTROL_ALLOW_ORIGIN, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE,
+    };
+    use tauri::http::{Response, StatusCode};
+
+    let build = |response: Response<Cow<'static, [u8]>>| response;
+
+    let raw_path = &request.uri().path()[1..];
+    let path = std::path::PathBuf::from(urlencoding::decode(raw_path).map(|c| c.into_owned()).unwrap_or_default());
+
+    let allowed_dirs = [
+        stream_cache_dir(app).ok(),
+        offline_dir(app).ok(),
+    ];
+    let path_allowed = allowed_dirs.iter().flatten().any(|dir| {
+        path.starts_with(dir) && !path.components().any(|c| matches!(c, std::path::Component::ParentDir))
+    });
+    if !path_allowed {
+        return build(
+            Response::builder()
+                .header(ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+                .status(StatusCode::FORBIDDEN)
+                .body(Vec::new().into())
+                .unwrap(),
+        );
+    }
+
+    let file = match std::fs::File::open(&path) {
+        Ok(file) => file,
+        Err(_) => {
+            return build(
+                Response::builder()
+                    .header(ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+                    .status(StatusCode::NOT_FOUND)
+                    .body(Vec::new().into())
+                    .unwrap(),
+            )
+        }
+    };
+    let len = match file.metadata() {
+        Ok(meta) => meta.len(),
+        Err(_) => {
+            return build(
+                Response::builder()
+                    .header(ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                    .body(Vec::new().into())
+                    .unwrap(),
+            )
+        }
+    };
+    if len < MIN_STREAM_CACHE_BYTES {
+        return build(
+            Response::builder()
+                .header(ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+                .status(StatusCode::NOT_FOUND)
+                .body(Vec::new().into())
+                .unwrap(),
+        );
+    }
+
+    let mime = stream_mime_for_path(&path);
+    let mut builder = Response::builder()
+        .header(ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+        .header(ACCEPT_RANGES, "bytes")
+        .header(CONTENT_TYPE, mime);
+
+    if let Some(range) = request.headers().get("range").and_then(|r| r.to_str().ok()) {
+        if let Some((start, end)) = parse_single_range(range, len) {
+            let nbytes = (end - start + 1) as usize;
+            let mut buf = vec![0u8; nbytes];
+            let mut reader = &file;
+            if reader.seek(SeekFrom::Start(start)).is_ok() && reader.read_exact(&mut buf).is_ok() {
+                return build(
+                    builder
+                        .header(CONTENT_RANGE, format!("bytes {start}-{end}/{len}"))
+                        .header(CONTENT_LENGTH, nbytes)
+                        .status(StatusCode::PARTIAL_CONTENT)
+                        .body(buf.into())
+                        .unwrap(),
+                );
+            }
+            builder = Response::builder()
+                .header(ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+                .header(ACCEPT_RANGES, "bytes")
+                .header(CONTENT_TYPE, mime);
+        }
+    }
+
+    let mut buf = Vec::with_capacity(len as usize);
+    if (&file).take(len).read_to_end(&mut buf).is_err() {
+        return build(
+            Response::builder()
+                .header(ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .body(Vec::new().into())
+                .unwrap(),
+        );
+    }
+    build(
+        builder
+            .header(CONTENT_LENGTH, len)
+            .body(buf.into())
+            .unwrap(),
+    )
+}
+
 fn main() {
     tauri::Builder::default()
         .manage(AppState::default())
+        .register_uri_scheme_protocol("stream", |ctx, request| {
+            stream_protocol_response(&request, ctx.app_handle())
+        })
         .plugin(tauri_plugin_autostart::init(tauri_plugin_autostart::MacosLauncher::LaunchAgent, None::<Vec<&str>>))
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_prevent_default::init())
@@ -8409,6 +9422,9 @@ fn main() {
             resolve_track_album,
             get_synced_lyrics,
             get_synced_lyrics_by_meta,
+            probe_lyrics_availability,
+            get_lyric_offset,
+            clear_lyric_offset,
             resolve_stream,
             extract_file_metadata,
             list_imported_tracks,
@@ -8421,6 +9437,7 @@ fn main() {
             get_track_duration,
             get_artist_monthly_listeners,
             save_offline,
+            reconcile_offline_quality,
             remove_offline,
             list_offline,
             clear_all_offline,
@@ -8504,7 +9521,53 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::innertube::{API_KEY_RE, CLIENT_VERSION_RE, VISITOR_DATA_RE};
     use serde_json::json;
+
+    #[tokio::test]
+    async fn run_command_with_timeout_captures_child_output() {
+        // Regression test: `run_command_with_timeout` must pipe the child's
+        // stdout/stderr. With inherited handles, `wait_with_output` returns
+        // empty output — which is exactly how every yt-dlp download looked
+        // like a silent failure ("did not return a playable audio file" /
+        // "exited with exit code: 1") while the real output vanished.
+        let Some(local) = std::env::var_os("LOCALAPPDATA") else {
+            return;
+        };
+        let yt_dlp = std::path::Path::new(&local).join("com.velocity.desktop/bin/yt-dlp.exe");
+        if !yt_dlp.exists() {
+            return;
+        }
+        let out = run_command_with_timeout(&yt_dlp, ["--version"], Duration::from_secs(15))
+            .await
+            .unwrap_or_else(|e| panic!("yt-dlp --version failed: {e}"));
+        assert!(
+            !out.trim().is_empty(),
+            "yt-dlp --version output must be captured, got: {out:?}"
+        );
+    }
+
+    #[test]
+    fn yt_dlp_output_file_ignores_non_path_lines_after_the_path() {
+        let dir = std::env::temp_dir().join(format!("velocity-ytdlp-parse-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let audio = dir.join("song.webm");
+        std::fs::write(&audio, b"fake audio bytes").unwrap();
+
+        let output = format!(
+            "{}\n[download] Destination: something\nWARNING: post-processor note\n",
+            audio.display()
+        );
+        assert_eq!(
+            find_yt_dlp_output_file(&output).as_deref(),
+            Some(audio.to_string_lossy().as_ref())
+        );
+
+        let no_path = "[download] nothing downloaded here\n".to_string();
+        assert_eq!(find_yt_dlp_output_file(&no_path), None);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn extracts_autoplay_queue_from_nested_watch_layout() {
@@ -8678,7 +9741,7 @@ mod tests {
     }
 
     #[test]
-    fn excludes_video_and_playlist_search_items() {
+    fn excludes_playlist_and_unknown_search_items() {
         let song = SearchItem {
             id: "song".to_string(),
             kind: "song".to_string(),
@@ -8696,6 +9759,9 @@ mod tests {
             artist_browse_id: None,
             artist_credits: None,
         };
+        // Music videos (kind "video") are KEPT in the response so the playback
+        // fallback can find a playable same-song alternate; the frontend hides
+        // them from search display and the song-match pool excludes them.
         let video = SearchItem {
             kind: "video".to_string(),
             ..song.clone()
@@ -8704,10 +9770,15 @@ mod tests {
             kind: "playlist".to_string(),
             ..song.clone()
         };
+        let unknown = SearchItem {
+            kind: "unknown".to_string(),
+            ..song.clone()
+        };
 
         assert!(should_include_search_item(&song));
-        assert!(!should_include_search_item(&video));
+        assert!(should_include_search_item(&video));
         assert!(!should_include_search_item(&playlist));
+        assert!(!should_include_search_item(&unknown));
     }
 
     #[test]
@@ -8920,13 +9991,84 @@ mod tests {
         let response = parse_search_response("radiohead", &value);
         assert!(response.top_result.is_some());
         assert_eq!(response.top_result.as_ref().unwrap().title, "Let Down");
-        assert_eq!(response.results.len(), 4);
+        // "Karma Police" lives in the card's `contents` (More-from-YouTube
+        // related videos), so it is dropped along with the other card rows.
+        assert_eq!(response.results.len(), 3);
         let titles: Vec<_> = response.results.iter().map(|item| item.title.as_str()).collect();
-        assert!(titles.contains(&"Karma Police"));
+        assert!(!titles.contains(&"Karma Police"));
         assert!(titles.contains(&"Creep"));
         assert!(titles.contains(&"Paranoid Android"));
         assert!(titles.contains(&"OK Computer"));
         assert!(!titles.contains(&"YouTube Version"));
+    }
+
+    #[test]
+    fn parse_search_response_drops_card_more_from_youtube_rows() {
+        // The top-result card's `contents` is [divider, topResult, fanUpload, fanUpload].
+        // The fan uploads (generic YouTube videos under "More from YouTube") carry no
+        // type label, so without the card-row guard they would be classified as songs.
+        let row = |title: &str, meta: &str, video_id: &str| {
+            json!({
+                "musicResponsiveListItemRenderer": {
+                    "flexColumns": [
+                        {
+                            "musicResponsiveListItemFlexColumnRenderer": {
+                                "text": { "runs": [{ "text": title }] }
+                            }
+                        },
+                        {
+                            "musicResponsiveListItemFlexColumnRenderer": {
+                                "text": { "runs": [{ "text": meta }] }
+                            }
+                        }
+                    ],
+                    "playlistItemData": { "videoId": video_id }
+                }
+            })
+        };
+
+        let value = json!({
+            "contents": {
+                "tabbedSearchResultsRenderer": {
+                    "tabs": [{
+                        "tabRenderer": {
+                            "content": {
+                                "sectionListRenderer": {
+                                    "contents": [
+                                        {
+                                            "musicCardShelfRenderer": {
+                                                "title": { "runs": [{ "text": "Paranoid Android" }] },
+                                                "subtitle": { "runs": [{ "text": "Song \u{2022} Radiohead" }] },
+                                                "thumbnailOverlay": {
+                                                    "musicItemThumbnailOverlayRenderer": {
+                                                        "content": {
+                                                            "musicPlayButtonRenderer": {
+                                                                "playNavigationEndpoint": {
+                                                                    "watchEndpoint": { "videoId": "top-mv" }
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                },
+                                                "contents": [
+                                                    { "messageRenderer": { "text": { "runs": [{ "text": "Songs" }] } } },
+                                                    row("Paranoid Android", "Radiohead \u{2022} 13M views \u{2022} 6:17", "nz-studio"),
+                                                    row("Radiohead - Paranoid Android | Live at Glastonbury 2003 (HQ)", "WiseRiley \u{2022} 940K views \u{2022} 6:38", "fan1"),
+                                                    row("Radiohead - Paranoid Android (odm Utrecht)", "anne pater \u{2022} 1.1M views \u{2022} 6:10", "fan2")
+                                                ]
+                                            }
+                                        }
+                                    ]
+                                }
+                            }
+                        }
+                    }]
+                }
+            }
+        });
+
+        let response = parse_search_response("paranoid android", &value);
+        assert!(response.results.is_empty());
     }
 
     #[test]
@@ -9912,6 +11054,22 @@ mod tests {
         );
     }
 
+    #[test]
+    fn parse_single_range_reads_common_byte_ranges() {
+        assert_eq!(parse_single_range("bytes=0-99", 1000), Some((0, 99)));
+        assert_eq!(parse_single_range("bytes=500-", 1000), Some((500, 999)));
+        assert_eq!(parse_single_range("bytes=0-", 1000), Some((0, 999)));
+        assert_eq!(parse_single_range("bytes=-100", 1000), Some((900, 999)));
+        assert_eq!(parse_single_range("bytes=2000-", 1000), None);
+        assert_eq!(parse_single_range("bytes=0-0", 1), Some((0, 0)));
+        assert_eq!(parse_single_range("garbage", 1000), None);
+    }
+
+    #[test]
+    fn stream_mime_for_path_maps_extensions() {
+        assert_eq!(stream_mime_for_path(std::path::Path::new("a.webm")), "audio/webm");
+        assert_eq!(stream_mime_for_path(std::path::Path::new("a.mp3")), "audio/mpeg");
+        assert_eq!(stream_mime_for_path(std::path::Path::new("a.m4a")), "audio/mp4");
+        assert_eq!(stream_mime_for_path(std::path::Path::new("a.unknown")), "application/octet-stream");
+    }
 }
-
-

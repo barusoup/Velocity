@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { assertInvariants, maxSyncsForPlayingTicks } from "./invariants";
+import { maxSyncsForPlayingTicks } from "./invariants";
 import {
   defaultPlayerState,
   play,

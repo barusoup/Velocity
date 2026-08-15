@@ -213,7 +213,7 @@ export function reducePresenceMount(
 }
 
 export function reducePresenceUnmount(
-  state: PresenceEngineState,
+  _state: PresenceEngineState,
 ): { state: PresenceEngineState; effects: PresenceEngineEffect[] } {
   return {
     state: { ...createPresenceEngineState(), mounted: false },

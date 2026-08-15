@@ -1,5 +1,6 @@
-import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react";
-import { CircleArrowRight, ChevronUp, LoaderCircle, Pause, Play, RefreshCw, SkipBack, SkipForward, X } from "lucide-react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { CircleArrowRight, LoaderCircle, Mic2, Pause, Play, RefreshCw, SkipBack, SkipForward } from "lucide-react";
+import { IconPanelRightClose, IconPanelRightOpen } from "../wrapped-icons";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import {
   getArtistDetail,
@@ -16,7 +17,6 @@ import type { MediaTrack } from "../types";
 import { useIsTrackSaved, useToggleTrackSave } from "../hooks/useCollectionSelectors";
 import { useContextTrackTarget } from "../hooks/useContextTrackTarget";
 import { usePlayerUiStore } from "../store/playerUiStore";
-import { useSetting } from "../settings";
 import { formatDuration, readLiveMediaDuration } from "../utils/media";
 import {
   getDirectAlbumBrowseId,
@@ -32,16 +32,8 @@ import {
   AnimatedRepeat,
   AnimatedShuffle,
   AnimatedVolume,
-  QueueMenuIcon,
 } from "./PlayerButtonIcons";
 import { SaveButton } from "./SaveButton";
-
-const loadQueuePanel = () => import("./QueuePanel");
-const QueuePanel = lazy(() =>
-  loadQueuePanel().then((m) => ({ default: m.QueuePanel })),
-);
-
-const SIDEBAR_LAYOUT_TRANSITION = "220ms cubic-bezier(0.22, 1, 0.36, 1)";
 
 const MARQUEE_SPEED = 40;
 const MARQUEE_PAUSE_SECONDS = 0.85;
@@ -95,7 +87,7 @@ function ArtistLine({
   }, [onNavigate, onPendingChange, pending]);
 
   return (
-    <div className={`mt-0.5 text-[0.84rem] leading-tight text-neutral-400 transition-opacity duration-150 ${pending ? "opacity-60" : ""}`}>
+    <div className={`text-[0.84rem] leading-tight text-neutral-400 transition-opacity duration-150 ${pending ? "opacity-60" : ""}`}>
       <Marquee
         speed={MARQUEE_SPEED}
         pauseSeconds={MARQUEE_PAUSE_SECONDS}
@@ -118,22 +110,21 @@ function ArtistLine({
 }
 
 export default function PlayerBar({
-  sidebarOpen,
   onNavigate,
   viewName,
+  nowPlayingOpen = false,
+  onToggleNowPlaying,
 }: {
-  sidebarOpen: boolean;
   onNavigate: (view: View) => void;
   viewName: string;
+  nowPlayingOpen?: boolean;
+  onToggleNowPlaying?: () => void;
 }) {
   const playerState = usePlayerState();
   const playerActions = usePlayerActions();
   const player = { ...playerState, ...playerActions };
   const [volumeHover, setVolumeHover] = useState(false);
   const [dragVolume, setDragVolume] = useState<number | null>(null);
-  const [queueOpen, setQueueOpen] = useState(false);
-  const prevQueueOpenRef = useRef(false);
-  const [queueMounted, setQueueMounted] = useState(false);
   const [titleOverflow, setTitleOverflow] = useState(0);
   const [artistOverflow, setArtistOverflow] = useState(0);
   const [syncOverflow, setSyncOverflow] = useState(0);
@@ -147,26 +138,6 @@ export default function PlayerBar({
     setArtistPending(pending);
   }, []);
   const [cachedCover, setCachedCover] = useState<string | null>(null);
-
-  const onLyricsPage = viewName === "lyrics";
-  const hidePlayerOnLyrics = useSetting("hidePlayerOnLyrics");
-  const hideBarTimeoutRef = useRef<number | null>(null);
-  const barHoveredRef = useRef(false);
-  const mouseInBottomZoneRef = useRef(false);
-  const [hasHoverCapability, setHasHoverCapability] = useState(true);
-  useEffect(() => {
-    if (typeof window === "undefined" || typeof window.matchMedia !== "function") return;
-    const mql = window.matchMedia("(hover: hover) and (pointer: fine)");
-    const sync = () => setHasHoverCapability(mql.matches);
-    sync();
-    const listener = (event: MediaQueryListEvent) => setHasHoverCapability(event.matches);
-    if (typeof mql.addEventListener === "function") {
-      mql.addEventListener("change", listener);
-      return () => mql.removeEventListener("change", listener);
-    }
-    mql.addListener(listener);
-    return () => mql.removeListener(listener);
-  }, []);
 
   const playerBarShellRef = useRef<HTMLDivElement | null>(null);
   const playerDockRef = useRef<HTMLDivElement | null>(null);
@@ -196,14 +167,6 @@ export default function PlayerBar({
     setArtistPending(false);
   }, [track?.id]);
 
-  useEffect(() => {
-    if (queueOpen) {
-      setQueueMounted(true);
-      return;
-    }
-    const timer = window.setTimeout(() => setQueueMounted(false), 320);
-    return () => window.clearTimeout(timer);
-  }, [queueOpen]);
   const draggingVolume = useRef(false);
   const draggingSeek = useRef(false);
   const wasPlayingBeforeSeekDragRef = useRef(false);
@@ -231,18 +194,6 @@ export default function PlayerBar({
     return unsub;
   }, []);
   const liveDurationRef = useRef(0);
-
-  useEffect(() => {
-    let cancelled = false;
-    const timeoutId = window.setTimeout(() => {
-      if (!cancelled) void loadQueuePanel();
-    }, 350);
-
-    return () => {
-      cancelled = true;
-      window.clearTimeout(timeoutId);
-    };
-  }, []);
 
   // Preload artist detail and banner artwork when the track changes so
   // clicking the artist name in the player bar opens the page instantly.
@@ -475,96 +426,6 @@ export default function PlayerBar({
     // the (id, findLyrics) pair is.
   }, [track?.id, track?.videoId, track?.resolvedVideoId, track?.source, track?.findLyrics]);
 
-  // Lyrics page: auto-hide player bar, reveal on hover near bottom.
-  // Uses the same pattern as the search bar: a bottom-zone sensor
-  // (mouseenter/mouseleave) combined with dock hover tracking and a
-  // grace timeout. React state drives the hidden class so re-renders
-  // (e.g. clicking a button) don't clobber DOM-manipulated classes.
-  // When hidePlayerOnLyrics is enabled the bar is omitted entirely
-  // (see the early return below) — this path only runs for the default
-  // hover-to-reveal behavior.
-  const [barVisible, setBarVisible] = useState(true);
-
-  const showBar = useCallback(() => {
-    if (hideBarTimeoutRef.current !== null) {
-      clearTimeout(hideBarTimeoutRef.current);
-      hideBarTimeoutRef.current = null;
-    }
-    setBarVisible(true);
-  }, []);
-
-  const scheduleHideBar = useCallback((fromDockLeave = false) => {
-    if (hideBarTimeoutRef.current !== null) {
-      clearTimeout(hideBarTimeoutRef.current);
-    }
-    if (queueOpen) return;
-    hideBarTimeoutRef.current = window.setTimeout(() => {
-      const keepForBottomZone = !fromDockLeave && mouseInBottomZoneRef.current;
-      if (!barHoveredRef.current && !keepForBottomZone) {
-        setBarVisible(false);
-      }
-      hideBarTimeoutRef.current = null;
-    }, 250);
-  }, [queueOpen]);
-
-  useEffect(() => {
-    const wasQueueOpen = prevQueueOpenRef.current;
-    prevQueueOpenRef.current = queueOpen;
-    if (!onLyricsPage || !hasHoverCapability || queueOpen || hidePlayerOnLyrics) {
-      setBarVisible(true);
-      return;
-    }
-    if (wasQueueOpen) return;
-    if (barHoveredRef.current || mouseInBottomZoneRef.current) {
-      scheduleHideBar();
-    } else {
-      setBarVisible(false);
-    }
-  }, [onLyricsPage, hasHoverCapability, queueOpen, hidePlayerOnLyrics, scheduleHideBar]);
-
-  // Bottom-zone detection via mousemove: tracks when the pointer enters
-  // or exits the bottom 150px of the viewport. Replaces the old
-  // pointer-events-toggling sensor div which caused the dock to
-  // sometimes miss mouseenter/mouseleave, leaving the bar visible.
-  useEffect(() => {
-    if (!onLyricsPage || !hasHoverCapability || hidePlayerOnLyrics) return;
-
-    const handleMouseMove = (e: MouseEvent) => {
-      const threshold = window.innerHeight - 150;
-      const isInZone = e.clientY >= threshold;
-
-      if (isInZone && !mouseInBottomZoneRef.current) {
-        mouseInBottomZoneRef.current = true;
-        showBar();
-      } else if (!isInZone && mouseInBottomZoneRef.current) {
-        mouseInBottomZoneRef.current = false;
-        scheduleHideBar();
-      }
-    };
-
-    document.addEventListener("mousemove", handleMouseMove, { passive: true });
-    return () => document.removeEventListener("mousemove", handleMouseMove);
-  }, [onLyricsPage, hasHoverCapability, hidePlayerOnLyrics, showBar, scheduleHideBar]);
-
-  // When the cursor leaves the browser window (e.g. alt+tab, or moving
-  // diagonally out of the viewport) no mouseleave fires on the dock, so
-  // hover refs stay stale and the bar never auto-hides. Detect the exit
-  // via document mouseout with a null relatedTarget and reset everything.
-  useEffect(() => {
-    if (!onLyricsPage || !hasHoverCapability || hidePlayerOnLyrics) return;
-
-    const handleWindowExit = (e: MouseEvent) => {
-      if (e.relatedTarget !== null) return;
-      barHoveredRef.current = false;
-      mouseInBottomZoneRef.current = false;
-      setVolumeHover(false);
-      scheduleHideBar();
-    };
-
-    document.addEventListener("mouseout", handleWindowExit);
-    return () => document.removeEventListener("mouseout", handleWindowExit);
-  }, [onLyricsPage, hasHoverCapability, hidePlayerOnLyrics, scheduleHideBar]);
-
   const calcVolumeFromClientX = useCallback((clientX: number) => {
     const el = volumeTrackRef.current;
     if (!el) return 0;
@@ -596,19 +457,14 @@ export default function PlayerBar({
     if (!audio) return;
 
     let frameId = 0;
+    let intervalId = 0;
     let running = true;
     let lastProgress = -1;
     let lastDuration = -1;
     let lastPct = -1;
 
     const paintSeekBar = () => {
-      if (!running) return;
-
       const scrub = seekScrubProgressRef.current;
-      if (audio.paused && scrub === null) return;
-
-      frameId = window.requestAnimationFrame(paintSeekBar);
-
       const latestAudio = currentAudio.current;
       const progress =
         scrub ??
@@ -622,7 +478,9 @@ export default function PlayerBar({
           ? Math.min(100, Math.max(0, (progress / duration) * 100))
           : 0;
 
-      const progressChanged = Math.abs(progress - lastProgress) >= 0.01;
+      // The timer shows whole seconds; updating labels at ~4Hz is visually
+      // identical to 60Hz and avoids DOM churn on weak CPUs.
+      const progressChanged = Math.abs(progress - lastProgress) >= 0.25;
       if (progressChanged) {
         lastProgress = progress;
         if (seekElapsedRef.current) {
@@ -648,10 +506,54 @@ export default function PlayerBar({
       }
     };
 
+    const stopLoop = () => {
+      window.cancelAnimationFrame(frameId);
+      frameId = 0;
+      if (intervalId) {
+        window.clearInterval(intervalId);
+        intervalId = 0;
+      }
+    };
+
+    // Playback ticks run on a low-frequency interval. A 60fps rAF loop that
+    // keeps scheduling while playing wastes a CPU core when the window sits
+    // occluded behind another app (WebView2 doesn't always throttle rAF for
+    // covered-but-visible windows), which shows up as stutter in games on
+    // weaker CPUs. 4Hz is indistinguishable for a seek bar.
+    const startInterval = () => {
+      stopLoop();
+      intervalId = window.setInterval(() => {
+        if (!running) return;
+        if (audio.paused && seekScrubProgressRef.current === null) {
+          stopLoop();
+          return;
+        }
+        paintSeekBar();
+      }, 250);
+    };
+
+    // While scrubbing, switch to rAF so the thumb tracks the pointer smoothly.
+    const startScrubRaf = () => {
+      stopLoop();
+      const scrubTick = () => {
+        if (!running) return;
+        if (seekScrubProgressRef.current === null) {
+          startInterval();
+          return;
+        }
+        frameId = window.requestAnimationFrame(scrubTick);
+        paintSeekBar();
+      };
+      frameId = window.requestAnimationFrame(scrubTick);
+    };
+
     const schedule = () => {
       if (!running) return;
-      window.cancelAnimationFrame(frameId);
-      frameId = window.requestAnimationFrame(paintSeekBar);
+      if (seekScrubProgressRef.current !== null) {
+        startScrubRaf();
+      } else if (!audio.paused) {
+        startInterval();
+      }
     };
 
     const onWake = () => schedule();
@@ -661,8 +563,8 @@ export default function PlayerBar({
 
     const unsubScrub = usePlayerUiStore.subscribe(
       (state) => state.seekScrubProgress,
-      (scrub) => {
-        if (scrub !== null) schedule();
+      () => {
+        schedule();
       },
     );
 
@@ -672,7 +574,7 @@ export default function PlayerBar({
 
     return () => {
       running = false;
-      window.cancelAnimationFrame(frameId);
+      stopLoop();
       audio.removeEventListener("play", onWake);
       audio.removeEventListener("seeking", onWake);
       audio.removeEventListener("seeked", onWake);
@@ -779,23 +681,6 @@ export default function PlayerBar({
     };
   }, [applyLiveDrag, calcSeekSecondsFromClientX]);
 
-  useEffect(() => {
-    if (!queueOpen) return;
-    const handlePointerDown = (event: PointerEvent) => {
-      const target = event.target as Element;
-      if (!target?.closest?.(".queue-panel") && !target?.closest?.("[data-queue-toggle]")) setQueueOpen(false);
-    };
-    const handleKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape") setQueueOpen(false);
-    };
-    document.addEventListener("pointerdown", handlePointerDown);
-    document.addEventListener("keydown", handleKeyDown);
-    return () => {
-      document.removeEventListener("pointerdown", handlePointerDown);
-      document.removeEventListener("keydown", handleKeyDown);
-    };
-  }, [queueOpen]);
-
   const contextTarget = useContextTrackTarget(track!, Boolean(track));
   const directAlbumBrowseId = track ? getDirectAlbumBrowseId(track) : null;
   const handleNavigateToAlbum = useCallback(() => {
@@ -829,214 +714,133 @@ export default function PlayerBar({
   }, [onNavigate]);
 
   const canNavigateToAlbum = Boolean(directAlbumBrowseId || track?.videoId || track?.album?.trim());
-  const hasLyrics = lyricsAvailable && viewName !== "lyrics";
+  const onLyricsPage = viewName === "lyrics";
+  const hasLyrics = lyricsAvailable;
 
   const seekScrubProgress = usePlayerUiStore((state) => state.seekScrubProgress);
   const storedProgress = usePlayerUiStore((state) => state.progress);
 
-  if (!track) return null;
-  if (onLyricsPage && hidePlayerOnLyrics) return null;
-
-  const duration =
-    player.duration ||
-    track.durationSeconds ||
-    0;
-  const displayProgress = seekScrubProgress ?? storedProgress;
+  const duration = track
+    ? resolveSeekDuration() ||
+      player.duration ||
+      track.durationSeconds ||
+      0
+    : 0;
+  const displayProgress = track ? (seekScrubProgress ?? storedProgress) : 0;
   const remaining = Math.max(0, duration - displayProgress);
   const progressPct = duration ? (displayProgress / duration) * 100 : 0;
-
-  const lyricsEnabled = onLyricsPage && hasHoverCapability && !hidePlayerOnLyrics;
-  const lyricsHideActive = lyricsEnabled && !barVisible && !queueOpen;
 
   return (
       <div
         ref={playerDockRef}
-        className="fixed bottom-[var(--ui-player-bottom)] z-40"
-        style={{
-          left: sidebarOpen
-            ? "calc((100vw + var(--ui-sidebar-open)) / 2)"
-            : "calc((100vw + var(--ui-sidebar-closed)) / 2)",
-          transform: "translateX(-50%)",
-          transition: `left ${SIDEBAR_LAYOUT_TRANSITION}`,
-        }}
-        onMouseEnter={() => {
-          barHoveredRef.current = true;
-          if (lyricsEnabled) {
-            showBar();
-          }
-        }}
-        onMouseLeave={() => {
-          barHoveredRef.current = false;
-          if (lyricsEnabled) {
-            scheduleHideBar(true);
-          }
-        }}
+        // -mt-px overlaps the sidebar crescent by 1px so the join is fully
+        // seamless (covers subpixel/DPR hairline gaps where #000 would show).
+        className="player-bar-dock relative z-40 w-full -mt-px"
       >
-        {queueMounted && (
-          <Suspense fallback={null}>
-            <QueuePanel open={queueOpen} onNavigate={onNavigate} />
-          </Suspense>
-        )}
         <div
           ref={playerBarShellRef}
-          className={`player-bar-shell relative z-10 flex items-center gap-[clamp(0.75rem,1.25vw,1.25rem)] rounded-xl border border-white/12 bg-neutral-950/90 py-[clamp(0.45rem,0.625vw,0.7rem)] shadow-[0_20px_60px_rgba(0,0,0,0.62)] backdrop-blur-md${lyricsHideActive ? " player-bar-lyrics-hidden" : ""}`}
+          className="player-bar-shell relative z-10 flex items-center gap-[clamp(0.75rem,1.25vw,1.25rem)] bg-neutral-950 py-[clamp(0.45rem,0.625vw,0.7rem)]"
           style={{
-            paddingLeft: "clamp(0.3rem, 0.5vw, 0.4rem)",
-            paddingRight: "clamp(0.6rem,0.9375vw,0.9rem)",
-            width: sidebarOpen
-              ? "min(var(--ui-player-max), calc(100vw - var(--ui-sidebar-open) - 1.5rem))"
-              : "min(var(--ui-player-max), calc(100vw - var(--ui-sidebar-closed) - 1.5rem))",
-            transition: onLyricsPage
-              ? `width ${SIDEBAR_LAYOUT_TRANSITION}, opacity 320ms cubic-bezier(0.32, 0.72, 0, 1), transform 360ms cubic-bezier(0.32, 0.72, 0, 1)`
-              : `width ${SIDEBAR_LAYOUT_TRANSITION}`,
+            // Match the shell's vertical padding (py) so the gap to the
+            // album art's left is consistent with the gaps above/below the
+            // left column instead of hugging the window edge.
+            paddingLeft: "clamp(0.45rem, 0.625vw, 0.7rem)",
+            paddingRight: "clamp(0.45rem, 0.625vw, 0.7rem)",
+            width: "100%",
           }}
         >
-          <div
-            {...contextTarget}
-            className="hidden min-w-0 w-[var(--ui-player-side)] shrink-0 items-center gap-2 min-[720px]:flex"
-          >
-            <div className={`group relative h-[var(--ui-art-sm)] w-[var(--ui-art-sm)] shrink-0 overflow-hidden bg-neutral-800 ${getArtworkRoundedClass()}`}>
-              {(track.cover || cachedCover) ? (
-                <ArtworkImage
-                  sources={cachedCover ? [cachedCover, track.cover] : [track.cover]}
-                  className="h-full w-full object-cover"
-                  loading="eager"
-                />
-              ) : (
-                <DefaultArtwork />
-              )}
-
-              {hasLyrics && (
-                <div className="absolute inset-0 opacity-0 transition-opacity duration-200 group-hover:opacity-100 group-focus-within:opacity-100">
-                  <div
-                    aria-hidden
-                    className="pointer-events-none absolute inset-0 bg-black/45"
+          {track ? (
+            <div
+              {...contextTarget}
+              className="hidden min-w-0 w-[var(--ui-player-side)] shrink-0 items-center gap-2 min-[720px]:flex"
+            >
+              <div className={`group relative h-[var(--ui-art-sm)] w-[var(--ui-art-sm)] shrink-0 overflow-hidden bg-neutral-800 ${getArtworkRoundedClass()}`}>
+                {(track.cover || cachedCover) ? (
+                  <ArtworkImage
+                    sources={cachedCover ? [cachedCover, track.cover] : [track.cover]}
+                    className="h-full w-full object-cover"
+                    loading="eager"
                   />
-                  <button
-                    type="button"
-                    onClick={(event) => {
-                      event.stopPropagation();
-                      onNavigate({ name: "lyrics" });
-                    }}
-                    aria-label="Open synced lyrics"
-                    className="absolute inset-0 flex items-center justify-center"
-                  >
-                    <span className="flex h-7 w-7 items-center justify-center rounded-full bg-black text-white shadow-[0_10px_28px_rgba(0,0,0,0.55)]">
-                      <ChevronUp size={16} strokeWidth={2.25} />
-                    </span>
-                  </button>
-                </div>
-              )}
-
-              <div
-                className={`absolute inset-0 transition-opacity duration-200 ${
-                  lyricsLoading || lyricsLoadFailed
-                    ? "opacity-100"
-                    : "opacity-0 pointer-events-none"
-                }`}
-              >
-                <div
-                  aria-hidden
-                  className="pointer-events-none absolute inset-0 bg-black/45"
-                />
-                <div className="absolute inset-0 flex items-center justify-center">
-                  <span
-                    className={`absolute transition-all duration-200 ${
-                      lyricsLoadFailed
-                        ? "opacity-0 scale-75"
-                        : "opacity-100 scale-100"
-                    }`}
-                  >
-                    <LoaderCircle
-                      size={18}
-                      className={`text-white ${lyricsLoading ? "animate-spin" : ""}`}
-                    />
-                  </span>
-                  <span
-                    className={`absolute transition-all duration-200 ${
-                      lyricsLoadFailed
-                        ? "opacity-100 scale-100"
-                        : "opacity-0 scale-75"
-                    }`}
-                  >
-                    <X size={16} strokeWidth={2.25} className="text-white" />
-                  </span>
-                </div>
-              </div>
-            </div>
-            <div className="relative min-w-0 flex-1">
-              <div
-                ref={textContainerRef}
-                className="min-w-0"
-              >
-                {canNavigateToAlbum ? (
-                  <button
-                    type="button"
-                    onClick={handleNavigateToAlbum}
-                    className={`block w-full text-left text-[0.98rem] font-semibold leading-tight transition hover:text-white focus-visible:outline-none ${albumPending ? "cursor-wait opacity-60" : "text-white/85"}`}
-                  >
-                    <Marquee
-                      speed={MARQUEE_SPEED}
-                      pauseSeconds={MARQUEE_PAUSE_SECONDS}
-                      minDuration={MARQUEE_MIN_DURATION}
-                      cycle={sharedCycle}
-                      onOverflowChange={handleTitleOverflowChange}
-                    >
-                      {track.title}
-                    </Marquee>
-                  </button>
-                ) : track.source === "upload" ? (
-                  <button
-                    type="button"
-                    onClick={handleNavigateToLocal}
-                    className="block w-full text-left text-[0.98rem] font-semibold leading-tight text-white/85 transition hover:text-white focus-visible:outline-none"
-                  >
-                    <Marquee
-                      speed={MARQUEE_SPEED}
-                      pauseSeconds={MARQUEE_PAUSE_SECONDS}
-                      minDuration={MARQUEE_MIN_DURATION}
-                      cycle={sharedCycle}
-                      onOverflowChange={handleTitleOverflowChange}
-                    >
-                      {track.title}
-                    </Marquee>
-                  </button>
                 ) : (
-                  <Marquee
-                    className="text-[0.98rem] font-semibold leading-tight text-white"
-                    speed={MARQUEE_SPEED}
-                    pauseSeconds={MARQUEE_PAUSE_SECONDS}
-                    minDuration={MARQUEE_MIN_DURATION}
-                    cycle={sharedCycle}
-                    onOverflowChange={handleTitleOverflowChange}
-                  >
-                    {track.title}
-                  </Marquee>
+                  <DefaultArtwork />
                 )}
-                <div className="flex w-fit max-w-full items-center gap-1">
-                  <div className="min-w-0 flex-1">
-                    <ArtistLine
-                      track={track}
-                      onNavigate={onNavigate}
+              </div>
+              <div className="relative min-w-0 flex-1">
+                <div
+                  ref={textContainerRef}
+                  className="min-w-0"
+                >
+                  {canNavigateToAlbum ? (
+                    <button
+                      type="button"
+                      onClick={handleNavigateToAlbum}
+                      className={`block w-full text-left text-[0.98rem] font-semibold leading-tight transition hover:text-white focus-visible:outline-none ${albumPending ? "cursor-wait opacity-60" : "text-white/85"}`}
+                    >
+                      <Marquee
+                        speed={MARQUEE_SPEED}
+                        pauseSeconds={MARQUEE_PAUSE_SECONDS}
+                        minDuration={MARQUEE_MIN_DURATION}
+                        cycle={sharedCycle}
+                        onOverflowChange={handleTitleOverflowChange}
+                      >
+                        {track.title}
+                      </Marquee>
+                    </button>
+                  ) : track.source === "upload" ? (
+                    <button
+                      type="button"
+                      onClick={handleNavigateToLocal}
+                      className="block w-full text-left text-[0.98rem] font-semibold leading-tight text-white/85 transition hover:text-white focus-visible:outline-none"
+                    >
+                      <Marquee
+                        speed={MARQUEE_SPEED}
+                        pauseSeconds={MARQUEE_PAUSE_SECONDS}
+                        minDuration={MARQUEE_MIN_DURATION}
+                        cycle={sharedCycle}
+                        onOverflowChange={handleTitleOverflowChange}
+                      >
+                        {track.title}
+                      </Marquee>
+                    </button>
+                  ) : (
+                    <Marquee
+                      className="text-[0.98rem] font-semibold leading-tight text-white"
+                      speed={MARQUEE_SPEED}
+                      pauseSeconds={MARQUEE_PAUSE_SECONDS}
+                      minDuration={MARQUEE_MIN_DURATION}
                       cycle={sharedCycle}
-                      onOverflowChange={handleArtistOverflowChange}
-                      pending={artistPending}
-                      onPendingChange={handleArtistPendingChange}
-                    />
-                  </div>
-                  {track.source !== "upload" && (
-                    <div className="shrink-0 mt-1">
-                      <PlayerBarTrackSave track={track} />
-                    </div>
+                      onOverflowChange={handleTitleOverflowChange}
+                    >
+                      {track.title}
+                    </Marquee>
                   )}
+                  <div className="flex min-w-0 items-center gap-1">
+                    <div className="min-w-0 overflow-hidden">
+                      <ArtistLine
+                        track={track}
+                        onNavigate={onNavigate}
+                        cycle={sharedCycle}
+                        onOverflowChange={handleArtistOverflowChange}
+                        pending={artistPending}
+                        onPendingChange={handleArtistPendingChange}
+                      />
+                    </div>
+                    {track.source !== "upload" && (
+                      <div className="shrink-0 translate-y-px">
+                        <PlayerBarTrackSave track={track} />
+                      </div>
+                    )}
+                  </div>
+                  {player.lastError && <div className="truncate text-[11px] leading-none text-red-400">{player.lastError}</div>}
                 </div>
-                {player.lastError && <div className="truncate text-[11px] text-red-400 leading-tight mt-0.5">{player.lastError}</div>}
               </div>
             </div>
-          </div>
+          ) : (
+            <div className="hidden min-w-0 w-[var(--ui-player-side)] shrink-0 min-[720px]:block" />
+          )}
 
-          <div className="flex min-w-0 flex-1 flex-col items-center">
-            <div className="flex h-9 items-center justify-center gap-2">
+          <div className="flex min-w-0 flex-1 flex-col items-center justify-center gap-1">
+            <div className="flex items-center justify-center gap-2">
               <button
                 type="button"
                 onClick={player.toggleShuffle}
@@ -1048,41 +852,50 @@ export default function PlayerBar({
               </button>
               <button
                 type="button"
-                onClick={player.prev}
+                onClick={track ? player.prev : undefined}
                 className="flex h-8 w-8 items-center justify-center rounded-full text-neutral-200 transition duration-100 ease-out hover:text-white"
               >
                 <SkipBack size={18} fill="currentColor" />
               </button>
               <button
                 type="button"
-                onClick={() => {
-                  if (player.lastError) {
-                    player.clearError();
-                    player.retry();
-                    return;
-                  }
-                  player.togglePlay();
-                }}
-                aria-label={
-                  player.lastError
-                    ? "Retry loading current track"
-                    : player.isBuffering
-                      ? "Loading"
-                      : player.isPlaying
-                        ? "Pause"
-                        : "Play"
+                disabled={!track}
+                onClick={
+                  track
+                    ? () => {
+                        if (player.lastError) {
+                          player.clearError();
+                          player.retry();
+                          return;
+                        }
+                        player.togglePlay();
+                      }
+                    : undefined
                 }
-                className={`relative flex h-10 w-10 items-center justify-center rounded-full transition-[transform,background-color,color] duration-[80ms] ease-out active:scale-[0.93] motion-reduce:transition-none motion-reduce:active:scale-100 ${
-                  player.lastError
-                    ? "bg-red-500 text-white hover:bg-red-400 active:bg-red-500/90"
-                    : "bg-white text-black active:bg-white/85"
+                aria-label={
+                  !track
+                    ? "Play"
+                    : player.lastError
+                      ? "Retry loading current track"
+                      : player.isBuffering
+                        ? "Loading"
+                        : player.isPlaying
+                          ? "Pause"
+                          : "Play"
+                }
+                className={`player-play-button relative flex h-10 w-10 items-center justify-center rounded-full ${
+                  !track
+                    ? "bg-white text-black cursor-default"
+                    : player.lastError
+                      ? "bg-red-500 text-white hover:bg-red-400 active:bg-red-500/90"
+                      : "bg-white text-black active:bg-white/85"
                 }`}
               >
-                {player.isBuffering && !player.lastError ? (
+                {track && player.isBuffering && !player.lastError ? (
                   <LoaderCircle size={16} className="animate-spin" />
-                ) : player.lastError ? (
+                ) : track && player.lastError ? (
                   <RefreshCw size={16} strokeWidth={2.25} />
-                ) : player.isPlaying ? (
+                ) : track && player.isPlaying ? (
                   <Pause size={16} fill="currentColor" strokeWidth={0} />
                 ) : (
                   <Play size={16} fill="currentColor" strokeWidth={0} />
@@ -1090,7 +903,7 @@ export default function PlayerBar({
               </button>
               <button
                 type="button"
-                onClick={() => player.next(true)}
+                onClick={track ? () => player.next(true) : undefined}
                 className="flex h-8 w-8 items-center justify-center rounded-full text-neutral-200 transition duration-100 ease-out hover:text-white"
               >
                 <SkipForward size={18} fill="currentColor" />
@@ -1106,17 +919,18 @@ export default function PlayerBar({
               </button>
             </div>
 
-            <div className="mt-1 flex w-full items-center gap-3">
+            <div className="flex w-full items-center gap-3">
               <span
                 ref={seekElapsedRef}
-                className="w-10 text-right text-[11px] tabular-nums text-neutral-400"
+                className="w-10 shrink-0 text-right text-[11px] leading-none tabular-nums text-neutral-400"
               >
                 {formatDuration(displayProgress)}
               </span>
               <div className="relative h-1 flex-1">
                 <div
-                  className="absolute -inset-y-2 left-0 right-0 z-10 cursor-pointer"
+                  className={`absolute -inset-y-2 left-0 right-0 z-10 ${track ? "cursor-pointer" : "cursor-default"}`}
                   onMouseDown={(event) => {
+                    if (!track) return;
                     event.stopPropagation();
                     wasPlayingBeforeSeekDragRef.current = player.beginSeekScrub();
                     draggingSeek.current = true;
@@ -1126,7 +940,7 @@ export default function PlayerBar({
                 />
                 <div
                   ref={seekTrackRef}
-                  className="group relative h-full rounded-full bg-neutral-800"
+                  className="group relative h-1 w-full rounded-full bg-neutral-800"
                 >
                   <div
                     ref={seekFillRef}
@@ -1142,20 +956,19 @@ export default function PlayerBar({
               </div>
               <span
                 ref={seekRemainingRef}
-                className="w-10 text-[11px] tabular-nums text-neutral-400"
+                className="w-10 shrink-0 text-left text-[11px] leading-none tabular-nums text-neutral-400"
               >
                 -{formatDuration(remaining)}
               </span>
             </div>
           </div>
 
-          <div className="hidden w-[var(--ui-player-side)] shrink-0 items-center justify-end gap-1 min-[720px]:flex">
+          <div className="hidden w-[var(--ui-player-side)] shrink-0 items-center justify-end gap-1 pr-[clamp(0.5rem,1vw,1rem)] min-[720px]:flex">
             <button
               type="button"
               onClick={() => player.setAutoplay(!player.autoplay)}
               aria-label={player.autoplay ? "Autoplay on" : "Autoplay off"}
               aria-pressed={player.autoplay}
-              data-queue-toggle
               className={`relative hidden h-9 w-9 items-center justify-center rounded-full transition-[opacity,transform,color] duration-150 ease-out sm:flex ${
                 volumeHover ? "pointer-events-none scale-95 opacity-0" : "scale-100 opacity-100"
               } ${player.autoplay ? "text-white" : "text-neutral-400 hover:text-white"}`}
@@ -1167,34 +980,9 @@ export default function PlayerBar({
                 }`}
               />
             </button>
-            <button
-              type="button"
-              data-queue-toggle
-              aria-label={queueOpen ? "Close queue" : "Open queue"}
-              aria-expanded={queueOpen}
-              onClick={() => {
-                if (queueOpen) {
-                  setQueueOpen(false);
-                  return;
-                }
-
-                setQueueMounted(true);
-                setQueueOpen(false);
-                void loadQueuePanel().finally(() => {
-                  window.requestAnimationFrame(() => {
-                    setQueueOpen(true);
-                  });
-                });
-              }}
-              className={`hidden h-9 w-9 items-center justify-center rounded-full transition-[opacity,transform,color] duration-150 ease-out sm:flex ${
-                volumeHover ? "pointer-events-none scale-95 opacity-0" : "scale-100 opacity-100"
-              } ${queueOpen ? "text-white" : "text-neutral-400 hover:text-white"}`}
-            >
-              <QueueMenuIcon />
-            </button>
             <div
               ref={volumeContainerRef}
-              className="relative flex items-center justify-end py-2"
+              className="relative flex items-center justify-end"
               onMouseEnter={() => setVolumeHover(true)}
               onMouseLeave={() => {
                 if (!draggingVolume.current) setVolumeHover(false);
@@ -1246,6 +1034,144 @@ export default function PlayerBar({
                 </div>
               </div>
             </div>
+            <button
+              type="button"
+              onClick={() => {
+                if (hasLyrics) {
+                  onNavigate({ name: "lyrics" });
+                }
+              }}
+              disabled={!hasLyrics}
+              aria-label={
+                lyricsLoading
+                  ? "Loading lyrics..."
+                  : hasLyrics
+                  ? onLyricsPage
+                    ? "Lyrics open"
+                    : "Open lyrics"
+                  : "No lyrics available"
+              }
+              aria-pressed={onLyricsPage}
+              className={`relative hidden h-9 w-9 items-center justify-center rounded-full transition-[opacity,transform,color] duration-150 ease-out sm:flex ${
+                onLyricsPage
+                  ? "text-white"
+                  : hasLyrics
+                  ? "text-neutral-400 hover:text-white cursor-pointer"
+                  : "text-neutral-400/40 opacity-40 cursor-not-allowed"
+              }`}
+            >
+              <Mic2
+                size={18}
+                className={`transition-opacity duration-150 ${
+                  lyricsLoading ? "opacity-30" : ""
+                }`}
+              />
+              {onLyricsPage && (
+                <span className="absolute bottom-0.5 h-1 w-1 rounded-full bg-white" />
+              )}
+              {lyricsLoading && (
+                <span className="pointer-events-none absolute inset-0 flex items-center justify-center">
+                  <LoaderCircle
+                    size={18}
+                    className="animate-spin text-white"
+                  />
+                </span>
+              )}
+            </button>
+            {onToggleNowPlaying && (
+              <button
+                type="button"
+                disabled={!track}
+                onClick={track ? onToggleNowPlaying : undefined}
+                aria-label={
+                  !track
+                    ? "Now playing unavailable"
+                    : nowPlayingOpen
+                      ? "Close now playing"
+                      : "Open now playing"
+                }
+                aria-pressed={track ? nowPlayingOpen : false}
+                className={`hidden h-9 w-9 items-center justify-center rounded-full transition duration-150 ease-out sm:flex ${
+                  !track
+                    ? "text-neutral-400/40 opacity-40 cursor-not-allowed"
+                    : nowPlayingOpen
+                      ? "bg-white text-black"
+                      : "text-neutral-400 hover:bg-white/10 hover:text-white"
+                }`}
+              >
+                {nowPlayingOpen && track ? <IconPanelRightClose size={18} /> : <IconPanelRightOpen size={18} />}
+              </button>
+            )}
+          </div>
+          <div className="flex items-center gap-1 min-[720px]:hidden">
+            <button
+              type="button"
+              onClick={() => {
+                if (hasLyrics) {
+                  onNavigate({ name: "lyrics" });
+                }
+              }}
+              disabled={!hasLyrics}
+              aria-label={
+                lyricsLoading
+                  ? "Loading lyrics..."
+                  : hasLyrics
+                  ? onLyricsPage
+                    ? "Lyrics open"
+                    : "Open lyrics"
+                  : "No lyrics available"
+              }
+              aria-pressed={onLyricsPage}
+              className={`relative flex h-9 w-9 shrink-0 items-center justify-center rounded-full transition-[opacity,transform,color] duration-150 ease-out ${
+                onLyricsPage
+                  ? "text-white"
+                  : hasLyrics
+                  ? "text-neutral-400 hover:text-white cursor-pointer"
+                  : "text-neutral-400/40 opacity-40 cursor-not-allowed"
+              }`}
+            >
+              <Mic2
+                size={18}
+                className={`transition-opacity duration-150 ${
+                  lyricsLoading ? "opacity-30" : ""
+                }`}
+              />
+              {onLyricsPage && (
+                <span className="absolute bottom-0.5 h-1 w-1 rounded-full bg-white" />
+              )}
+              {lyricsLoading && (
+                <span className="pointer-events-none absolute inset-0 flex items-center justify-center">
+                  <LoaderCircle
+                    size={18}
+                    className="animate-spin text-white"
+                  />
+                </span>
+              )}
+            </button>
+            {onToggleNowPlaying && (
+              <button
+                type="button"
+                disabled={!track}
+                onClick={track ? onToggleNowPlaying : undefined}
+                aria-label={
+                  !track
+                    ? "Now playing unavailable"
+                    : nowPlayingOpen
+                      ? "Close now playing"
+                      : "Open now playing"
+                }
+                aria-pressed={track ? nowPlayingOpen : false}
+                className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-full transition duration-150 ease-out ${
+                  !track
+                    ? "text-neutral-400/40 opacity-40 cursor-not-allowed"
+                    : nowPlayingOpen
+                      ? "bg-white text-black"
+                      : "text-neutral-400 hover:bg-white/10 hover:text-white"
+                }`}
+              >
+                {nowPlayingOpen && track ? <IconPanelRightClose size={18} /> : <IconPanelRightOpen size={18} />}
+              </button>
+            )}
           </div>
         </div>
       </div>
@@ -1258,10 +1184,10 @@ function PlayerBarTrackSave({ track }: { track: MediaTrack }) {
   return (
     <SaveButton
       isSaved={isSaved}
-      size="sm"
+      size="xs"
       onToggle={toggleSave}
       ariaLabel={isSaved ? "Remove from collection" : "Save to collection"}
-      className="!h-5 !w-5"
+      className="!h-[19px] !w-[19px]"
     />
   );
 }

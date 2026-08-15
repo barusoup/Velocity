@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
 import { createPortal } from "react-dom";
-import { GripVertical, History, List, Pause, Play, LoaderCircle, RefreshCw, Trash2 } from "lucide-react";
+import { GripVertical, Pause, Play, LoaderCircle, RefreshCw, Trash2 } from "lucide-react";
 import { usePlayerActions, usePlayerState } from "../player";
 import type { MediaTrack } from "../types";
 import { formatDuration } from "../utils/media";
@@ -10,6 +10,7 @@ import { ArtistCreditText, DEFAULT_ALBUM_ACCENT, useTrackAccents } from "./Pages
 import type { View } from "./Sidebar";
 import { getDirectArtistBrowseId, resolveArtistBrowseId } from "../utils/navigation";
 import { VirtualList } from "./VirtualList";
+import { useContextTrackTarget } from "../hooks/useContextTrackTarget";
 
 type QueueTab = "queued" | "recent";
 type DragOverlayFrame = { top: number; left: number; width: number };
@@ -48,11 +49,10 @@ function muteForOverlay(c: { r: number; g: number; b: number }): { r: number; g:
   return { r: Math.round((rr + m) * 255), g: Math.round((gg + m) * 255), b: Math.round((bb + m) * 255) };
 }
 
-export function QueuePanel({ open, onNavigate }: { open: boolean; onNavigate: (view: View) => void }) {
+export function QueuePanelBody({ tab, open, onNavigate }: { tab: QueueTab; open: boolean; onNavigate: (view: View) => void }) {
   const player = usePlayerState();
   const playerActions = usePlayerActions();
 
-  const [tab, setTab] = useState<QueueTab>("queued");
   const scrollRef = useRef<HTMLDivElement>(null);
   const listRef = useRef<HTMLDivElement>(null);
   const rowLayoutRef = useRef<{ queueIndex: number; top: number; height: number }[]>([]);
@@ -92,6 +92,10 @@ export function QueuePanel({ open, onNavigate }: { open: boolean; onNavigate: (v
       autoplay: player.autoplayTrackIds.has(track.id),
     })),
     [player.autoplayTrackIds, player.queue, player.queueIndex],
+  );
+  const hasClearableQueueTracks = useMemo(
+    () => futureTracks.some((entry) => !entry.autoplay),
+    [futureTracks],
   );
   const allTracks = useMemo(() => {
     const list: { cover?: string | null }[] = [];
@@ -408,47 +412,30 @@ export function QueuePanel({ open, onNavigate }: { open: boolean; onNavigate: (v
 
   return (
     <>
-    <section
-      className={`queue-panel absolute bottom-[calc(100%+0.75rem)] right-0 z-20 flex h-[min(31rem,calc(100dvh-var(--ui-player-height)-2.75rem))] w-[min(28rem,calc(100vw-var(--ui-sidebar-closed)-2rem))] origin-bottom-right transform-gpu flex-col overflow-hidden rounded-xl border border-white/12 bg-neutral-950/90 shadow-[0_22px_80px_rgba(0,0,0,0.55)] backdrop-blur-md transition-[opacity,transform] duration-[320ms] ease-[cubic-bezier(0.16,1,0.3,1)] ${
-        open
-          ? "pointer-events-auto translate-y-0 opacity-100"
-          : "pointer-events-none translate-y-0 opacity-0"
-      }`}
-      aria-label="Playback queue"
-      aria-hidden={!open}
-      inert={!open}
-    >
-      <div className="flex shrink-0 items-center border-b border-white/10 px-4 pt-3">
-        <div className="flex h-10 items-end gap-5" role="tablist" aria-label="Queue views">
-          <QueueTabButton
-            active={tab === "queued"}
-            icon={<List size={16} />}
-            label="Queued"
-            onClick={() => setTab("queued")}
-          />
-          <QueueTabButton
-            active={tab === "recent"}
-            icon={<History size={16} />}
-            label="Recently Played"
-            onClick={() => setTab("recent")}
-          />
-          <button
-            type="button"
-            onClick={() => (tab === "queued" ? playerActions.clearQueue() : playerActions.clearPlaybackHistory())}
-            className="ml-auto flex h-10 items-center gap-2 whitespace-nowrap text-sm font-semibold text-white/48 transition-colors hover:text-white/78"
-            title={tab === "queued" ? "Clear all upcoming tracks from the queue" : "Clear recently played history"}
-          >
-            <Trash2 size={16} />
-            <span>Clear All</span>
-          </button>
-        </div>
-      </div>
-
       <div ref={scrollRef} className="nice-scroll min-h-0 flex-1 overflow-y-auto px-2 pb-5 pt-3">
         {tab === "queued" ? (
           <>
             {player.currentTrack && (
-              <QueueSection label="Now playing">
+              <QueueSection
+                label="Now playing"
+                action={
+                  hasClearableQueueTracks ? (
+                    <button
+                      type="button"
+                      onPointerDown={(e) => e.stopPropagation()}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        playerActions.clearQueue();
+                      }}
+                      title="Clear queue"
+                      aria-label="Clear queue"
+                      className="flex h-5 w-5 items-center justify-center rounded transition-colors text-white/42 hover:text-white"
+                    >
+                      <Trash2 size={13} />
+                    </button>
+                  ) : null
+                }
+              >
                 <QueueTrackRow
                   track={player.currentTrack}
                   active
@@ -474,26 +461,43 @@ export function QueuePanel({ open, onNavigate }: { open: boolean; onNavigate: (v
                     <div key={`${entry.track.id}-${entry.queueIndex}`}>
                       {startsSection && (
                         <div
-                          className="flex items-center gap-1.5 px-3 pb-1.5 pt-2 text-[12px] font-semibold text-white/42"
+                          className="flex items-center justify-between px-3 pb-1.5 pt-2 text-[12px] font-semibold text-white/42"
                           style={{
                             transform: `translateY(${isGapAtFirstSection ? 0 : shift}px)`,
                             transition: dragFromIndex !== null ? "transform 200ms cubic-bezier(0.22, 1, 0.36, 1)" : "none",
                           }}
                         >
-                          <span>{sectionLabel}</span>
-                          {entry.autoplay && (
+                          <div className="flex items-center gap-1.5">
+                            <span>{sectionLabel}</span>
+                            {entry.autoplay && (
+                              <button
+                                type="button"
+                                onClick={() => playerActions.reloadAutoplay()}
+                                disabled={player.autoplaySeed?.videoId === player.currentTrack?.videoId || player.isReloadingAutoplay}
+                                aria-label="Reload autoplay"
+                                className={`flex h-5 w-5 items-center justify-center rounded-full transition-colors duration-150 ${
+                                  player.autoplaySeed?.videoId === player.currentTrack?.videoId || player.isReloadingAutoplay
+                                    ? "pointer-events-none text-white/20"
+                                    : "text-white/42 hover:text-white/80"
+                                }`}
+                              >
+                                <RefreshCw size={12} className={player.isReloadingAutoplay ? "animate-spin" : ""} />
+                              </button>
+                            )}
+                          </div>
+                          {index === 0 && !player.currentTrack && hasClearableQueueTracks && (
                             <button
                               type="button"
-                              onClick={() => playerActions.reloadAutoplay()}
-                              disabled={player.autoplaySeed?.videoId === player.currentTrack?.videoId || player.isReloadingAutoplay}
-                              aria-label="Reload autoplay"
-                              className={`flex h-5 w-5 items-center justify-center rounded-full transition-colors duration-150 ${
-                                player.autoplaySeed?.videoId === player.currentTrack?.videoId || player.isReloadingAutoplay
-                                  ? "pointer-events-none text-white/20"
-                                  : "text-white/42 hover:text-white/80"
-                              }`}
+                              onPointerDown={(e) => e.stopPropagation()}
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                playerActions.clearQueue();
+                              }}
+                              title="Clear queue"
+                              aria-label="Clear queue"
+                              className="flex h-5 w-5 items-center justify-center rounded transition-colors text-white/42 hover:text-white"
                             >
-                              <RefreshCw size={12} className={player.isReloadingAutoplay ? "animate-spin" : ""} />
+                              <Trash2 size={13} />
                             </button>
                           )}
                         </div>
@@ -523,7 +527,24 @@ export function QueuePanel({ open, onNavigate }: { open: boolean; onNavigate: (v
             )}
           </>
         ) : player.recentlyPlayed.length > 0 ? (
-          <QueueSection label="Recently played">
+          <QueueSection
+            label="Recently played"
+            action={
+              <button
+                type="button"
+                onPointerDown={(e) => e.stopPropagation()}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  playerActions.clearPlaybackHistory();
+                }}
+                title="Clear history"
+                aria-label="Clear history"
+                className="flex h-5 w-5 items-center justify-center rounded transition-colors text-white/42 hover:text-white"
+              >
+                <Trash2 size={13} />
+              </button>
+            }
+          >
             <VirtualList
               items={player.recentlyPlayed}
               enabled={open}
@@ -556,7 +577,6 @@ export function QueuePanel({ open, onNavigate }: { open: boolean; onNavigate: (v
           <EmptyQueue label="Songs you finish or skip will appear here" />
         )}
       </div>
-    </section>
       {draggedTrack && dragFromIndex !== null && dragOverlayFrame !== null && typeof document !== "undefined"
         ? createPortal(
           <DragOverlay
@@ -613,43 +633,21 @@ function DragOverlay({
   );
 }
 
-function QueueTabButton({
-  active,
-  icon,
+function QueueSection({
   label,
-  onClick,
+  action,
+  children,
 }: {
-  active: boolean;
-  icon: React.ReactNode;
   label: string;
-  onClick: () => void;
+  action?: React.ReactNode;
+  children: React.ReactNode;
 }) {
   return (
-    <button
-      type="button"
-      role="tab"
-      aria-selected={active}
-      onClick={onClick}
-      className={`relative flex h-10 items-center gap-2 whitespace-nowrap text-sm font-semibold transition-colors ${
-        active ? "text-white" : "text-white/48 hover:text-white/78"
-      }`}
-    >
-      {icon}
-      <span>{label}</span>
-      <span
-        className={`absolute inset-x-0 bottom-0 h-0.5 bg-white transition-transform duration-150 ${
-          active ? "scale-x-100" : "scale-x-0"
-        }`}
-        aria-hidden="true"
-      />
-    </button>
-  );
-}
-
-function QueueSection({ label, children }: { label: string; children: React.ReactNode }) {
-  return (
     <div>
-      <div className="px-3 pb-1.5 text-[12px] font-semibold text-white/42">{label}</div>
+      <div className="flex items-center justify-between px-3 pb-1.5 text-[12px] font-semibold text-white/42">
+        <span>{label}</span>
+        {action}
+      </div>
       {children}
     </div>
   );
@@ -679,6 +677,7 @@ function QueueTrackRow({
   onNavigate?: (view: View) => void;
 }) {
   const directArtistBrowseId = getDirectArtistBrowseId(track);
+  const contextTarget = useContextTrackTarget(track);
   const handleResolveNavigate = useCallback(() => {
     if (!onNavigate) return;
     void resolveArtistBrowseId(track)
@@ -700,6 +699,7 @@ function QueueTrackRow({
 
   return (
     <div
+      {...contextTarget}
       data-queue-index={queueIndex}
       draggable={false}
       onPointerDown={onPointerDragStart}
@@ -773,9 +773,9 @@ function QueueTrackRow({
   );
 }
 
-function EmptyQueue({ label }: { label: string }) {
+function EmptyQueue({ label, className }: { label: string; className?: string }) {
   return (
-    <div className="flex min-h-32 items-center justify-center px-5 text-center text-sm font-medium text-white/38">
+    <div className={`px-4 pt-0 pb-2 text-center text-xs font-medium text-white/38 ${className ?? ""}`}>
       {label}
     </div>
   );

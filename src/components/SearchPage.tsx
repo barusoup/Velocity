@@ -27,8 +27,9 @@ import {
   SearchItemMeta,
   toTrack,
 } from "./PagesShared";
-import { getSearchItemArtist } from "../utils/search";
 import { Marquee } from "./Marquee";
+import { createTrackFromSearchItem } from "../utils/track-factory";
+import { dedupeMusicVideoTitledSongs, filterSearchMusicVideoRows } from "../utils/search";
 
 export function SearchPage({
   query,
@@ -134,16 +135,39 @@ export function SearchPage({
   }, [query, retryToken]);
 
   useEffect(() => {
-    const items: SearchItem[] = [];
-    if (state.data?.topResult) items.push(state.data.topResult);
-    for (const item of state.data?.results ?? []) {
-      if (!items.some((existing) => existing.id === item.id)) items.push(item);
+    const topItem = state.data?.topResult;
+    const results = state.data?.results ?? [];
+    // Throttled prefetch: only warm the top result + first 4 songs.
+    // The previous loop prefetched lyrics for every search hit (up to 50
+    // concurrent get_synced_lyrics IPCs) which saturated the backend and
+    // caused the UI to freeze after each keystroke. Queue-based prefetch
+    // with concurrency 2 already handles upcoming tracks; search should be
+    // minimal.
+    const candidates: SearchItem[] = [];
+    if (topItem) candidates.push(topItem);
+    for (const item of results) {
+      if (candidates.length >= 5) break;
+      if (!candidates.some((existing) => existing.id === item.id)) candidates.push(item);
     }
-    for (const item of items) {
-      if (item.kind !== "song") continue;
-      if (!item.videoId) continue;
-      void getSyncedLyrics(item.videoId).catch(() => {});
-    }
+    let cancelled = false;
+    let index = 0;
+    const pump = () => {
+      if (cancelled) return;
+      while (index < candidates.length) {
+        const item = candidates[index++]!;
+        if (item.kind !== "song" || !item.videoId) continue;
+        void getSyncedLyrics(item.videoId).catch(() => {});
+        // Stagger by one microtask so we don't burst 5 invokes in same frame.
+        if (index < candidates.length) {
+          queueMicrotask(pump);
+          break;
+        }
+      }
+    };
+    pump();
+    return () => {
+      cancelled = true;
+    };
   }, [state.data]);
 
   const top = state.data?.topResult;
@@ -151,10 +175,18 @@ export function SearchPage({
   const isDefaultFilterView =
     filters.types.length === DEFAULT_SEARCH_FILTERS.types.length &&
     filters.sortBy === DEFAULT_SEARCH_FILTERS.sortBy;
+  // Drop duplicate and standalone music-video-titled rows when a clean
+  // studio row for the song exists (see `dedupeMusicVideoTitledSongs` +
+  // `filterSearchMusicVideoRows`). Applied before the filter/sort pass so
+  // both the default and filtered views stay clean.
+  const dedupedResults = useMemo(
+    () => filterSearchMusicVideoRows(dedupeMusicVideoTitledSongs(results), query),
+    [query, results],
+  );
   const sortableResults = useMemo(() => {
-    if (!top || isDefaultFilterView) return results;
-    return [top, ...results.filter((item) => item.id !== top.id)];
-  }, [isDefaultFilterView, results, top]);
+    if (!top || isDefaultFilterView) return dedupedResults;
+    return [top, ...dedupedResults.filter((item) => item.id !== top.id)];
+  }, [isDefaultFilterView, dedupedResults, top]);
   const filteredTop = isDefaultFilterView && top && passesSearchFilters(top, filters) ? top : null;
   const filteredResults = useMemo(() => applySearchFilters(sortableResults, filters), [sortableResults, filters]);
   const hasUnfilteredResults = Boolean(top || results.length);
@@ -624,26 +656,7 @@ function SearchItemSaveButtons({
 
 function toSaveableTrack(item: SearchItem): MediaTrack | null {
   if (item.kind !== "song" && item.kind !== "video") return null;
-  if (!item.videoId) return null;
-  const id = item.albumBrowseId
-    ? `yt:${item.videoId}:${item.albumBrowseId}`
-    : `yt:${item.videoId}`;
-  return {
-    id,
-    kind: item.kind,
-    title: item.title,
-    artist: getSearchItemArtist(item),
-    album: item.album ?? null,
-    albumBrowseId: item.albumBrowseId ?? null,
-    artistBrowseId: item.artistBrowseId ?? null,
-    artistCredits: item.artistCredits ?? null,
-    durationSeconds: item.durationSeconds ?? null,
-    playCount: item.playCount ?? null,
-    cover: item.cover ?? null,
-    videoId: item.videoId,
-    source: "stream",
-    filePath: null,
-  };
+  return createTrackFromSearchItem(item);
 }
 
 function browseIdFromSearchItemId(id: string): string | null {

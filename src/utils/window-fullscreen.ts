@@ -97,9 +97,8 @@ export async function toggleFullscreenWithBoundsRestore(): Promise<void> {
   const win = getCurrentWindow();
 
   try {
-    let inAppFs = appPseudoFullscreen;
     try {
-      inAppFs = await invoke<boolean>("is_app_fullscreen");
+      await invoke<boolean>("is_app_fullscreen");
     } catch {
       // Fall back to the last known pseudo-fullscreen state.
     }

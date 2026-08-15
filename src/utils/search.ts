@@ -1,4 +1,5 @@
 import type { ArtistCredit, SearchItem } from "../types";
+import { cleanAutoplaySearchTitle, normalizeText, titleLooksLikeMusicVideo } from "./track-titles";
 
 export const PLACEHOLDER_ARTIST = "Unknown artist";
 
@@ -88,4 +89,78 @@ export function getSearchItemArtist(
   }
 
   return PLACEHOLDER_ARTIST;
+}
+
+/**
+ * Compensate for mislabeled search rows. When the same song appears both as
+ * a clean studio-titled row and as a music-video-titled row ("Song (Official
+ * Music Video)"), keep only the clean studio row so search results don't
+ * show duplicate entries for one song.
+ *
+ * Deliberately conservative: a video-titled row that is the ONLY
+ * representation of its song is always kept — dropping it would remove the
+ * song from search entirely, and the playback layer resolves its videoId to
+ * the studio audio anyway.
+ */
+export function dedupeMusicVideoTitledSongs(
+  items: readonly SearchItem[],
+): SearchItem[] {
+  const byBaseTitle = new Map<string, SearchItem[]>();
+  for (const item of items) {
+    if (item.kind !== "song") continue;
+    const base = normalizeText(cleanAutoplaySearchTitle(item.title));
+    if (!base) continue;
+    const group = byBaseTitle.get(base);
+    if (group) group.push(item);
+    else byBaseTitle.set(base, [item]);
+  }
+
+  const droppedIds = new Set<string>();
+  for (const group of byBaseTitle.values()) {
+    const cleanRows = group.filter((item) => !titleLooksLikeMusicVideo(item.title));
+    if (cleanRows.length === 0 || cleanRows.length === group.length) continue;
+    for (const item of group) {
+      if (titleLooksLikeMusicVideo(item.title)) droppedIds.add(item.id);
+    }
+  }
+
+  if (droppedIds.size === 0) return [...items];
+  return items.filter((item) => !droppedIds.has(item.id));
+}
+
+/**
+ * Drop music-video-titled song rows from search results whenever a clean
+ * studio song row meaningfully matches the query ("Paranoid Android" should
+ * appear once, as the studio cut — not twice with a "(Official Music Video)"
+ * twin). A video-titled row is kept only when it is the song's only
+ * representation in the results, so dropping it could not empty the search;
+ * the playback layer resolves that videoId to studio audio anyway.
+ */
+export function filterSearchMusicVideoRows(
+  items: readonly SearchItem[],
+  query: string,
+): SearchItem[] {
+  const videoTitled = items.filter(
+    (item) => item.kind === "song" && titleLooksLikeMusicVideo(item.title),
+  );
+  if (videoTitled.length === 0) return [...items];
+
+  const cleanRows = items.filter(
+    (item) => !(item.kind === "song" && titleLooksLikeMusicVideo(item.title)),
+  );
+  const queryTokens = new Set(normalizeText(query).split(/\s+/).filter(Boolean));
+  if (queryTokens.size === 0) return [...items];
+
+  const overlapThreshold = Math.min(2, queryTokens.size);
+  const hasCleanSongMatch = cleanRows.some((item) => {
+    if (item.kind !== "song") return false;
+    const itemTokens = new Set(normalizeText(item.title).split(/\s+/).filter(Boolean));
+    let overlap = 0;
+    for (const token of itemTokens) {
+      if (queryTokens.has(token)) overlap += 1;
+    }
+    return overlap >= overlapThreshold;
+  });
+
+  return hasCleanSongMatch ? cleanRows : [...items];
 }

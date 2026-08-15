@@ -16,13 +16,14 @@ const TASTE_SAMPLE_INTERVAL_MS = 1000;
  */
 export function useTasteProfileTracking(): void {
   const showHomeMenu = useSetting("showHomeMenu");
-  const { currentTrack, duration, isPlaying, seekRevision } = usePlayerState();
+  const { currentTrack, duration, isPlaying } = usePlayerState();
   const sessionRef = useRef<ListenSession | null>(null);
-  const seekRevisionRef = useRef(seekRevision);
+  const currentTrackRef = useRef(currentTrack);
+  const effectiveDurationRef = useRef(0);
 
   useEffect(() => {
-    seekRevisionRef.current = seekRevision;
-  }, [seekRevision]);
+    currentTrackRef.current = currentTrack;
+  }, [currentTrack]);
 
   useEffect(() => {
     if (!showHomeMenu || !currentTrack) {
@@ -33,15 +34,16 @@ export function useTasteProfileTracking(): void {
     const effectiveDuration =
       duration > 0 ? duration : currentTrack.durationSeconds ?? 0;
     if (!Number.isFinite(effectiveDuration) || effectiveDuration <= 0) return;
+    effectiveDurationRef.current = effectiveDuration;
 
     const sample = () => {
-      const track = currentTrack;
+      const track = currentTrackRef.current;
       if (!track) return;
 
       const { session, newlyQualified } = sampleListenProgress(sessionRef.current, {
         trackId: track.id,
         progress: getPlayerProgress(),
-        duration: effectiveDuration,
+        duration: effectiveDurationRef.current,
         isPlaying: usePlayerUiStore.getState().isPlaying,
         qualifyRatio: LISTEN_QUALIFY_RATIO,
       });
@@ -52,8 +54,11 @@ export function useTasteProfileTracking(): void {
       }
     };
 
+    // Reset session when track changes; seekRevision is handled inside
+    // sampleListenProgress via progress resets, not by restarting the timer.
+    sessionRef.current = null;
     sample();
     const timer = window.setInterval(sample, TASTE_SAMPLE_INTERVAL_MS);
     return () => window.clearInterval(timer);
-  }, [showHomeMenu, currentTrack, duration, isPlaying, seekRevision]);
+  }, [showHomeMenu, currentTrack?.id, duration, isPlaying]);
 }

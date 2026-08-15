@@ -1,6 +1,11 @@
 import { cacheArtwork, peekCachedArtwork } from "../api";
+import { capThumbnailUrl } from "../components/Shared";
 
 const DEFAULT_CONCURRENCY = 6;
+
+// Preload at a size that covers rows, cards and features. Larger contexts
+// (hero/now-playing) fetch their own bigger variant on demand.
+const PRELOAD_SIZE = 256;
 
 function normalizeArtworkUrl(url: string): string | null {
   const trimmed = url.trim();
@@ -13,7 +18,7 @@ function normalizeArtworkUrl(url: string): string | null {
   ) {
     return null;
   }
-  return normalized;
+  return capThumbnailUrl(normalized, PRELOAD_SIZE);
 }
 
 /** Deduplicated remote artwork URLs that are not already in the session cache. */

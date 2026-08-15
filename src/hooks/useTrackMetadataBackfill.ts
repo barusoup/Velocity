@@ -1,4 +1,4 @@
-import { useLayoutEffect, useRef } from "react";
+import { useEffect, useRef } from "react";
 import type { MediaTrack } from "../types";
 import {
   isTrackMetadataBackfillExhausted,
@@ -22,11 +22,7 @@ export function useTrackMetadataBackfill(
   const onTracksChangeRef = useRef(onTracksChange);
   onTracksChangeRef.current = onTracksChange;
 
-  const tracksKey = tracks
-    .map((track) => `${track.id}:${track.durationSeconds ?? ""}:${track.playCount ?? ""}`)
-    .join("|");
-
-  useLayoutEffect(() => {
+  useEffect(() => {
     const missing = tracks.filter(
       (track) =>
         !!track.videoId &&
@@ -106,5 +102,5 @@ export function useTrackMetadataBackfill(
     void backfill();
 
     return () => controller.abort();
-  }, [tracksKey, backfillDuration, backfillPlayCount, tracks]);
+  }, [tracks, backfillDuration, backfillPlayCount]);
 }

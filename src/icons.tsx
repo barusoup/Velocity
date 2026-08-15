@@ -169,6 +169,22 @@ export const IconPanelLeftOpen = ({ size, ...p }: IconProps) => (
   </svg>
 );
 
+export const IconPanelRightClose = ({ size, ...p }: IconProps) => (
+  <svg {...base(size, p)}>
+    <rect x="3" y="4" width="18" height="16" rx="2" />
+    <path d="M15 4v16" />
+    <path d="m8 15 3-3-3-3" />
+  </svg>
+);
+
+export const IconPanelRightOpen = ({ size, ...p }: IconProps) => (
+  <svg {...base(size, p)}>
+    <rect x="3" y="4" width="18" height="16" rx="2" />
+    <path d="M15 4v16" />
+    <path d="m10 15-3-3 3-3" />
+  </svg>
+);
+
 export const IconSettings = ({ size, ...p }: IconProps) => (
   <svg {...base(size, p)}>
     <circle cx="12" cy="12" r="3" />

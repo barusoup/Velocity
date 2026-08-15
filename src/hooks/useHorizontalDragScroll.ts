@@ -123,6 +123,15 @@ export function useHorizontalDragScroll() {
     const strip = stripRef.current;
     if (!strip) return;
 
+    // If pointerdown is in the scrollbar region, let native scrollbar handle it
+    const rect = strip.getBoundingClientRect();
+    if (
+      event.clientY > rect.top + strip.clientHeight ||
+      event.clientX > rect.left + strip.clientWidth
+    ) {
+      return;
+    }
+
     cancelScrollAnimation(state);
 
     state.pointerId = event.pointerId;

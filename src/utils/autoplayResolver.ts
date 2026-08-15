@@ -1,5 +1,6 @@
 import type { MediaTrack } from "../types";
 import { isAutoplayWatchPlaylistCandidate, isLikelyMusicVideoTrack } from "./media";
+import { isVariantRecordingTitle, titleLooksLikeMusicVideo } from "./track-titles";
 
 /**
  * Pure resolver for the autoplay queue refill.
@@ -79,7 +80,15 @@ function isAcceptableAutoplayEntry(
   seen: SeenIndex,
   deps: AutoplayResolverDeps,
 ): boolean {
+  // Unwanted media (music videos + variant recordings like live/remix) must
+  // never be queued as-is, even after a resolver's replacement attempt. The
+  // resolver itself already tries to swap these to their studio cut and
+  // drops the row when no studio exists; this second gate catches any
+  // remaining unwanted title that slipped through (defense in depth).
   if (isLikelyMusicVideoTrack(entry)) return false;
+  if (titleLooksLikeMusicVideo(entry.title)) return false;
+  if (isVariantRecordingTitle(entry.title)) return false;
+  if (entry.kind === "video") return false;
   if (seen.ids.has(entry.id)) return false;
   if (entry.videoId != null && seen.videoIds.has(entry.videoId)) return false;
   if (seen.artistTitles.has(`${entry.artist}\0${entry.title}`.toLowerCase())) return false;

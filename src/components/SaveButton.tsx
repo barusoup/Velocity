@@ -15,12 +15,13 @@ import { cn } from "../utils/cn";
 //            the Album header (~h-10 w-10). Hover turns the icon white.
 //   * "md" — album rows on the full discography page (~h-8 w-8).
 //   * "sm" — compact pill for track rows / queue rows / player bar (~h-7 w-7).
+//   * "xs" — compact displays like the player bar (~h-6 w-6).
 //
 // The toggle uses a quick Spotify-like pop: the green disc blooms in and
 // the check settles into place.
 // ---------------------------------------------------------------------------
 
-type SaveButtonSize = "lg" | "md" | "sm";
+type SaveButtonSize = "lg" | "md" | "sm" | "xs";
 
 export type SaveButtonProps = {
   isSaved: boolean;
@@ -85,11 +86,29 @@ export const SaveButton = memo(function SaveButton({
   // pixel-matched between states. The plus icon draws its own circle; the
   // saved state gets a green inner disc at that same box size.
   const dimensions =
-    size === "lg" ? "h-10 w-10" : size === "md" ? "h-8 w-8" : "h-7 w-7";
+    size === "lg"
+      ? "h-10 w-10"
+      : size === "md"
+        ? "h-8 w-8"
+        : size === "sm"
+          ? "h-7 w-7"
+          : "h-6 w-6";
   const iconDiscDimensions =
-    size === "lg" ? "h-7 w-7" : size === "md" ? "h-[22px] w-[22px]" : "h-4 w-4";
+    size === "lg"
+      ? "h-7 w-7"
+      : size === "md"
+        ? "h-[22px] w-[22px]"
+        : size === "sm"
+          ? "h-4 w-4"
+          : "h-3.5 w-3.5";
   const savedIconDimensions =
-    size === "lg" ? "h-[18px] w-[18px]" : size === "md" ? "h-3.5 w-3.5" : "h-2.5 w-2.5";
+    size === "lg"
+      ? "h-[18px] w-[18px]"
+      : size === "md"
+        ? "h-3.5 w-3.5"
+        : size === "sm"
+          ? "h-2.5 w-2.5"
+          : "h-2 w-2";
 
   // One glyph per state. The saved check is intentionally smaller than the
   // disc around it, matching Spotify's compact black tick inside the green
@@ -134,7 +153,7 @@ export const SaveButton = memo(function SaveButton({
         <span className="absolute inset-0 flex items-center justify-center text-white">
           <LoaderCircle
             className="animate-spin"
-            size={size === "lg" ? 24 : size === "md" ? 18 : 14}
+            size={size === "lg" ? 24 : size === "md" ? 18 : size === "sm" ? 14 : 12}
           />
         </span>
       )}

@@ -8,6 +8,7 @@ import {
   streamIdentityVideoIds,
 } from "./utils/media";
 import { isPlaceholderArtist } from "./utils/search";
+import { isVariantRecordingTitle, titleLooksLikeMusicVideo } from "./utils/track-titles";
 
 export const TASTE_PROFILE_KEY = "velocity-taste-profile";
 
@@ -442,11 +443,19 @@ export function storeDailyRecommendations(tracks: MediaTrack[], now = Date.now()
   return next;
 }
 
+function isUnwantedCachedRecommendation(track: MediaTrack): boolean {
+  if (isLikelyMusicVideoTrack(track)) return true;
+  if (titleLooksLikeMusicVideo(track.title)) return true;
+  if (isVariantRecordingTitle(track.title)) return true;
+  if (track.kind === "video") return true;
+  return false;
+}
+
 export function getCachedDailyRecommendations(now = Date.now()): MediaTrack[] | null {
   const state = loadTasteProfile();
   if (state.dailyRecommendations?.date !== todayDateKey(now)) return null;
   return dedupeTracksBySong(state.dailyRecommendations.tracks).filter(
-    (track) => !isLikelyMusicVideoTrack(track),
+    (track) => !isUnwantedCachedRecommendation(track),
   );
 }
 

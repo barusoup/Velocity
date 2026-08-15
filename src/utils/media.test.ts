@@ -7,6 +7,7 @@ import {
   isSameSongTrack,
   isSameStreamPlayback,
   preferStudioSongTrack,
+  readLiveMediaDuration,
 } from "./media";
 
 function streamTrack(
@@ -171,5 +172,41 @@ describe("exportStreamVideoId", () => {
         videoId: null,
       }),
     ).toBeNull();
+  });
+});
+
+describe("readLiveMediaDuration", () => {
+  function fakeAudio(overrides: Partial<HTMLAudioElement>): HTMLAudioElement {
+    return {
+      duration: NaN,
+      seekable: { length: 0, start: () => 0, end: () => 0 },
+      ...overrides,
+    } as unknown as HTMLAudioElement;
+  }
+
+  it("prefers a finite element duration over metadata", () => {
+    const audio = fakeAudio({ duration: 200 });
+    expect(readLiveMediaDuration(audio, 210)).toBe(200);
+  });
+
+  it("prefers metadata over the buffered seekable range for streams", () => {
+    const audio = fakeAudio({
+      duration: Infinity,
+      seekable: { length: 1, start: () => 0, end: () => 90 } as TimeRanges,
+    });
+    expect(readLiveMediaDuration(audio, 210)).toBe(210);
+  });
+
+  it("falls back to the seekable range when no metadata is available", () => {
+    const audio = fakeAudio({
+      duration: Infinity,
+      seekable: { length: 1, start: () => 0, end: () => 90 } as TimeRanges,
+    });
+    expect(readLiveMediaDuration(audio, null)).toBe(90);
+  });
+
+  it("returns 0 when nothing is usable", () => {
+    const audio = fakeAudio({ duration: Infinity });
+    expect(readLiveMediaDuration(audio, null)).toBe(0);
   });
 });

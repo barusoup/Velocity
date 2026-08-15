@@ -8,8 +8,10 @@ import {
 } from "lucide-react";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { deviceExportVideoIds, savePlaylistToMp3 } from "../api";
+import { getSetting } from "../settings";
 import { useDeviceExport } from "../hooks/useDeviceExport";
-import { exportStreamVideoId, sanitizeFilename } from "../utils/media";
+import { exportStreamVideoId } from "../utils/media";
+import { safeTrackFileName } from "../utils/save-helpers";
 import { SavingPanel } from "./SavingPanel";
 import type { UserPlaylist } from "../playlists";
 
@@ -156,7 +158,7 @@ function PlaylistContextMenuContent({
             album: track.album ?? null,
             trackNumber: idx + 1,
             coverUrl: track.cover ?? null,
-            fileName: sanitizeFilename(track.title || "track"),
+            fileName: safeTrackFileName(track.title),
           };
         });
         return savePlaylistToMp3({
@@ -167,6 +169,7 @@ function PlaylistContextMenuContent({
           // (or null). The backend decodes both shapes — data URL and
           // http URL — so we just hand the string through unchanged.
           coverUrl: playlist.cover ?? null,
+          format: getSetting("exportFormat"),
           tracks: resolvedTracks,
         });
       },

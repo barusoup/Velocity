@@ -12,12 +12,12 @@ import {
   prefetchSyncedLyricsForTrack,
 } from "./api";
 import { setCachedLoudness, getCachedLoudness, LOUDNESS_CACHE_MAX_ENTRIES } from "./normalization";
-import { compactQueueForHistorySnapshot, PLAYBACK_HISTORY_QUEUE_SNAPSHOT_MAX } from "./utils/playback-history-snapshot";
+import { compactQueueForHistorySnapshot, PLAYBACK_HISTORY_QUEUE_SNAPSHOT_MAX } from "./player/playback-history-snapshot";
 import { registerContextTrack, lookupContextTrack } from "./utils/track-context-registry";
 import {
   addVisitedQueueTrack,
   resetVisitedQueueTracks,
-} from "./utils/queue-visited";
+} from "./player/queue-visited";
 
 function sampleTrack(overrides: Partial<MediaTrack> & { id: string }): MediaTrack {
   return {

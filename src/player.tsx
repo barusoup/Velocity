@@ -25,7 +25,8 @@ import {
   invalidateWatchPlaylist,
   resolveStream,
 } from "./api";
-import type { LoudnessData, MediaTrack, QueueOrigin } from "./types";
+import type { MediaTrack, QueueOrigin } from "./types";
+import { useCollectionStore } from "./store/collectionStore";
 import { usePlayerUiStore } from "./store/playerUiStore";
 import {
   DEFAULT_VOLUME,
@@ -44,7 +45,6 @@ import {
 import {
   hasAttemptedLeadingSilenceAnalysis,
   LEADING_SILENCE_DETECT_TIMEOUT_MS,
-  resolveLeadingSilenceSkipSeconds,
   setCachedLeadingSilence,
 } from "./leading-silence";
 import { getSetting, setSetting, SETTINGS_KEY, useSetting } from "./settings";
@@ -57,6 +57,7 @@ import {
   readLiveMediaDuration,
   readDuration,
   remapQueueStartIndex,
+  resolveFileMediaSrc,
   streamIdentityVideoIds,
 } from "./utils/media";
 import {
@@ -64,12 +65,12 @@ import {
   resolveTrackMetadata,
 } from "./utils/track-metadata-backfill";
 import {
-  isUnplayableStreamError,
   resolveAutoplayEntryToSong,
   resolveStreamTrackAudio,
   resolveStreamTrackAudioFallback,
 } from "./utils/song-resolution";
 import { resolveAutoplayAdditions } from "./utils/autoplayResolver";
+import { createSemaphore } from "./utils/concurrency";
 import {
   addVisitedQueueTrack,
   findPreviousVisitedQueueIndex,
@@ -77,8 +78,39 @@ import {
   resetVisitedQueueTracks,
   resolveHistoryVisitedTrackIds,
   restoreVisitedQueueTracks,
-} from "./utils/queue-visited";
-import { compactQueueForHistorySnapshot } from "./utils/playback-history-snapshot";
+} from "./player/queue-visited";
+import {
+  compactQueueForHistorySnapshot
+} from "./player/playback-history-snapshot";
+import {
+  bootAutoplaySeed,
+  buildLoudnessPreviewStarts,
+  buildRecentlyPlayedSet,
+  buildSeenIndex,
+  clampVolume,
+  describeMediaError,
+  findPreviousSessionHistoryIndex,
+  getAudioCacheKey,
+  historyRestoreWouldDropAppendedTracks,
+  isInRecentlyPlayed,
+  isPlaybackIdleLongEnough,
+  isRedoingQueueAdvance,
+  isStaleLoadError,
+  isUsefulPreviewLoudness,
+  parseSavedSessionRaw,
+  playbackEntryMatchesQueueSession,
+  playbackNeedsSourceRefresh,
+  prependPlaybackHistoryEntry,
+  queueOriginEquals,
+  readAudioElementDuration,
+  readMuted,
+  readVolume,
+  shuffledCopy,
+  waitForMediaReady,
+  withTimeout,
+  type PlaybackHistoryEntry,
+  type SavedSession,
+} from "./player/helpers";
 
 export const currentAudio: { current: HTMLAudioElement | null } = { current: null };
 
@@ -173,9 +205,6 @@ const AUTOPLAY_QUEUE_TARGET = 10;
 const AUTOPLAY_QUEUE_BATCH_LIMIT = 20;
 const PREFETCH_AHEAD = 5;
 const LOUDNESS_PREVIEW_CHUNK_SECONDS = 16;
-const LOUDNESS_PREVIEW_MIN_PEAK_DB = -35;
-const LOUDNESS_PREVIEW_MIN_LUFS = -45;
-const RECENTLY_PLAYED_LIMIT = 50;
 // Total attempts = 1 initial + (MAX_LOAD_ATTEMPTS - 1) retries, spaced by RETRY_DELAY_MS.
 // The retry budget must be generous enough for the Rust backend's yt-dlp to
 // finish and cache its result on a cold start (can take 10-15+ seconds).
@@ -183,7 +212,19 @@ const RECENTLY_PLAYED_LIMIT = 50;
 // because the backend's disk cache (45-min TTL) serves the retry instantly.
 const MAX_LOAD_ATTEMPTS = 3;
 const RETRY_DELAY_MS = [700, 1500, 3500];
-const STREAM_RESOLVE_TIMEOUT_MS = 12_000;
+// The Rust backend bounds a single yt-dlp download at STREAM_RESOLVE_TIMEOUT
+// (90s). On cold start — and especially on macOS, where Rosetta plus a cold
+// yt-dlp/deno spawn adds seconds — a real download can take 10-30s. A 12s
+// frontend timeout made every slow first load "fail" and then retry, which
+// spawned *more* concurrent yt-dlp jobs and compounded the macOS freeze.
+// 45s covers slow links too; the backend also dedupes in-flight downloads
+// per video id, so a retry waits on the same yt-dlp run instead of spawning
+// a second one.
+const STREAM_RESOLVE_TIMEOUT_MS = 45_000;
+// At most this many yt-dlp stream downloads run at once across prefetch +
+// active-track resolution, so a hung backend can't wedge the whole queue.
+const STREAM_PREFETCH_CONCURRENCY = 2;
+const streamPrefetchSemaphore = createSemaphore(STREAM_PREFETCH_CONCURRENCY);
 // How long to wait for a YT Music watch-playlist response before treating
 // the attempt as a failed autoplay fetch and trigging a retry. Keeps the
 // first song of a session (slow cold start) from leaving the queue empty.
@@ -195,32 +236,12 @@ const AUTOPLAY_RETRY_BASE_DELAY_MS = 3_000;
 // than this. Slightly under the Rust STREAM_CACHE_TTL (45 min) so a cached
 // file deleted server-side while the app sat paused cannot leave the media
 // element reading a ghost path and skipping mid-track.
-const STALE_PLAYBACK_MS = 40 * 60 * 1000;
 const SESSION_KEY = "velocity-session";
-const SESSION_MAX_AGE_MS = 86_400_000;
-
-type SavedSession = {
-  track: MediaTrack;
-  progress: number;
-  savedAt: number;
-};
 
 type BootRestorePending = {
   trackId: string;
   progress: number;
 };
-
-function parseSavedSessionRaw(raw: string | null): SavedSession | null {
-  if (!raw) return null;
-  try {
-    const data = JSON.parse(raw) as SavedSession;
-    if (!data?.track?.id || typeof data.progress !== "number") return null;
-    if (Date.now() - data.savedAt > SESSION_MAX_AGE_MS) return null;
-    return data;
-  } catch {
-    return null;
-  }
-}
 
 let cachedBootSession: SavedSession | null | undefined;
 
@@ -244,82 +265,9 @@ function getBootSession(): SavedSession | null {
   return cachedBootSession;
 }
 
-function bootAutoplaySeed(session: SavedSession): AutoplaySeed | null {
-  const restored = session.track;
-  const seedVideoId =
-    restored.source === "stream"
-      ? restored.resolvedVideoId ?? restored.videoId ?? null
-      : null;
-  return seedVideoId ? { videoId: seedVideoId, playlistId: null } : null;
-}
-
 type WebAudioWindow = Window & {
   webkitAudioContext?: typeof AudioContext;
 };
-
-function clampVolume(value: number): number {
-  return Number.isFinite(value) ? Math.max(0, Math.min(1, value)) : DEFAULT_VOLUME;
-}
-
-function readAudioElementDuration(audio: HTMLAudioElement): number | null {
-  const value = readLiveMediaDuration(audio);
-  return value > 0 ? value : null;
-}
-
-function waitForMediaReady(
-  audio: HTMLAudioElement,
-  isStale?: () => boolean,
-): Promise<void> {
-  if (isStale?.()) {
-    return Promise.reject(new Error("STALE_LOAD"));
-  }
-  if (audio.readyState >= HTMLMediaElement.HAVE_FUTURE_DATA) {
-    return Promise.resolve();
-  }
-  return new Promise((resolve, reject) => {
-    const onReady = () => {
-      cleanup();
-      if (isStale?.()) {
-        reject(new Error("STALE_LOAD"));
-        return;
-      }
-      resolve();
-    };
-    const onError = () => {
-      cleanup();
-      if (isStale?.()) {
-        reject(new Error("STALE_LOAD"));
-        return;
-      }
-      reject(new Error(describeMediaError(audio.error) ?? "The audio could not be reloaded."));
-    };
-    const cleanup = () => {
-      audio.removeEventListener("canplay", onReady);
-      audio.removeEventListener("error", onError);
-    };
-    audio.addEventListener("canplay", onReady);
-    audio.addEventListener("error", onError);
-  });
-}
-
-function isStaleLoadError(error: unknown): boolean {
-  return error instanceof Error && error.message === "STALE_LOAD";
-}
-
-function isPlaybackIdleLongEnough(idleSinceMs: number): boolean {
-  return idleSinceMs > 0 && Date.now() - idleSinceMs >= STALE_PLAYBACK_MS;
-}
-
-function playbackNeedsSourceRefresh(
-  track: MediaTrack | null | undefined,
-  idleSinceMs: number,
-  refreshFlag: boolean,
-): boolean {
-  return (
-    track?.source === "stream" &&
-    (refreshFlag || isPlaybackIdleLongEnough(idleSinceMs))
-  );
-}
 
 // Single source of truth for the audio gain applied to the gain node /
 // audio element. Encapsulates the full factor chain:
@@ -345,94 +293,6 @@ function computeAppliedGain(volume: number, normGain: number): number {
   return effectiveGain * cleanVolume * masterVolumeGain;
 }
 
-function shuffledCopy<T>(items: readonly T[]): T[] {
-  const shuffled = [...items];
-  for (let index = shuffled.length - 1; index > 0; index -= 1) {
-    const swapIndex = Math.floor(Math.random() * (index + 1));
-    [shuffled[index], shuffled[swapIndex]] = [shuffled[swapIndex], shuffled[index]];
-  }
-  return shuffled;
-}
-
-function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
-  return new Promise<T>((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error(message)), timeoutMs);
-    promise.then(
-      (value) => {
-        clearTimeout(timer);
-        resolve(value);
-      },
-      (error) => {
-        clearTimeout(timer);
-        reject(error);
-      },
-    );
-  });
-}
-
-function describeMediaError(error: MediaError | null): string {
-  if (!error) return "Playback failed for this track.";
-  switch (error.code) {
-    case MediaError.MEDIA_ERR_ABORTED:
-      return "Playback was stopped before the track could load.";
-    case MediaError.MEDIA_ERR_NETWORK:
-      return "The music stream could not be loaded over the network.";
-    case MediaError.MEDIA_ERR_DECODE:
-      return "This track loaded, but the audio could not be decoded.";
-    case MediaError.MEDIA_ERR_SRC_NOT_SUPPORTED:
-      return "This track's audio format is not supported here.";
-    default:
-      return "Playback failed for this track.";
-  }
-}
-
-function buildLoudnessPreviewStarts(durationSeconds?: number | null): number[] {
-  const duration = Number.isFinite(durationSeconds ?? NaN) ? Math.max(0, durationSeconds ?? 0) : 0;
-  if (duration <= 0) return [0, 30, 75];
-
-  const candidates = [0, duration * 0.18, duration * 0.45];
-
-  const maxStart = Math.max(0, duration - LOUDNESS_PREVIEW_CHUNK_SECONDS);
-  const starts: number[] = [];
-  for (const candidate of candidates) {
-    const start = Math.round(Math.min(Math.max(0, candidate), maxStart));
-    if (!starts.some((existing) => Math.abs(existing - start) < LOUDNESS_PREVIEW_CHUNK_SECONDS / 2)) {
-      starts.push(start);
-    }
-  }
-
-  return starts;
-}
-
-function isUsefulPreviewLoudness(loudness: LoudnessData): boolean {
-  if (!isUsableLoudness(loudness)) return false;
-  if (typeof loudness.integratedLufs === "number" && loudness.integratedLufs < LOUDNESS_PREVIEW_MIN_LUFS) return false;
-  if (typeof loudness.truePeak === "number" && loudness.truePeak < LOUDNESS_PREVIEW_MIN_PEAK_DB) return false;
-  return true;
-}
-
-function readVolume(): number | null {
-  try {
-    const raw = getItem(VOLUME_KEY);
-    if (raw === null) return null;
-    const parsed = JSON.parse(raw);
-    return typeof parsed === "number" && Number.isFinite(parsed) ? parsed : null;
-  } catch {
-    return null;
-  }
-}
-
-function readMuted(): boolean | null {
-  try {
-    const raw = getItem(MUTED_KEY);
-    if (raw === null) return null;
-    const parsed = JSON.parse(raw);
-    return typeof parsed === "boolean" ? parsed : null;
-  } catch {
-    return null;
-  }
-}
-
 // Audio analysis (loudness, leading silence) is a property of the
 // underlying audio file, so it should be cached by the underlying stream
 // videoId and ignore release/album context. `MediaTrack.id` encodes the
@@ -440,213 +300,29 @@ function readMuted(): boolean | null {
 // distinguishable in the UI; using the raw id here would force redundant
 // per-release re-analysis (and re-run the detector pipeline) for tracks
 // that share their audio across singles, EPs, and parent albums.
-function getAudioCacheKey(track: MediaTrack): string {
-  if (track.source === "stream") {
-    const effectiveVideoId = exportStreamVideoId(track);
-    if (effectiveVideoId) return `yt:${effectiveVideoId}`;
-  }
-  return track.id;
-}
 
-const LEADING_SILENCE_APPLY_MAX_POSITION = 0.25;
-
-type PlaybackHistoryEntry = {
-  track: MediaTrack;
-  queue: MediaTrack[];
-  queueIndex: number;
-  queueOrigin: QueueOrigin | null;
-  autoplayTrackIds: string[];
-  autoplaySeed: AutoplaySeed | null;
-  shuffle: boolean;
-  /** Track ids the user actually started in this queue session. */
-  queueVisitedTrackIds: string[];
-};
-
-function queueOriginEquals(left: QueueOrigin | null, right: QueueOrigin | null): boolean {
-  if (left === right) return true;
-  if (!left || !right) return false;
-  if (left.kind !== right.kind) return false;
-  // User playlists carry their own `id` field rather than the YTM-era
-  // `browseId` namespace — distinct equality branch so a YTM `playlist`
-  // origin with a coincidentally shape-matching browseId can never be
-  // treated as the same as a user-create playlist (which would otherwise
-  // collapse queue/playback history across the two distinct entities).
-  if (left.kind === "user-playlist" && right.kind === "user-playlist") {
-    return left.id === right.id;
-  }
-  // After the user-playlist guard, both sides are one of the browseId-based
-  // kinds. TypeScript can't narrow this through the && above, so extract
-  // browseId via a helper that works on all union members.
-  const leftBrowseId = "browseId" in left ? left.browseId : null;
-  const rightBrowseId = "browseId" in right ? right.browseId : null;
-  return leftBrowseId === rightBrowseId;
-}
-
-function playbackHistoryEntriesEqual(left: PlaybackHistoryEntry, right: PlaybackHistoryEntry): boolean {
-  if (
-    left.track.id !== right.track.id ||
-    left.queueIndex !== right.queueIndex ||
-    left.shuffle !== right.shuffle ||
-    !queueOriginEquals(left.queueOrigin, right.queueOrigin) ||
-    left.autoplaySeed?.videoId !== right.autoplaySeed?.videoId ||
-    left.autoplaySeed?.playlistId !== right.autoplaySeed?.playlistId ||
-    left.autoplayTrackIds.length !== right.autoplayTrackIds.length ||
-    left.queue.length !== right.queue.length ||
-    left.queueVisitedTrackIds.length !== right.queueVisitedTrackIds.length
-  ) {
-    return false;
-  }
-
-  for (let index = 0; index < left.autoplayTrackIds.length; index += 1) {
-    if (left.autoplayTrackIds[index] !== right.autoplayTrackIds[index]) return false;
-  }
-
-  for (let index = 0; index < left.queue.length; index += 1) {
-    if (left.queue[index]?.id !== right.queue[index]?.id) return false;
-  }
-
-  for (let index = 0; index < left.queueVisitedTrackIds.length; index += 1) {
-    if (left.queueVisitedTrackIds[index] !== right.queueVisitedTrackIds[index]) return false;
-  }
-
-  return true;
-}
-
-function playbackHistorySessionKey(
-  entry: Pick<PlaybackHistoryEntry, "track" | "queueIndex" | "queueOrigin" | "shuffle">,
-): string {
-  const origin = entry.queueOrigin;
-  let originKey = "";
-  if (origin) {
-    originKey = origin.kind === "user-playlist"
-      ? `user:${origin.id}`
-      : `browse:${"browseId" in origin ? origin.browseId : ""}`;
-  }
-  return `${entry.track.id}\0${entry.queueIndex}\0${entry.shuffle ? 1 : 0}\0${originKey}`;
-}
-
-function prependPlaybackHistoryEntry(
-  current: PlaybackHistoryEntry[],
-  entry: PlaybackHistoryEntry,
-): PlaybackHistoryEntry[] {
-  const sessionKey = playbackHistorySessionKey(entry);
-  const withoutDuplicate = current.filter(
-    (existing) => playbackHistorySessionKey(existing) !== sessionKey,
-  );
-  if (
-    withoutDuplicate[0] &&
-    playbackHistoryEntriesEqual(withoutDuplicate[0], entry)
-  ) {
-    return withoutDuplicate;
-  }
-  return [entry, ...withoutDuplicate].slice(0, RECENTLY_PLAYED_LIMIT);
-}
-
-function playbackEntryMatchesQueueSession(
-  entry: PlaybackHistoryEntry,
-  activeQueue: readonly MediaTrack[],
-  activeOrigin: QueueOrigin | null,
-): boolean {
-  if (!queueOriginEquals(entry.queueOrigin, activeOrigin)) return false;
-  if (entry.queue.length > activeQueue.length) return false;
-  for (let index = 0; index < entry.queue.length; index += 1) {
-    if (entry.queue[index]?.id !== activeQueue[index]?.id) return false;
-  }
-  return true;
-}
-
-function historyRestoreWouldDropAppendedTracks(
-  currentQueue: readonly MediaTrack[],
-  historyEntry: PlaybackHistoryEntry,
-): boolean {
-  const historyQueue = historyEntry.queue;
-  if (currentQueue.length <= historyQueue.length) return false;
-  return historyQueue.every((track, index) => currentQueue[index]?.id === track.id);
-}
-
-function findPreviousSessionHistoryIndex(
-  history: readonly PlaybackHistoryEntry[],
-  currentQueue: readonly MediaTrack[],
-  currentIndex: number,
-  currentTrack: MediaTrack | null,
-  activeOrigin: QueueOrigin | null,
-): number {
-  if (!currentTrack) return -1;
-  const aheadIds = new Set(
-    currentQueue.slice(currentIndex + 1).map((track) => track.id),
-  );
-  for (let index = 0; index < history.length; index += 1) {
-    const entry = history[index];
-    if (entry.track.id === currentTrack.id) continue;
-    // Tracks still queued ahead of the playhead were skipped past — not "previous".
-    if (aheadIds.has(entry.track.id)) continue;
-    if (
-      playbackEntryMatchesQueueSession(entry, currentQueue, activeOrigin) &&
-      entry.queueIndex > currentIndex
-    ) {
-      continue;
-    }
-    return index;
-  }
-  return -1;
-}
-
-function isRedoingQueueAdvance(
-  history: readonly PlaybackHistoryEntry[],
-  currentQueue: readonly MediaTrack[],
-  currentIndex: number,
-  activeOrigin: QueueOrigin | null,
-): boolean {
-  const nextTrack = currentQueue[currentIndex + 1];
-  const currentTrack = currentQueue[currentIndex];
-  if (!nextTrack || !currentTrack) return false;
-  return history.some(
-    (entry) =>
-      entry.track.id === nextTrack.id &&
-      entry.queueIndex === currentIndex + 1 &&
-      playbackEntryMatchesQueueSession(entry, currentQueue, activeOrigin),
-  );
-}
-
-type RecentlyPlayedSet = {
-  ids: Set<string>;
-  videoIds: Set<string>;
-  artistTitles: Set<string>;
-};
-
-function buildRecentlyPlayedSet(entries: PlaybackHistoryEntry[]): RecentlyPlayedSet {
-  const ids = new Set<string>();
-  const videoIds = new Set<string>();
-  const artistTitles = new Set<string>();
-  for (const e of entries) {
-    ids.add(e.track.id);
-    if (e.track.videoId) videoIds.add(e.track.videoId);
-    artistTitles.add(`${e.track.artist}\0${e.track.title}`.toLowerCase());
-  }
-  return { ids, videoIds, artistTitles };
-}
-
-function isInRecentlyPlayed(track: MediaTrack, set: RecentlyPlayedSet): boolean {
-  if (set.ids.has(track.id)) return true;
-  if (track.videoId && set.videoIds.has(track.videoId)) return true;
-  return set.artistTitles.has(`${track.artist}\0${track.title}`.toLowerCase());
-}
-
-function buildSeenIndex(queue: readonly MediaTrack[]) {
-  const ids = new Set<string>();
-  const videoIds = new Set<string>();
-  const artistTitles = new Set<string>();
-  for (const entry of queue) {
-    ids.add(entry.id);
-    if (entry.videoId) videoIds.add(entry.videoId);
-    artistTitles.add(`${entry.artist}\0${entry.title}`.toLowerCase());
-  }
-  return { ids, videoIds, artistTitles };
-}
 
 export function PlayerProvider({ children }: { children: ReactNode }) {
   const bootSession = getBootSession();
   const audioRef = useRef<HTMLAudioElement | null>(null);
+  // Blob object URLs created via `resolveFileMediaSrc` for the active track's
+  // audio. Revoked when a new track loads or playback stops so we don't leak.
+  const activeMediaObjectUrlRef = useRef<string | null>(null);
+  const revokeActiveMediaObjectUrl = () => {
+    if (activeMediaObjectUrlRef.current) {
+      URL.revokeObjectURL(activeMediaObjectUrlRef.current);
+      activeMediaObjectUrlRef.current = null;
+    }
+  };
+  // Resolve a local file path to a playable audio src (blob URL, bypassing the
+  // asset protocol's 1 MB Range cap that breaks `<audio>` decode), revoking the
+  // previous track's blob URL.
+  const mediaSrcFromFilePath = async (filePath: string): Promise<string> => {
+    revokeActiveMediaObjectUrl();
+    const src = await resolveFileMediaSrc(filePath);
+    if (src.startsWith("blob:")) activeMediaObjectUrlRef.current = src;
+    return src;
+  };
   const [currentTrack, setCurrentTrack] = useState<MediaTrack | null>(
     () => bootSession?.track ?? null,
   );
@@ -790,7 +466,6 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
   // setQueueState to bump loadToken so the load effect re-runs.
   const pendingForceReloadRef = useRef(false);
   const currentAudioPathRef = useRef<string | null>(null);
-  const leadingSilenceSkipRef = useRef(0);
 
   // Debounce timer for persisting the playback session to localStorage.
   const sessionSaveTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -1122,7 +797,10 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
 
     // Phase 1: resolve and download the stream (required for playback).
     // We await this so the load effect can use the cached stream path.
-    const streamWork = (async () => {
+    // The download runs inside the prefetch semaphore so at most
+    // STREAM_PREFETCH_CONCURRENCY yt-dlp jobs race the active track, and a
+    // hung backend can't wedge the prefetch queue forever.
+    const streamWork = streamPrefetchSemaphore.run(async () => {
       const catalogVideoId = exportStreamVideoId(track);
       if (!catalogVideoId) return null;
 
@@ -1148,7 +826,7 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
       if (!stream.filePath) return null;
 
       return { trackForStream, stream, effectiveVideoId };
-    })();
+    });
 
     // Phase 2: background analysis (fire-and-forget, must not delay playback).
     // The load effect picks up cached results if analysis finishes in time.
@@ -1173,7 +851,6 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
             .then((data) => setCachedLeadingSilence(cacheKey, data))
             .catch((error) => {
               console.warn("Prefetch leading silence detection failed:", error);
-              setCachedLeadingSilence(cacheKey, { skipSeconds: null });
             });
         }
       })
@@ -1341,7 +1018,7 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
       const gainNode = context.createGain();
       const analyserNode = context.createAnalyser();
       analyserNode.fftSize = 1024;
-      analyserNode.smoothingTimeConstant = 0.65;
+      analyserNode.smoothingTimeConstant = 0;
       const limiterNode = context.createDynamicsCompressor();
 
       // Configure DynamicsCompressorNode as a brickwall limiter to protect from digital clipping.
@@ -1410,7 +1087,7 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
     const offlinePath = await getOfflinePathForTrack(track);
     if (offlinePath) {
       setCurrentAudioPath(offlinePath);
-      const src = convertFileSrc(offlinePath);
+      const src = await mediaSrcFromFilePath(offlinePath);
       audio.src = src;
       audio.load();
       await waitForMediaReady(audio);
@@ -1422,7 +1099,7 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
     if (!idleLongEnough && existingPath) {
       try {
         setCurrentAudioPath(existingPath);
-        const src = convertFileSrc(existingPath);
+        const src = await mediaSrcFromFilePath(existingPath);
         audio.src = src;
         audio.load();
         await waitForMediaReady(audio);
@@ -1440,7 +1117,9 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
       STREAM_RESOLVE_TIMEOUT_MS,
       "Refreshing this track's audio took too long.",
     );
-    const src = stream.filePath ? convertFileSrc(stream.filePath) : stream.url ?? null;
+    const src = stream.filePath
+      ? await mediaSrcFromFilePath(stream.filePath)
+      : (stream.url ?? null);
     if (!src) throw new Error("No audio source is available for this track.");
 
     setCurrentAudioPath(stream.filePath ?? null);
@@ -1476,30 +1155,7 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
     }
   }, []);
 
-  const refreshLeadingSilenceSkipRef = useCallback((cacheKey: string) => {
-    leadingSilenceSkipRef.current = resolveLeadingSilenceSkipSeconds(cacheKey);
-  }, []);
-
-  const applyLeadingSilenceSkipAtStart = useCallback((audio: HTMLAudioElement, force = false) => {
-    const skip = leadingSilenceSkipRef.current;
-    if (skip <= 0) return;
-    if (!force && audio.currentTime > LEADING_SILENCE_APPLY_MAX_POSITION) return;
-    try {
-      audio.currentTime = skip;
-    } catch {
-      // currentTime can throw when the element has no seekable range yet.
-    }
-    progressRef.current = skip;
-    writeProgress(skip);
-  }, []);
-
-  const applyLeadingSilenceSkipAtStartRef = useRef(applyLeadingSilenceSkipAtStart);
-  useEffect(() => {
-    applyLeadingSilenceSkipAtStartRef.current = applyLeadingSilenceSkipAtStart;
-  }, [applyLeadingSilenceSkipAtStart]);
-
   const ensureLeadingSilenceAnalyzed = useCallback(async (cacheKey: string, filePath: string | null) => {
-    refreshLeadingSilenceSkipRef(cacheKey);
     if (!filePath || hasAttemptedLeadingSilenceAnalysis(cacheKey)) return;
 
     try {
@@ -1510,12 +1166,10 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
       );
       if (trackRef.current && getAudioCacheKey(trackRef.current) !== cacheKey) return;
       setCachedLeadingSilence(cacheKey, data);
-      refreshLeadingSilenceSkipRef(cacheKey);
     } catch (error) {
       console.warn("Leading silence detection failed:", error);
-      setCachedLeadingSilence(cacheKey, { skipSeconds: null });
     }
-  }, [refreshLeadingSilenceSkipRef]);
+  }, []);
 
   const applySeekTarget = useCallback((target: number) => {
     const audio = audioRef.current;
@@ -1689,6 +1343,14 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
     };
     const handlePause = () => {
       if (sourceRefreshInProgressRef.current) return;
+      // The load effect drives buffering state while it owns the audio
+      // element (initial load + automatic retries). It calls `audio.pause()`
+      // as part of tearing down the previous track; without this guard the
+      // async `pause` event would stomp the load's isBuffering(true), so the
+      // play/pause button flashes the paused (Play) icon instead of the
+      // loading spinner for the whole resolve/load window. Mirrors the
+      // loadInProgressRef guard in handleError.
+      if (loadInProgressRef.current) return;
       lastPlaybackIdleAtRef.current = Date.now();
       setIsPlaying(false);
       setIsBuffering(false);
@@ -1713,7 +1375,9 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
     };
     const handleEnded = () => {
       if (repeatRef.current === "one") {
-        applyLeadingSilenceSkipAtStartRef.current(audio, true);
+        audio.currentTime = 0;
+        progressRef.current = 0;
+        writeProgress(0);
         void audio.play().catch(() => {
           setIsPlaying(false);
         });
@@ -1960,7 +1624,7 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
         (track.source === "upload" ? track.filePath ?? null : null);
       if (!filePath) return;
 
-      const probed = await readDuration(convertFileSrc(filePath));
+      const probed = await readDuration(convertFileSrc(filePath, "stream"));
       if (probed) applyResolvedDuration(probed);
     })();
 
@@ -2039,6 +1703,10 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
     let retriesLeft = MAX_LOAD_ATTEMPTS - 1;
     let activeRetryTimer: ReturnType<typeof setTimeout> | null = null;
     let lastAttemptError: unknown = null;
+    // Video ids whose stream already failed for THIS load. Accumulated across
+    // retries so the same-song alternate walk keeps advancing instead of
+    // bouncing off the same dead ids.
+    const triedStreamIds = new Set<string>();
 
     setLastError(null);
     setIsBuffering(true);
@@ -2170,7 +1838,9 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
         if (trackForLoad.source === "upload") {
           resolvedFilePath = trackForLoad.filePath ?? null;
           setCurrentAudioPath(resolvedFilePath);
-          src = trackForLoad.audioSrc ?? null;
+          src = resolvedFilePath
+            ? await mediaSrcFromFilePath(resolvedFilePath)
+            : (trackForLoad.audioSrc ?? null);
         } else {
           // Use the resolved videoId (canonical Topic upload) when
           // available, falling back to the original videoId. This is
@@ -2184,7 +1854,7 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
             if (cancelled || trackRef.current?.id !== loadTrackId) return;
             resolvedFilePath = offlinePath;
             setCurrentAudioPath(offlinePath);
-            src = convertFileSrc(offlinePath);
+            src = await mediaSrcFromFilePath(offlinePath);
           } else {
             // On retries, drop the cached resolution so the backend can
             // re-derive a working URL — a transient network glitch can leave
@@ -2199,39 +1869,57 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
                 "Resolving this track's audio took too long.",
               );
             } catch (streamError) {
-              const streamMessage =
-                streamError instanceof Error ? streamError.message : String(streamError);
-              if (
-                isUnplayableStreamError(streamMessage) &&
-                effectiveVideoId === exportStreamVideoId(trackForLoad)
-              ) {
-                const fallback = await resolveStreamTrackAudioFallback(trackForLoad);
+              // ANY resolve-stream failure for the current id can be the
+              // "this id will never play" signal (age gate, 403, "sign in to
+              // confirm you're not a bot", a yt-dlp extractor error, or a
+              // frontend timeout). Some studio uploads fail every time while a
+              // different same-song studio upload loads fine — so walk the
+              // ordered alternate list within THIS attempt. Music videos are
+              // never offered as alternates. Every failed alternate is added
+              // to `triedStreamIds` (persisted across retries), so a later
+              // retry continues the walk instead of re-trying dead ids.
+              if (effectiveVideoId !== exportStreamVideoId(trackForLoad)) throw streamError;
+              triedStreamIds.add(effectiveVideoId);
+              let lastStreamError: unknown = streamError;
+              while (true) {
+                if (cancelled || trackRef.current?.id !== loadTrackId) return;
+                const fallback = await resolveStreamTrackAudioFallback(trackForLoad, {
+                  excludeVideoIds: [...triedStreamIds],
+                });
                 if (cancelled || trackRef.current?.id !== loadTrackId) return;
                 const fallbackVideoId = fallback?.resolvedVideoId;
-                if (fallbackVideoId && fallbackVideoId !== effectiveVideoId) {
-                  const audioResolved = fallback
-                    ? {
-                        ...fallback,
-                        id: trackForLoad.id,
-                        videoId: trackForLoad.videoId ?? catalogVideoId,
-                      }
-                    : {
-                        ...trackForLoad,
-                        resolvedVideoId: fallbackVideoId,
-                      };
-                  patchQueueTrackInRef(trackForLoad.id, audioResolved);
-                  trackForLoad = audioResolved;
-                  invalidateStream(fallbackVideoId);
+                if (
+                  !fallbackVideoId ||
+                  triedStreamIds.has(fallbackVideoId) ||
+                  fallbackVideoId === effectiveVideoId
+                ) {
+                  throw lastStreamError;
+                }
+                const audioResolved = fallback
+                  ? {
+                      ...fallback,
+                      id: trackForLoad.id,
+                      videoId: trackForLoad.videoId ?? catalogVideoId,
+                    }
+                  : {
+                      ...trackForLoad,
+                      resolvedVideoId: fallbackVideoId,
+                    };
+                patchQueueTrackInRef(trackForLoad.id, audioResolved);
+                trackForLoad = audioResolved;
+                invalidateStream(fallbackVideoId);
+                try {
                   stream = await withTimeout(
                     resolveStream(fallbackVideoId),
                     STREAM_RESOLVE_TIMEOUT_MS,
                     "Resolving this track's audio took too long.",
                   );
-                } else {
-                  throw streamError;
+                  break;
+                } catch (fallbackError) {
+                  if (cancelled || trackRef.current?.id !== loadTrackId) return;
+                  triedStreamIds.add(fallbackVideoId);
+                  lastStreamError = fallbackError;
                 }
-              } else {
-                throw streamError;
               }
             }
             // Compare against the actual queue-track id here, not the audio-cache
@@ -2241,21 +1929,26 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
             if (cancelled || trackRef.current?.id !== loadTrackId) return;
             resolvedFilePath = stream.filePath ?? null;
             setCurrentAudioPath(resolvedFilePath);
-            src = stream.filePath ? convertFileSrc(stream.filePath) : stream.url ?? null;
+            src = stream.filePath
+              ? await mediaSrcFromFilePath(stream.filePath)
+              : (stream.url ?? null);
           }
           }
         }
 
         if (!src) throw new Error("No audio source is available for this track.");
         if (cancelled) return;
-        audio.src = src;
-        audio.load();
-
+        // Kick off the leading-silence analysis BEFORE the audio element
+        // starts decoding so its result is more likely to be ready by the
+        // time playback begins. Starting it after `load()` meant the very
+        // first play of a track always heard the silence — the analysis
+        // couldn't finish before `play()` read the still-empty skip.
         const loudnessCacheKey = getAudioCacheKey(trackForLoad);
-        refreshLeadingSilenceSkipRef(loudnessCacheKey);
         if (resolvedFilePath) {
           void ensureLeadingSilenceAnalyzed(loudnessCacheKey, resolvedFilePath);
         }
+        audio.src = src;
+        audio.load();
         const isStaleLoad = () =>
           cancelled || trackRef.current?.id !== loadTrackId;
         await waitForMediaReady(audio, isStaleLoad);
@@ -2299,7 +1992,9 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
             progressRef.current = savedPos;
             writeProgress(savedPos);
           } else {
-            applyLeadingSilenceSkipAtStart(audio);
+            audio.currentTime = 0;
+            progressRef.current = 0;
+            writeProgress(0);
           }
           const shouldPlay = playWhenReadyRef.current === true;
           playWhenReadyRef.current = null;
@@ -2322,8 +2017,6 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
           ensureAutoplayTopUpRef.current(true);
           return;
         }
-
-        applyLeadingSilenceSkipAtStart(audio);
 
         const userIntent = playWhenReadyRef.current;
         playWhenReadyRef.current = null;
@@ -2389,6 +2082,7 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
       if (activeRetryTimer) clearTimeout(activeRetryTimer);
       audio.pause();
       audio.currentTime = 0;
+      revokeActiveMediaObjectUrl();
     };
   }, [currentTrack?.id, queueIndex, ensureAudioGraph, loadToken, patchQueueTrackInRef, applyDurationFromAudio]);
 
@@ -2396,7 +2090,6 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
     if (!currentTrack) {
       setNormGainTransport(1);
       setCurrentAudioPath(null);
-      leadingSilenceSkipRef.current = 0;
       return;
     }
     const trackForAnalysis =
@@ -2405,7 +2098,6 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
         : currentTrack;
     const targetLufs = loadTargetLufs();
     const loudnessCacheKey = getAudioCacheKey(trackForAnalysis);
-    refreshLeadingSilenceSkipRef(loudnessCacheKey);
     const loudness = getCachedLoudness(loudnessCacheKey);
     if (loudness) {
       setNormGainTransport(computeLinearGain(loudness, targetLufs));
@@ -2549,17 +2241,34 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
   //   * on every change, it evicts the now-superseded snapshot before
   //     the next track's prefetch effect writes its replacement.
   //
-  // Gated on `source === "stream"` because upload tracks have no
-  // videoId and therefore no snapshot to keep — passing `null` would
-  // wipe everything (including any active stream-track snapshot), so
-  // we early-return instead.
+  // SAVED SONGS are exempt from eviction: their lyrics were persisted
+  // (with `persist: true`) specifically so offline playback works, and
+  // wiping them on the next track change would force a network re-fetch
+  // every time the user replays a downloaded song. The keep-set therefore
+  // starts with every saved song's identity ids and adds the current
+  // stream track's id on top. Upload tracks have no videoId/snapshot, so
+  // the effect still runs (the keep-set is just the saved songs).
+  //
+  // Subscribing to the collection store's entries means the eviction also
+  // re-runs the moment the saved set changes (save/unsave), not just on
+  // track change — so a snapshot written for a freshly-saved song is
+  // never wiped by a stale keep-set computed before the save landed.
+  const savedSongEntries = useCollectionStore((state) => state.songLookup.entries);
   useEffect(() => {
+    const keepVideoIds = new Set<string>();
     const track = currentTrack;
-    if (!track || track.source !== "stream") return;
-    const effectiveVideoId = track.resolvedVideoId ?? track.videoId;
-    if (!effectiveVideoId) return;
-    evictPersistedLyricsExcept(effectiveVideoId);
-  }, [currentTrack?.resolvedVideoId, currentTrack?.videoId, currentTrack?.source]);
+    if (track?.source === "stream") {
+      const effectiveVideoId = track.resolvedVideoId ?? track.videoId;
+      if (effectiveVideoId) keepVideoIds.add(effectiveVideoId);
+    }
+    for (const saved of savedSongEntries) {
+      if (saved.source !== "stream") continue;
+      for (const videoId of streamIdentityVideoIds(saved)) {
+        keepVideoIds.add(videoId);
+      }
+    }
+    evictPersistedLyricsExcept(keepVideoIds);
+  }, [currentTrack?.resolvedVideoId, currentTrack?.videoId, currentTrack?.source, savedSongEntries]);
 
   const resolveTrackAudio = useCallback(async (track: MediaTrack): Promise<MediaTrack | null> => {
     if (!isQueueableTrack(track)) {
@@ -3237,21 +2946,47 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
     const currentQueue = queueRef.current;
     const currentIndex = queueIndexRef.current;
     const autoplayIds = autoplayTrackIdsRef.current;
-    if (currentQueue.length === 0 || currentIndex < 0) return;
-    const head = currentQueue.slice(0, currentIndex + 1);
-    const autoplayTail = currentQueue.slice(currentIndex + 1).filter(t => autoplayIds.has(t.id));
-    setQueueState({
-      queue: [...head, ...autoplayTail],
-      queueIndex: currentIndex,
-      queueOrigin: queueOriginRef.current,
-      autoplayTrackIds: autoplayIds,
-      autoplaySeed: autoplaySeedRef.current,
-    });
+    if (currentQueue.length === 0) return;
+    if (currentIndex >= 0) {
+      const head = currentQueue.slice(0, currentIndex + 1);
+      const autoplayTail = currentQueue.slice(currentIndex + 1).filter((t) => autoplayIds.has(t.id));
+      const retainedAutoplayIds = new Set<string>();
+      for (const t of autoplayTail) {
+        retainedAutoplayIds.add(t.id);
+      }
+      setQueueState({
+        queue: [...head, ...autoplayTail],
+        queueIndex: currentIndex,
+        queueOrigin: queueOriginRef.current,
+        autoplayTrackIds: retainedAutoplayIds,
+        autoplaySeed: autoplaySeedRef.current,
+      });
+    } else {
+      const autoplayTail = currentQueue.filter((t) => autoplayIds.has(t.id));
+      const retainedAutoplayIds = new Set<string>();
+      for (const t of autoplayTail) {
+        retainedAutoplayIds.add(t.id);
+      }
+      setQueueState({
+        queue: autoplayTail,
+        queueIndex: -1,
+        queueOrigin: null,
+        autoplayTrackIds: retainedAutoplayIds,
+        autoplaySeed: autoplaySeedRef.current,
+      });
+    }
   }, [setQueueState]);
 
   const clearPlaybackHistory = useCallback(() => {
     setPlaybackHistory([]);
-  }, []);
+    playbackHistoryRef.current = [];
+    if (trackRef.current) {
+      resetQueueVisitedToTrack(trackRef.current.id);
+    } else {
+      setQueueVisitedTrackIds(new Set());
+      queueVisitedTrackIdsRef.current = new Set();
+    }
+  }, [resetQueueVisitedToTrack]);
 
   // Remove a track from the active queue without disturbing the rest of
   // the session. Used when a locally uploaded track is deleted from disk
@@ -3405,7 +3140,6 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
             audio.currentTime = 0;
             progressRef.current = 0;
             writeProgress(0);
-            applyLeadingSilenceSkipAtStartRef.current(audio, true);
             if (wasPlaying) {
               await audio.play();
             } else {
@@ -3416,7 +3150,6 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
             audio.currentTime = 0;
             progressRef.current = 0;
             writeProgress(0);
-            applyLeadingSilenceSkipAtStartRef.current(audio, true);
             setLastError(
               error instanceof Error ? error.message : "Could not restart this track.",
             );
@@ -3430,7 +3163,6 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
       audio.currentTime = 0;
       progressRef.current = 0;
       writeProgress(0);
-      applyLeadingSilenceSkipAtStartRef.current(audio, true);
       return;
     }
     // Move backward within the queue only to tracks the user actually started.
@@ -3473,14 +3205,24 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
     audio.currentTime = 0;
     progressRef.current = 0;
     writeProgress(0);
-    applyLeadingSilenceSkipAtStartRef.current(audio, true);
   }, [queueIndex, stopCurrentPlayback, restoreHistoryEntry, setQueueState, ensureAudioGraph, refreshStaleAudioSource]);
 
   const seek = useCallback((seconds: number) => {
     const audio = audioRef.current;
     const track = trackRef.current;
     if (!audio) return;
-    const target = Math.max(0, Math.min(duration || 0, seconds));
+    // Clamp against the live resolved duration rather than the possibly
+    // stale `duration` state. The two can diverge while paused (the tick
+    // that refreshes `duration` early-returns when paused) or while a
+    // stream is still buffering, which let a seek land short of the
+    // position the seek bar painted and left the thumb/fill offset from
+    // the cursor.
+    const resolved =
+      readLiveMediaDuration(audio, track?.durationSeconds) ||
+      duration ||
+      track?.durationSeconds ||
+      0;
+    const target = Math.max(0, Math.min(resolved, seconds));
     if (sourceRefreshInProgressRef.current) {
       pendingSeekTargetRef.current = target;
       progressRef.current = target;

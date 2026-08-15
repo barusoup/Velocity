@@ -163,9 +163,9 @@ Every major UI dimension is a `clamp()` value on `#root`, scaled smoothly betwee
 | `--ui-page-pad` | Page horizontal padding: `1–2.75rem` |
 | `--ui-content-max` | Max content width: `64–82rem` |
 | `--ui-player-max` | Player bar max width: `56–90rem` |
-| `--ui-player-side` | Player bar side panels: `11–15rem` |
+| `--ui-player-side` | Player bar side panels: flexible `14–24rem` |
 | `--ui-control` | Standard control button: `2.4–3rem` |
-| `--ui-art-sm` | Small artwork (player bar): `3.2–4rem` |
+| `--ui-art-sm` | Small artwork (player bar): `2.75–3.5rem` |
 | `--ui-art-row` | Track row artwork: `3.25–4rem` |
 | `--ui-art-lg` | Large artwork (page hero): `10–14rem` |
 | `--ui-radius-panel` | Panel border radius: `1–1.75rem` |

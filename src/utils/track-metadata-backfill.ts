@@ -3,7 +3,7 @@ import type { MediaTrack, SearchItem } from "../types";
 import { isPlaceholderAlbumName } from "./upload-enrichment";
 
 export type TrackMetadataUpdates = {
-  durationSeconds?: number;
+  durationSeconds?: number | null;
   playCount?: string | null;
   album?: string | null;
   albumBrowseId?: string | null;

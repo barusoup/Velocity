@@ -17,16 +17,15 @@ import { usePlayerActions, usePlayerState } from "../player";
 import { useIsTrackSaved } from "../hooks/useCollectionSelectors";
 import type { MediaTrack } from "../types";
 import { deviceExportVideoIds, hydrateUploadTrackForPlayback, saveTrackToMp3 } from "../api";
+import { getSetting } from "../settings";
+import type { ExportFormat } from "../settings";
 import { useDeviceExport } from "../hooks/useDeviceExport";
 import { getDirectAlbumBrowseId, getDirectArtistBrowseId } from "../utils/navigation";
-import { isSameSongTrack, sanitizeFilename } from "../utils/media";
-import { NestedSubMenuPanel } from "./NestedSubMenuPanel";
+import { isSameSongTrack } from "../utils/media";
+import { splitDirAndName, safeTrackFileName } from "../utils/save-helpers";
+import { PlaylistPickerSubMenu } from "./PlaylistPickerSubMenu";
 import { SavingPanel } from "./SavingPanel";
-import {
-  ContextMenu,
-  ContextMenuItem,
-  ContextMenuSection,
-} from "./ContextMenu";
+import { ContextMenu, ContextMenuItem } from "./ContextMenu";
 import type { View } from "./Sidebar";
 
 // -----------------------------------------------------------------------
@@ -143,7 +142,9 @@ function SongContextMenuContent({
   const isSaved = useIsTrackSaved(track);
   const isCurrentAlbum = directAlbumId && currentAlbumBrowseId && directAlbumId === currentAlbumBrowseId;
   const isCurrentArtist = directArtistId && currentArtistBrowseId && directArtistId === currentArtistBrowseId;
-  const isInQueue = playerState.queue.some((t) => t.id === track.id);
+  const isInQueue = playerState.queue
+    .slice(playerState.queueIndex + 1)
+    .some((t) => t.id === track.id && !playerState.autoplayTrackIds.has(t.id));
   // Confirmation state for the destructive Delete option. Only meaningful
   // for upload-sourced tracks. When true, the menu's children swap to a
   // two-button confirmation panel instead of the standard row list.
@@ -238,14 +239,25 @@ function SongContextMenuContent({
   // returns `null` when the user cancels, in which case we leave the
   // menu untouched (no save started).
   const handleSaveToDevice = async () => {
-    const safeTitle = sanitizeFilename(track.title || "track");
-    const defaultName = `${safeTitle}.mp3`;
+    const safeTitle = safeTrackFileName(track.title);
+    const exportFormat: ExportFormat = getSetting("exportFormat");
+    // Native exports keep the original container (webm/mka), whose
+    // extension we can't know until the download finishes — so the
+    // dialog shows no fixed extension and a broad audio filter.
+    const defaultName =
+      exportFormat === "native" ? safeTitle : `${safeTitle}.${exportFormat}`;
+    const dialogFilters =
+      exportFormat === "native"
+        ? [{ name: "Audio files", extensions: ["*"] }]
+        : exportFormat === "mp3"
+          ? [{ name: "MP3 audio", extensions: ["mp3"] }]
+          : [{ name: "Opus audio", extensions: ["opus"] }];
     let targetPath: string | null = null;
     try {
       targetPath = await saveDialog({
         title: `Save "${track.title || "track"}" to your device`,
         defaultPath: defaultName,
-        filters: [{ name: "MP3 audio", extensions: ["mp3"] }],
+        filters: dialogFilters,
       });
     } catch (error) {
       // Surface dialog errors through the same panel state machine as
@@ -291,6 +303,7 @@ function SongContextMenuContent({
           coverUrl: exportTrack.cover ?? null,
           targetDir: dir,
           fileName: stem,
+          format: exportFormat,
         });
       },
     }).catch(() => {});
@@ -511,63 +524,13 @@ function PlaylistSearchSubMenu({
   onPick: (playlist: { browseId: string; title: string }) => void;
   resolver: AddToPlaylistResolver;
 }) {
-  const [query, setQuery] = useState("");
-  const [results, setResults] = useState<
-    Awaited<ReturnType<AddToPlaylistResolver["resolvePlaylists"]>>
-  >([]);
-  const [loading, setLoading] = useState(true);
-
-  useEffect(() => {
-    let cancelled = false;
-    setLoading(true);
-    void resolver
-      .resolvePlaylists(query)
-      .then((list) => {
-        if (cancelled) return;
-        setResults(list);
-        setLoading(false);
-      })
-      .catch(() => {
-        if (cancelled) return;
-        setResults([]);
-        setLoading(false);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [query, resolver]);
-
   return (
-    <NestedSubMenuPanel anchorRef={anchorRef} onClose={onClose}>
-      <ContextMenuSection label="Search playlists">
-        <div className="px-3 pb-2">
-          <input
-            autoFocus
-            value={query}
-            onChange={(event) => setQuery(event.target.value)}
-            placeholder="Type a playlist name…"
-            className="w-full rounded-md border border-white/10 bg-white/5 px-3 py-1.5 text-sm text-white placeholder-white/40 outline-none transition-colors focus:border-white/20 focus:bg-white/10"
-          />
-        </div>
-      </ContextMenuSection>
-      <div className="max-h-64 overflow-y-auto">
-        {loading && results.length === 0 ? (
-          <div className="px-4 py-3 text-xs text-white/40">Searching…</div>
-        ) : results.length === 0 ? (
-          <div className="px-4 py-3 text-xs text-white/40">
-            No playlists yet. Create one from the sidebar.
-          </div>
-        ) : (
-          results.map((playlist) => (
-            <ContextMenuItem
-              key={playlist.browseId + playlist.title}
-              label={playlist.title}
-              onClick={() => onPick(playlist)}
-            />
-          ))
-        )}
-      </div>
-    </NestedSubMenuPanel>
+    <PlaylistPickerSubMenu
+      anchorRef={anchorRef}
+      onClose={onClose}
+      onPick={onPick}
+      resolver={(q) => resolver.resolvePlaylists(q)}
+    />
   );
 }
 
@@ -587,35 +550,5 @@ function enrichTrackForDeviceExport(
   return track;
 }
 
-// ── "Save to my device" helpers ────────────────────────────────────────
-//
-// The native save dialog returns the FULL path (e.g. `C:\Music\foo.mp3`).
-// We hand the path to the Rust command as `targetDir` + `fileName` (the
-// stem without the extension) so the backend can:
-//   * re-apply non-clobber naming if the user picks a filename that
-//     already exists,
-//   * keep the parent folder opaque to the FS layer, and
-//   * add the `.mp3` extension itself so we never write a file the OS
-//     can't identify.
 
-function splitDirAndName(path: string): { dir: string; stem: string } | null {
-  // Cross-platform: prefer forward/back slashes both as separators.
-  const lastSep = Math.max(path.lastIndexOf("\\"), path.lastIndexOf("/"));
-  if (lastSep < 0) {
-    // No separator: treat the whole thing as a stem in the current dir.
-    return { dir: ".", stem: stripExtension(path) };
-  }
-  const dir = path.slice(0, lastSep);
-  const name = path.slice(lastSep + 1);
-  if (!dir || !name) return null;
-  return { dir, stem: stripExtension(name) };
-}
-
-function stripExtension(name: string): string {
-  const dot = name.lastIndexOf(".");
-  // Strip the extension only when it's not the entire filename (e.g.
-  // ".gitignore" or a dotfile). Also skip when there's no dot at all.
-  if (dot <= 0) return name;
-  return name.slice(0, dot);
-}
 

@@ -1,10 +1,19 @@
 //! Synced-lyrics resolution: provider fan-out, metadata matching, and
 //! playback alignment for stream tracks.
 //!
-//! Provider priority (by composite score, not hard-coded order):
-//!   1. YouTube Music timed lyrics — same clock as the playing stream
-//!   2. Musixmatch richsync / subtitle LRC
-//!   3. LRCLIB, then regional fallbacks (Kugou, QQ, NetEase)
+//! Only clean providers are queried — Musixmatch (richsync/subtitle) and
+//! LRCLIB. Regional fallbacks (Kugou, QQ, NetEase) are intentionally NOT
+//! queried: they frequently return poorly formatted or machine-translated
+//! LRC that visibly flickers when a better result arrives later. Prefer
+//! waiting a few seconds longer (or reporting "no lyrics") over flashing
+//! a bad provider's result and then swapping.
+//!
+//! YouTube Music native timed lyrics are intentionally NOT displayed — in
+//! practice they are not aligned to the resolved stream. We prefer reporting
+//! "no lyrics" over serving unsynced lyrics. The YTM lyrics *tab* is still
+//! consulted as a cheap presence probe (does this song have lyrics at all?)
+//! so the UI can short-circuit the slow provider fan-out when a song has no
+//! lyrics to find.
 
 use std::{
     path::Path,
@@ -29,7 +38,6 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 const LYRIC_PROVIDER_TIMEOUT: Duration = Duration::from_secs(6);
 const MUSIXMATCH_APP_ID: &str = "web-desktop-app-v1.0";
-pub const ANDROID_MUSIC_CLIENT_VERSION: &str = "7.21.50";
 
 const YTM_SOURCE: &str = "Lyrics from YouTube Music";
 const MUSIXMATCH_SOURCE: &str = "Lyrics from Musixmatch";
@@ -37,6 +45,26 @@ const LRCLIB_SOURCE: &str = "Lyrics from LRCLIB";
 const KUGOU_SOURCE: &str = "Lyrics from Kugou";
 const QQ_MUSIC_SOURCE: &str = "Lyrics from QQ Music";
 const NETEASE_SOURCE: &str = "Lyrics from NetEase Cloud Music";
+
+/// Fast probe — how long Tier-0 is allowed before we report "unknown".
+const PROBE_TIMEOUT: Duration = Duration::from_millis(900);
+const PROBE_LRCLIB_TIMEOUT: Duration = Duration::from_millis(900);
+
+/// Vocal-onset DSP constants — tuned for 16 kHz mono PCM.
+const VOCAL_SAMPLE_RATE: u32 = 16_000;
+const VOCAL_WINDOW_MS: u32 = 20;
+const VOCAL_HOP_MS: u32 = 10;
+const VOCAL_MIN_SUSTAIN_MS: u32 = 320;
+const VOCAL_MIN_PHRASE_MS: u32 = 500;
+const VOCAL_ANALYSIS_SECONDS: f64 = 45.0;
+const VOCAL_ONSET_DB_ABOVE_FLOOR: f64 = 14.0;
+const VOCAL_ABSOLUTE_FLOOR_DB: f64 = -48.0;
+
+/// Bound for ffmpeg analysis (leading-silence + vocal-onset). Healthy runs
+/// finish in seconds; this reaps a wedged ffmpeg so it can't pin a tokio
+/// worker and its child process forever.
+#[allow(dead_code)]
+const FFMPEG_ANALYSIS_TIMEOUT: Duration = Duration::from_secs(30);
 
 static LRC_TIMESTAMP_RE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"^\[(\d+):(\d{1,2})(?:[.:](\d{1,3}))?]").expect("lrc timestamp regex")
@@ -70,6 +98,39 @@ pub struct SyncedLyricsResponse {
     pub lines: Vec<TimedLyricLine>,
     pub source: Option<String>,
     pub has_per_word_sync: Option<bool>,
+    /// Total playback offset (ms) already applied to `lines`. Set by the
+    /// vocal-onset correction for third-party LRC; `None` means no offset
+    /// was applied.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub applied_offset_ms: Option<i32>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LyricsAvailability {
+    /// Tier-0 thinks lyrics exist (YTM tab or LRCLIB get hit).
+    pub available: bool,
+    /// 0.0-1.0 — high means probe is confident; low means "unknown, keep searching".
+    pub confidence: f32,
+    /// Which fast provider triggered availability, if any.
+    pub source: Option<String>,
+    /// First lyric timestamp if availability came from a real LRC probe.
+    pub first_lyric_ms: Option<u32>,
+    /// Whether the YTM native lyrics tab existed (even if body wasn't fetched).
+    pub ytm_has_tab: bool,
+}
+
+#[derive(Clone, Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LyricOffsetRecord {
+    pub offset_ms: i32,
+    pub confidence: f32,
+    pub method: String,
+    pub lyrics_hash: String,
+    pub computed_at_ms: u64,
+    pub first_lyric_ms: u32,
+    pub vocal_onset_ms: u32,
+    pub leading_silence_ms: u32,
 }
 
 #[derive(Clone)]
@@ -81,9 +142,8 @@ pub struct LyricTrack {
 }
 
 /// Optional playback context used to align third-party lyrics with the
-/// cached stream file (leading silence) and to reach YTM's native lyrics.
+/// cached stream file (leading silence).
 pub struct LyricsResolveContext {
-    pub next_response: Option<Value>,
     pub leading_silence_skip_ms: u32,
 }
 
@@ -112,36 +172,22 @@ pub async fn resolve_synced_lyrics(
     deps: &LyricsDeps<'_>,
     meta: &LyricTrack,
     ctx: &LyricsResolveContext,
-    ytm_lyrics: Option<SyncedLyricsResponse>,
 ) -> Option<SyncedLyricsResponse> {
     let mut candidates: Vec<(i32, SyncedLyricsResponse)> = Vec::new();
 
-    if let Some(lyrics) = ytm_lyrics {
-        // YTM timed lyrics are already aligned to the playing stream — never
-        // apply the leading-silence shift meant for third-party studio LRC.
-        if lyrics.lines.len() >= 2 {
-            return Some(lyrics);
-        }
-    }
-
-    let (musixmatch, lrclib, kugou, qq, netease) = tokio::join!(
+    // Only clean providers: Musixmatch + LRCLIB. Regional providers (Kugou,
+    // QQ, NetEase) are excluded per product decision — they cause the
+    // "bad lyrics then better lyrics" flicker. Waiting longer (or showing
+    // "no lyrics") is preferred over flashing poorly formatted LRC.
+    let (musixmatch, lrclib) = tokio::join!(
         fetch_musixmatch_lyrics(deps, meta),
         fetch_lrclib_lyrics(deps.http, meta),
-        fetch_kugou_lyrics(deps.http, deps.user_agent, meta),
-        fetch_qq_music_lyrics(deps.http, deps.user_agent, meta),
-        fetch_netease_lyrics(deps.http, meta),
     );
 
-    for (lyrics, validated) in [
-        (musixmatch, true),
-        (lrclib, true),
-        (kugou, true),
-        (qq, true),
-        (netease, true),
-    ] {
+    for (lyrics, validated) in [(musixmatch, true), (lrclib, true)] {
         let Some(lyrics) = lyrics else { continue };
         let meta_bonus = if validated { 25 } else { 0 };
-        let score = score_candidate(&lyrics, meta, meta_bonus, validated, false);
+        let score = score_candidate(&lyrics, meta, meta_bonus, validated);
         if score >= 45 {
             candidates.push((score, lyrics));
         }
@@ -156,52 +202,45 @@ pub async fn resolve_synced_lyrics(
 
 fn finalize_third_party_lyrics(
     lyrics: SyncedLyricsResponse,
-    ctx: &LyricsResolveContext,
+    _ctx: &LyricsResolveContext,
 ) -> SyncedLyricsResponse {
-    if ctx.leading_silence_skip_ms == 0 || is_ytm_native_source(&lyrics) {
-        lyrics
-    } else {
-        apply_playback_offset(lyrics, ctx.leading_silence_skip_ms)
-    }
-}
-
-fn is_ytm_native_source(lyrics: &SyncedLyricsResponse) -> bool {
+    // Silence is now physically trimmed from the audio file (atrim re-encode)
+    // so the file starts at 0:00 where the music begins. Third-party LRC
+    // (LRCLIB/Musixmatch etc) is authored for the studio master (no leading
+    // silence), so it must NOT be shifted. Previously we did
+    // `lyrics + leading_silence_skip_ms` which delayed every line by the
+    // silence amount and defeated the trim — e.g. a YT Music upload with 3s
+    // of silence got trimmed to 0 but lyrics were pushed to +3s, staying
+    // out of sync. With physical trimming, leave lyrics as-is.
     lyrics
-        .source
-        .as_deref()
-        .is_some_and(|s| s.contains("YouTube Music"))
 }
 
 pub async fn build_resolve_context(
-    app: &AppHandle,
-    stream_cache: &Mutex<std::collections::HashMap<String, crate::CachedStream>>,
-    stream_cache_ttl: Duration,
-    video_id: Option<&str>,
+    _app: &AppHandle,
+    _stream_cache: &Mutex<crate::cache::TtlCache<String, crate::CachedStream>>,
+    _stream_cache_ttl: Duration,
+    _video_id: Option<&str>,
 ) -> LyricsResolveContext {
-    let stream_file_path = match video_id {
-        Some(id) => resolve_stream_file_path(app, stream_cache, stream_cache_ttl, id).await,
-        None => None,
-    };
-    let leading_silence_skip_ms = match stream_file_path.as_deref() {
-        Some(path) => analyze_leading_silence_skip_ms(app, path).await.unwrap_or(0),
-        None => 0,
-    };
+    // No leading-silence offset is applied anymore — physical trimming makes
+    // `analyze_leading_silence_skip_ms` unnecessary on the lyrics path. We
+    // keep the struct field for cache-key stability (vocal offset still
+    // stores leading_silence_ms) but always report 0 so `finalize` becomes
+    // a no-op. This also saves an ffmpeg spawn per `get_synced_lyrics` call.
     LyricsResolveContext {
-        next_response: None,
-        leading_silence_skip_ms,
+        leading_silence_skip_ms: 0,
     }
 }
 
 pub async fn resolve_stream_file_path(
     app: &AppHandle,
-    stream_cache: &Mutex<std::collections::HashMap<String, crate::CachedStream>>,
+    stream_cache: &Mutex<crate::cache::TtlCache<String, crate::CachedStream>>,
     stream_cache_ttl: Duration,
     video_id: &str,
 ) -> Option<String> {
     {
-        let cache = stream_cache.lock().await;
-        if let Some(entry) = cache.get(video_id) {
-            if entry.fetched_at.elapsed() < stream_cache_ttl && Path::new(&entry.source).exists() {
+        let mut cache = stream_cache.lock().await;
+        if let Some(entry) = cache.get(&video_id.to_string()) {
+            if Path::new(&entry.source).exists() {
                 return Some(entry.source.clone());
             }
         }
@@ -244,96 +283,6 @@ async fn find_disk_stream_cache(
 }
 
 // ---------------------------------------------------------------------------
-// YouTube Music timed lyrics
-// ---------------------------------------------------------------------------
-
-pub fn extract_lyrics_browse_id_from_next(response: &Value) -> Option<String> {
-    let tabs = response
-        .pointer("/contents/singleColumnMusicWatchNextResultsRenderer/tabbedRenderer/watchNextTabbedResultsRenderer/tabs")
-        .and_then(Value::as_array)?;
-    for tab in tabs {
-        if tab
-            .pointer("/tabRenderer/unselectable")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-        {
-            continue;
-        }
-        let page_type = tab
-            .pointer("/tabRenderer/endpoint/browseEndpoint/browseEndpointContextSupportedConfigs/browseEndpointContextMusicConfig/pageType")
-            .and_then(Value::as_str)?;
-        if page_type == "MUSIC_PAGE_TYPE_TRACK_LYRICS" {
-            return tab
-                .pointer("/tabRenderer/endpoint/browseEndpoint/browseId")
-                .and_then(Value::as_str)
-                .map(str::to_string);
-        }
-    }
-    None
-}
-
-pub fn parse_ytm_timed_lyrics_response(response: &Value) -> Option<SyncedLyricsResponse> {
-    let data = response.pointer(
-        "/contents/elementRenderer/newElement/type/componentType/model/timedLyricsModel/lyricsData",
-    )?;
-    let entries = data.get("timedLyricsData").and_then(Value::as_array)?;
-    if entries.is_empty() {
-        return None;
-    }
-
-    let mut lines = Vec::with_capacity(entries.len());
-    for entry in entries {
-        let text = entry.get("lyricLine").and_then(Value::as_str)?.trim();
-        if text.is_empty() {
-            continue;
-        }
-        let cue = entry.get("cueRange")?;
-        let start_ms = parse_ytm_ms(cue.get("startTimeMilliseconds"))?;
-        let end_ms = parse_ytm_ms(cue.get("endTimeMilliseconds")).unwrap_or(start_ms + 3000);
-        let id = cue
-            .pointer("/metadata/id")
-            .and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
-            .unwrap_or(start_ms as u64) as u32;
-
-        lines.push(TimedLyricLine {
-            id,
-            text: text.to_string(),
-            start_time_ms: start_ms,
-            end_time_ms: Some(end_ms),
-            words: None,
-        });
-    }
-
-    if lines.len() < 2 {
-        return None;
-    }
-
-    Some(SyncedLyricsResponse {
-        lines,
-        source: data
-            .get("sourceMessage")
-            .and_then(Value::as_str)
-            .map(|s| s.to_string())
-            .or_else(|| Some(YTM_SOURCE.to_string())),
-        has_per_word_sync: Some(false),
-    })
-}
-
-fn parse_ytm_ms(value: Option<&Value>) -> Option<u32> {
-    let raw = value?;
-    let ms = if let Some(n) = raw.as_u64() {
-        n
-    } else if let Some(s) = raw.as_str() {
-        s.parse().ok()?
-    } else if let Some(n) = raw.as_i64() {
-        n.max(0) as u64
-    } else {
-        return None;
-    };
-    Some(ms.min(u32::MAX as u64) as u32)
-}
-
-// ---------------------------------------------------------------------------
 // Scoring & metadata matching
 // ---------------------------------------------------------------------------
 
@@ -342,15 +291,11 @@ fn score_candidate(
     meta: &LyricTrack,
     provider_bonus: i32,
     metadata_validated: bool,
-    is_ytm_native: bool,
 ) -> i32 {
     let mut score = score_sync_quality(&lyrics.lines, meta.duration_seconds) as i32;
     score += provider_bonus;
     if lyrics.has_per_word_sync == Some(true) {
         score += 12;
-    }
-    if is_ytm_native {
-        score += 40;
     }
     if metadata_validated {
         score += 8;
@@ -577,6 +522,7 @@ fn artists_compatible(a: &str, b: &str) -> bool {
     na == nb || na.contains(&nb) || nb.contains(&na)
 }
 
+#[allow(dead_code)]
 fn apply_playback_offset(mut lyrics: SyncedLyricsResponse, offset_ms: u32) -> SyncedLyricsResponse {
     if offset_ms == 0 {
         return lyrics;
@@ -691,6 +637,7 @@ fn build_lyrics_from_lrc(lrc: &str, source: &str) -> Option<SyncedLyricsResponse
         lines,
         source: Some(source.to_string()),
         has_per_word_sync: Some(false),
+        applied_offset_ms: None,
     })
 }
 
@@ -698,13 +645,11 @@ fn build_lyrics_from_lrc(lrc: &str, source: &str) -> Option<SyncedLyricsResponse
 // Leading silence (align third-party lyrics with stream playback position)
 // ---------------------------------------------------------------------------
 
-async fn analyze_leading_silence_skip_ms(app: &AppHandle, file_path: &str) -> Option<u32> {
-    const ANALYSIS_MAX_SECONDS: f64 = 45.0;
-    const SILENCE_NOISE_DB: f64 = -30.0;
-    const SILENCE_MIN_DURATION: f64 = 0.25;
-    const MIN_SKIP_SECONDS: f64 = 0.5;
-    const MAX_SKIP_SECONDS: f64 = 30.0;
-    const LEADING_SILENCE_START_TOLERANCE: f64 = 0.05;
+pub(crate) fn parse_leading_silence_stderr(stderr: &str) -> Option<u32> {
+    const MIN_SKIP_SECONDS: f64 = 0.35;
+    const MAX_SKIP_SECONDS: f64 = 8.0;
+    const LEADING_SILENCE_START_TOLERANCE: f64 = 0.25;
+    const SILENCE_END_PREROLL: f64 = 0.08;
 
     fn parse_silence_value(line: &str, key: &str) -> Option<f64> {
         let marker = format!("{key}:");
@@ -713,6 +658,47 @@ async fn analyze_leading_silence_skip_ms(app: &AppHandle, file_path: &str) -> Op
         let token = raw.split_whitespace().next()?;
         token.parse::<f64>().ok().filter(|value| value.is_finite())
     }
+
+    let mut current_silence_start: Option<f64> = None;
+    let mut leading_skip: Option<f64> = None;
+
+    for line in stderr.lines() {
+        if line.contains("silence_start:") {
+            current_silence_start = parse_silence_value(line, "silence_start");
+            continue;
+        }
+        if line.contains("silence_end:") {
+            let silence_end = parse_silence_value(line, "silence_end");
+            let silence_dur = parse_silence_value(line, "silence_duration");
+            if let Some(end) = silence_end {
+                let start = current_silence_start
+                    .or_else(|| silence_dur.map(|dur| (end - dur).max(0.0)))
+                    .unwrap_or(0.0);
+                if start <= LEADING_SILENCE_START_TOLERANCE {
+                    leading_skip = Some(end);
+                    break;
+                }
+            }
+            current_silence_start = None;
+        }
+    }
+
+    leading_skip.and_then(|seconds| {
+        let with_preroll = (seconds - SILENCE_END_PREROLL).max(0.0);
+        if with_preroll < MIN_SKIP_SECONDS {
+            None
+        } else {
+            let clamped = with_preroll.min(MAX_SKIP_SECONDS);
+            Some((clamped * 1000.0).round() as u32)
+        }
+    })
+}
+
+#[allow(dead_code)]
+async fn analyze_leading_silence_skip_ms(app: &AppHandle, file_path: &str) -> Option<u32> {
+    const ANALYSIS_MAX_SECONDS: f64 = 45.0;
+    const SILENCE_NOISE_DB: f64 = -42.0;
+    const SILENCE_MIN_DURATION: f64 = 0.3;
 
     let ffmpeg = crate::resolve_ffmpeg(app).await?;
     let null_device = if cfg!(target_os = "windows") {
@@ -741,41 +727,312 @@ async fn analyze_leading_silence_skip_ms(app: &AppHandle, file_path: &str) -> Op
     ]);
     #[cfg(target_os = "windows")]
     command.creation_flags(CREATE_NO_WINDOW);
+    command.kill_on_drop(true);
 
-    let output = command.output().await.ok()?;
+    let output = match tokio::time::timeout(FFMPEG_ANALYSIS_TIMEOUT, command.output()).await {
+        Ok(Ok(output)) => output,
+        _ => return None,
+    };
     if !output.status.success() {
         return None;
     }
 
     let stderr = String::from_utf8_lossy(&output.stderr);
-    let mut current_silence_start: Option<f64> = None;
-    let mut leading_skip: Option<f64> = None;
+    parse_leading_silence_stderr(&stderr)
+}
 
-    for line in stderr.lines() {
-        if line.contains("silence_start:") {
-            current_silence_start = parse_silence_value(line, "silence_start");
-            continue;
-        }
-        if line.contains("silence_end:") {
-            let silence_end = parse_silence_value(line, "silence_end");
-            if let (Some(start), Some(end)) = (current_silence_start, silence_end) {
-                if start <= LEADING_SILENCE_START_TOLERANCE {
-                    leading_skip = Some(end);
-                    break;
-                }
-            }
-            current_silence_start = None;
-        }
+// ---------------------------------------------------------------------------
+// Availability probe (fast "does this song have lyrics?" signal)
+// ---------------------------------------------------------------------------
+
+/// Tier-0 probe — YTM tab + LRCLIB get, bounded to PROBE_TIMEOUT.
+/// Returns high-confidence availability; low confidence means "unknown, keep
+/// searching". This powers the UI's fast existence signal WITHOUT ever
+/// serving YouTube Music's native timed lyrics.
+pub async fn probe_lyrics_availability(
+    deps: &LyricsDeps<'_>,
+    meta: &LyricTrack,
+    ytm_has_tab: Option<bool>,
+) -> LyricsAvailability {
+    let ytm_tab = ytm_has_tab.unwrap_or(false);
+
+    // The YTM tab existing is a strong signal even before fetching its body.
+    // No InnerTube helper lives here — the probe trusts the caller's
+    // `ytm_has_tab` signal and races LRCLIB get as the text-lyrics fallback.
+    if ytm_tab {
+        return LyricsAvailability {
+            available: true,
+            confidence: 0.92,
+            source: Some(YTM_SOURCE.to_string()),
+            first_lyric_ms: None,
+            ytm_has_tab: true,
+        };
     }
 
-    leading_skip.and_then(|seconds| {
-        if seconds < MIN_SKIP_SECONDS {
-            None
-        } else {
-            let clamped = seconds.min(MAX_SKIP_SECONDS);
-            Some((clamped * 1000.0).round() as u32)
+    let lrclib_res =
+        tokio::time::timeout(PROBE_TIMEOUT, fetch_lrclib_get_fast(deps.http, meta)).await;
+    if let Ok(Some(lyrics)) = lrclib_res {
+        if lyrics.lines.len() >= 2 {
+            return LyricsAvailability {
+                available: true,
+                confidence: 0.88,
+                source: Some(LRCLIB_SOURCE.to_string()),
+                first_lyric_ms: lyrics.lines.first().map(|l| l.start_time_ms),
+                ytm_has_tab: false,
+            };
         }
+    }
+    // Neither fast provider hit — low confidence "unknown", caller should keep full search alive.
+    LyricsAvailability {
+        available: false,
+        confidence: 0.35,
+        source: None,
+        first_lyric_ms: None,
+        ytm_has_tab: ytm_tab,
+    }
+}
+
+async fn fetch_lrclib_get_fast(http: &Client, track: &LyricTrack) -> Option<SyncedLyricsResponse> {
+    let mut params: Vec<(&str, String)> = vec![
+        ("artist_name", track.artist.clone()),
+        ("track_name", track.title.clone()),
+    ];
+    if let Some(album) = track.album.as_ref().filter(|a| !a.trim().is_empty()) {
+        params.push(("album_name", album.clone()));
+    }
+    if let Some(d) = track.duration_seconds {
+        params.push(("duration", d.to_string()));
+    }
+    // Short timeout for the probe path.
+    let resp = tokio::time::timeout(PROBE_LRCLIB_TIMEOUT, async {
+        http.get("https://lrclib.net/api/get").query(&params).send().await.ok()
     })
+    .await
+    .ok()??;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let json: Value = resp.json().await.ok()?;
+    parse_lrclib_entry(&json, track)
+}
+
+// ---------------------------------------------------------------------------
+// Vocal-onset offset — light DSP alternative to a singing-voice model
+// ---------------------------------------------------------------------------
+
+/// Hash of the first few lyric lines — stable key for the offset cache.
+/// Only the textual content matters; timestamps don't affect identity.
+pub fn lyrics_content_hash(lyrics: &SyncedLyricsResponse) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for line in lyrics.lines.iter().take(5) {
+        line.text.trim().to_lowercase().hash(&mut hasher);
+    }
+    (lyrics.lines.len() as u64).hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+pub fn offset_cache_key(video_id: &str) -> String {
+    format!("lyrics-offset-v2-{video_id}")
+}
+
+/// Decide whether a detected vocal onset warrants shifting third-party LRC.
+/// Conservative: only shifts when intro is clearly instrumental and detection
+/// is confident. Returns signed offset to ADD to lyrics timestamps.
+pub fn compute_vocal_offset(
+    first_lyric_ms: u32,
+    vocal_onset_ms: u32,
+    leading_silence_ms: u32,
+) -> Option<(i32, f32, String)> {
+    // Vocal onset is measured from file start (0). Leading silence already
+    // accounts for digital blank; vocal onset should be >= leading silence.
+    let effective_vocal = vocal_onset_ms.saturating_sub(leading_silence_ms);
+    let effective_lyric = first_lyric_ms;
+    let delta = effective_vocal as i32 - effective_lyric as i32;
+    let abs_delta = delta.abs() as u32;
+
+    // Ignore tiny misalignments the user won't perceive; also cap absurd shifts.
+    // Allow larger delta for intro case (early lyric, late vocal) — intros can be 10-12s.
+    if abs_delta < 700 || abs_delta > 15000 {
+        return None;
+    }
+
+    let confidence: f32;
+    let method;
+
+    if first_lyric_ms <= 3000 && vocal_onset_ms >= 8000 && delta > 0 {
+        // Early lyric but late vocal — classic intro case
+        confidence = 0.88;
+        method = "vocal_onset_intro".to_string();
+    } else if delta > 0 && abs_delta >= 1200 {
+        confidence = 0.72;
+        method = "vocal_onset_late".to_string();
+    } else if delta < 0 && abs_delta >= 1000 {
+        // Lyrics lag vocals — less common, lower confidence
+        confidence = 0.60;
+        method = "vocal_onset_early".to_string();
+    } else {
+        method = "vocal_onset".to_string();
+        confidence = 0.55;
+    }
+
+    if confidence < 0.55 {
+        return None;
+    }
+
+    // Clamp to safe range so a bad detection never jumps lyrics off-screen.
+    let clamped = delta.clamp(-4000, 8000);
+    Some((clamped, confidence, method))
+}
+
+/// Light DSP vocal onset: decode first 45s to 16kHz mono f32le and look for
+/// the first sustained energy plateau. No ML — ~80% accurate on pop/rock,
+/// conservative gating in `compute_vocal_offset` avoids wrong shifts.
+pub async fn detect_vocal_onset_ms(app: &AppHandle, file_path: &str) -> Option<u32> {
+    let ffmpeg = crate::resolve_ffmpeg(app).await?;
+    let mut cmd = Command::new(&ffmpeg);
+    cmd.args([
+        "-nostdin",
+        "-hide_banner",
+        "-nostats",
+        "-t",
+        &format!("{:.1}", VOCAL_ANALYSIS_SECONDS),
+        "-i",
+        file_path,
+        "-vn",
+        "-ac",
+        "1",
+        "-ar",
+        &VOCAL_SAMPLE_RATE.to_string(),
+        "-f",
+        "f32le",
+        "-acodec",
+        "pcm_f32le",
+        "-",
+    ]);
+    #[cfg(target_os = "windows")]
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::null());
+    cmd.kill_on_drop(true);
+
+    let child = cmd.spawn().ok()?;
+    let output = tokio::time::timeout(Duration::from_secs(8), child.wait_with_output())
+        .await
+        .ok()?
+        .ok()?;
+    if !output.status.success() && output.stdout.is_empty() {
+        return None;
+    }
+    let pcm_bytes = output.stdout;
+    if pcm_bytes.len() < (VOCAL_SAMPLE_RATE as usize * 2 * 4) {
+        return None; // too short
+    }
+    let samples: Vec<f32> = pcm_bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+
+    detect_vocal_onset_from_samples(&samples, VOCAL_SAMPLE_RATE)
+}
+
+fn detect_vocal_onset_from_samples(samples: &[f32], sample_rate: u32) -> Option<u32> {
+    let window = (sample_rate * VOCAL_WINDOW_MS / 1000) as usize;
+    let hop = (sample_rate * VOCAL_HOP_MS / 1000) as usize;
+    if window == 0 || hop == 0 || samples.len() < window {
+        return None;
+    }
+    let mut rms_db: Vec<f32> = Vec::new();
+    let mut idx = 0usize;
+    while idx + window <= samples.len() {
+        let sum_sq: f64 = samples[idx..idx + window]
+            .iter()
+            .map(|s| (*s as f64) * (*s as f64))
+            .sum();
+        let rms = (sum_sq / window as f64).sqrt();
+        let db = if rms < 1e-9 {
+            -90.0
+        } else {
+            20.0 * rms.log10()
+        };
+        rms_db.push(db as f32);
+        idx += hop;
+    }
+    if rms_db.len() < 50 {
+        return None;
+    }
+    // Noise floor = 10th percentile
+    let mut sorted = rms_db.clone();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let p10_idx = sorted.len() / 10;
+    let noise_floor = sorted[p10_idx] as f64;
+    let thresh_db = (noise_floor + VOCAL_ONSET_DB_ABOVE_FLOOR).max(VOCAL_ABSOLUTE_FLOOR_DB);
+    let sustain_windows = (VOCAL_MIN_SUSTAIN_MS / VOCAL_HOP_MS) as usize;
+    let phrase_windows = (VOCAL_MIN_PHRASE_MS / VOCAL_HOP_MS) as usize;
+
+    for start in 0..rms_db.len().saturating_sub(sustain_windows + phrase_windows) {
+        let mut ok = true;
+        for w in 0..sustain_windows {
+            if (rms_db[start + w] as f64) < thresh_db {
+                ok = false;
+                break;
+            }
+        }
+        if !ok {
+            continue;
+        }
+        // Check phrase sustain: average of next phrase_windows stays above thresh-2dB
+        let avg: f64 = rms_db[start..start + phrase_windows]
+            .iter()
+            .map(|v| *v as f64)
+            .sum::<f64>()
+            / phrase_windows as f64;
+        if avg < thresh_db - 2.0 {
+            continue;
+        }
+        // Also ensure variance is not huge (reject transient drum burst that decays)
+        let var: f64 = rms_db[start..start + phrase_windows]
+            .iter()
+            .map(|v| {
+                let d = *v as f64 - avg;
+                d * d
+            })
+            .sum::<f64>()
+            / phrase_windows as f64;
+        if var > 80.0 {
+            continue;
+        }
+        let onset_ms = (start as u32) * VOCAL_HOP_MS;
+        // Ignore onsets in first 400ms — often click/pop
+        if onset_ms < 400 {
+            continue;
+        }
+        return Some(onset_ms);
+    }
+    None
+}
+
+pub fn apply_vocal_offset(mut lyrics: SyncedLyricsResponse, offset_ms: i32) -> SyncedLyricsResponse {
+    if offset_ms == 0 {
+        return lyrics;
+    }
+    for line in &mut lyrics.lines {
+        let new_start = (line.start_time_ms as i32 + offset_ms).max(0) as u32;
+        line.start_time_ms = new_start;
+        line.id = new_start;
+        if let Some(end) = line.end_time_ms {
+            let new_end = (end as i32 + offset_ms).max(0) as u32;
+            line.end_time_ms = Some(new_end);
+        }
+        if let Some(words) = line.words.as_mut() {
+            for word in words {
+                word.start_time_ms = (word.start_time_ms as i32 + offset_ms).max(0) as u32;
+                word.end_time_ms = (word.end_time_ms as i32 + offset_ms).max(0) as u32;
+            }
+        }
+    }
+    lyrics.applied_offset_ms = Some(offset_ms);
+    lyrics
 }
 
 // ---------------------------------------------------------------------------
@@ -937,6 +1194,7 @@ async fn fetch_musixmatch_richsync(
         lines,
         source: Some(MUSIXMATCH_SOURCE.to_string()),
         has_per_word_sync: Some(true),
+        applied_offset_ms: None,
     })
 }
 
@@ -1361,40 +1619,6 @@ mod tests {
     }
 
     #[test]
-    fn extract_lyrics_browse_id_reads_next_tabs() {
-        let response = serde_json::json!({
-            "contents": {
-                "singleColumnMusicWatchNextResultsRenderer": {
-                    "tabbedRenderer": {
-                        "watchNextTabbedResultsRenderer": {
-                            "tabs": [
-                                {
-                                    "tabRenderer": {
-                                        "endpoint": {
-                                            "browseEndpoint": {
-                                                "browseId": "MPLYt_abc123",
-                                                "browseEndpointContextSupportedConfigs": {
-                                                    "browseEndpointContextMusicConfig": {
-                                                        "pageType": "MUSIC_PAGE_TYPE_TRACK_LYRICS"
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            ]
-                        }
-                    }
-                }
-            }
-        });
-        assert_eq!(
-            extract_lyrics_browse_id_from_next(&response).as_deref(),
-            Some("MPLYt_abc123")
-        );
-    }
-
-    #[test]
     fn score_sync_quality_rejects_single_timestamp() {
         let lines = vec![
             TimedLyricLine {
@@ -1413,5 +1637,107 @@ mod tests {
             },
         ];
         assert_eq!(score_sync_quality(&lines, Some(180)), 0);
+    }
+
+    #[test]
+    fn compute_vocal_offset_intro_case() {
+        // Early lyric (1s) but vocal at 12s — classic intro, should offset +11s clamped to 8s
+        let result = compute_vocal_offset(1200, 12000, 0);
+        assert!(result.is_some());
+        let (offset, conf, _) = result.unwrap();
+        assert!(offset > 700 && offset <= 8000);
+        assert!(conf >= 0.8);
+    }
+
+    #[test]
+    fn compute_vocal_offset_ignores_small_delta() {
+        assert!(compute_vocal_offset(5000, 5400, 0).is_none()); // 400ms < 700 threshold
+        assert!(compute_vocal_offset(5000, 5600, 300).is_none()); // 300ms after leading silence
+    }
+
+    #[test]
+    fn compute_vocal_offset_leading_silence_subtracted() {
+        // File has 2s leading silence, vocal at 4s, lyric at 1s → effective vocal 2s, delta 1s
+        let result = compute_vocal_offset(1000, 4000, 2000);
+        assert!(result.is_some());
+        let (offset, _, _) = result.unwrap();
+        assert_eq!(offset, 1000);
+    }
+
+    #[test]
+    fn lyrics_content_hash_stable() {
+        let a = SyncedLyricsResponse { lines: vec![TimedLyricLine { id: 0, text: "hello".into(), start_time_ms: 0, end_time_ms: None, words: None }, TimedLyricLine { id: 1000, text: "world".into(), start_time_ms: 1000, end_time_ms: None, words: None }], source: None, has_per_word_sync: None, applied_offset_ms: None };
+        let b = SyncedLyricsResponse { lines: vec![TimedLyricLine { id: 5, text: "  Hello ".into(), start_time_ms: 5, end_time_ms: None, words: None }, TimedLyricLine { id: 1005, text: "WORLD".into(), start_time_ms: 1005, end_time_ms: None, words: None }], source: Some("other".into()), has_per_word_sync: Some(true), applied_offset_ms: Some(100) };
+        assert_eq!(lyrics_content_hash(&a), lyrics_content_hash(&b));
+    }
+
+    #[test]
+    fn detect_vocal_onset_from_silence_then_tone() {
+        // 5s of near-silence then sustained tone at -20dB should trigger ~5s onset
+        let sr = VOCAL_SAMPLE_RATE;
+        let silence_len = (sr * 5) as usize;
+        let tone_len = (sr * 2) as usize;
+        let mut samples = vec![0.0f32; silence_len];
+        samples.extend(vec![0.1f32; tone_len]); // -20dB approx
+        samples.extend(vec![0.0f32; 1000]);
+        let onset = detect_vocal_onset_from_samples(&samples, sr);
+        assert!(onset.is_some());
+        let ms = onset.unwrap();
+        assert!(ms >= 4800 && ms <= 5500, "onset {ms} not in expected 5s window");
+    }
+
+    #[test]
+    fn detect_vocal_onset_rejects_transient_click() {
+        // Single 20ms click should not count as vocal (needs 320ms sustain)
+        let sr = VOCAL_SAMPLE_RATE;
+        let mut samples = vec![0.0f32; (sr * 3) as usize];
+        let click_start = sr as usize; // 1s in
+        for i in 0..(sr * 20 / 1000) as usize {
+            samples[click_start + i] = 0.5;
+        }
+        let onset = detect_vocal_onset_from_samples(&samples, sr);
+        assert!(onset.is_none() || onset.unwrap() > 4000);
+    }
+
+    #[test]
+    fn parse_leading_silence_stderr_standard_format() {
+        let stderr = "[Parsed_silencedetect_0 @ 0x123] silence_start: 0\n[Parsed_silencedetect_0 @ 0x123] silence_end: 2.0 | silence_duration: 2.0\n";
+        let skip = parse_leading_silence_stderr(stderr);
+        // 2.0s - 0.08s preroll = 1.92s = 1920ms
+        assert_eq!(skip, Some(1920));
+    }
+
+    #[test]
+    fn parse_leading_silence_stderr_duration_fallback() {
+        // Missing silence_start line, only silence_end with silence_duration
+        let stderr = "[Parsed_silencedetect_0 @ 0x123] silence_end: 1.5 | silence_duration: 1.5\n";
+        let skip = parse_leading_silence_stderr(stderr);
+        // 1.5s - 0.08s preroll = 1.42s = 1420ms
+        assert_eq!(skip, Some(1420));
+    }
+
+    #[test]
+    fn parse_leading_silence_stderr_with_encoder_priming() {
+        // Silence starts at 0.12s (within 0.25s tolerance)
+        let stderr = "[Parsed_silencedetect_0 @ 0x123] silence_start: 0.12\n[Parsed_silencedetect_0 @ 0x123] silence_end: 2.0 | silence_duration: 1.88\n";
+        let skip = parse_leading_silence_stderr(stderr);
+        // 2.0s - 0.08s preroll = 1.92s = 1920ms
+        assert_eq!(skip, Some(1920));
+    }
+
+    #[test]
+    fn parse_leading_silence_stderr_ignores_mid_track_silence() {
+        // Silence starts at 15.0s (not leading)
+        let stderr = "[Parsed_silencedetect_0 @ 0x123] silence_start: 15.0\n[Parsed_silencedetect_0 @ 0x123] silence_end: 18.0 | silence_duration: 3.0\n";
+        let skip = parse_leading_silence_stderr(stderr);
+        assert_eq!(skip, None);
+    }
+
+    #[test]
+    fn parse_leading_silence_stderr_rejects_sub_minimum_silence() {
+        // 0.3s silence - 0.08s preroll = 0.22s (< 0.35s min skip)
+        let stderr = "[Parsed_silencedetect_0 @ 0x123] silence_start: 0\n[Parsed_silencedetect_0 @ 0x123] silence_end: 0.3 | silence_duration: 0.3\n";
+        let skip = parse_leading_silence_stderr(stderr);
+        assert_eq!(skip, None);
     }
 }

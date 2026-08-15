@@ -29,8 +29,8 @@ export function useGlobalContextMenus({
           const track = lookupContextTrack(trackId);
           if (track) {
             onSongContextMenu(track, { x: event.clientX, y: event.clientY });
+            return;
           }
-          return;
         }
 
         const raw = songTrigger.getAttribute("data-track");

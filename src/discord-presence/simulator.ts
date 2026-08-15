@@ -202,7 +202,6 @@ export class DiscordPresenceSimulator {
   private scheduleConfirmBurst(): void {
     this.confirmBurstTimers = [];
     this.confirmBurstSerial += 1;
-    const serial = this.confirmBurstSerial;
     const targetGeneration = this.engineState.syncGeneration;
     for (const delayMs of [350, 900, 2_000, 4_500]) {
       this.confirmBurstTimers.push({

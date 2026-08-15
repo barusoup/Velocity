@@ -33,8 +33,8 @@ import {
 
 function applyPresenceEffects(
   effects: PresenceEngineEffect[],
-  getInput: () => PresenceSyncInput,
-  engineStateRef: { current: PresenceEngineState },
+  _getInput: () => PresenceSyncInput,
+  _engineStateRef: { current: PresenceEngineState },
   queueSync: (payload: DiscordPresencePayload, generation: number) => void,
   scheduleRetry: (delayMs: number) => void,
   cancelRetry: () => void,
@@ -340,6 +340,7 @@ export function useDiscordRichPresence(): void {
 
   useEffect(() => () => {
     cancelConfirmBurst();
+    cancelRetry();
     dispatch(reducePresenceUnmount);
   }, []);
 }

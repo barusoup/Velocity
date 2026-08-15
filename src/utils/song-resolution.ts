@@ -1,9 +1,10 @@
 import { getEntityDetail, searchMusic } from "../api";
 import type { MediaTrack, SearchItem } from "../types";
-import { isExcludedNonMusicStreamKind } from "./media";
+import { isExcludedNonMusicStreamKind, isLikelyMusicVideoTrack } from "./media";
 import { getSearchItemArtist, isPlaceholderArtist } from "./search";
+import { isVariantRecordingTitle, titleLooksLikeMusicVideo } from "./track-titles";
 
-const SEARCH_MATCH_TIMEOUT_MS = 4_000;
+const SEARCH_MATCH_TIMEOUT_MS = 6_000;
 const AUTOPLAY_MIN_ARTIST_OVERLAP = 0.25;
 const AUTOPLAY_MIN_TITLE_OVERLAP = 0.25;
 const AUTOPLAY_RESOLVE_CONCURRENCY = 4;
@@ -161,8 +162,43 @@ async function searchCandidatesForCanonicalTrack(track: MediaTrack): Promise<Sea
   return searchMusicCandidates(query);
 }
 
+/**
+ * Song-kind search rows that are genuine audio uploads. Music videos and
+ * other non-song media are excluded even when YouTube Music surfaces them
+ * under a "song" label (or no label at all) — otherwise a music video could
+ * be picked as the "studio song" replacement, replacing a video with a
+ * video. Recording variants (live, acoustic, ...) are kept here because they
+ * are still audio; the variant-vs-studio policy is enforced by each caller.
+ */
+function songAudioCandidates(candidates: readonly SearchItem[]): SearchItem[] {
+  return candidates.filter(
+    (item) =>
+      item.kind === "song" &&
+      item.videoId != null &&
+      !isLikelyMusicVideoTrack({
+        kind: item.kind,
+        title: item.title,
+        videoId: item.videoId,
+      }) &&
+      !searchItemMetaIndicatesVideo(item),
+  );
+}
+
+/** Song-kind rows safe to treat as studio-song swap targets (no variants). */
 function songKindCandidates(candidates: readonly SearchItem[]): SearchItem[] {
-  return candidates.filter((item) => item.kind === "song" && item.videoId);
+  return songAudioCandidates(candidates).filter(
+    (item) => !isVariantRecordingTitle(item.title),
+  );
+}
+
+// YT Music labels true songs with a "plays" count and music videos with a
+// "views" count. A row whose meta carries a view count (but no play count) is
+// really a video, even if its type label says "song".
+const SEARCH_VIEWS_RE = /\bviews?\b/i;
+const SEARCH_PLAYS_RE = /\bplays?\b/i;
+function searchItemMetaIndicatesVideo(item: SearchItem): boolean {
+  const meta = item.subtitle ?? "";
+  return SEARCH_VIEWS_RE.test(meta) && !SEARCH_PLAYS_RE.test(meta);
 }
 
 /** Whether search already lists this upload as the intended artist/title row. */
@@ -208,7 +244,7 @@ function shouldTrustCataloguedUpload(
  * cleaned title search, matching the pre-refactor `findClosestSongForVideoTrack`.
  */
 function findClosestSongFromCandidates(
-  video: Pick<MediaTrack, "artist" | "title" | "videoId" | "durationSeconds">,
+  video: Pick<MediaTrack, "artist" | "title" | "videoId" | "resolvedVideoId" | "durationSeconds">,
   candidates: readonly SearchItem[],
   options?: { skipCataloguedTrust?: boolean },
 ): SearchItem | null {
@@ -254,7 +290,7 @@ function findClosestSongFromCandidates(
       continue;
     }
     const matchedVideoId = entry.song.videoId!;
-    if (matchedVideoId === video.videoId) continue;
+    if (matchedVideoId === video.videoId || matchedVideoId === video.resolvedVideoId) continue;
     return entry.song;
   }
   return null;
@@ -265,7 +301,7 @@ function findClosestSongFromCandidates(
  * scan skipping the source videoId, matching pre-refactor canonical lookup.
  */
 function findCanonicalSongFromCandidates(
-  track: Pick<MediaTrack, "artist" | "title" | "videoId" | "durationSeconds">,
+  track: Pick<MediaTrack, "artist" | "title" | "videoId" | "resolvedVideoId" | "durationSeconds">,
   candidates: readonly SearchItem[],
   options?: { skipCataloguedTrust?: boolean },
 ): SearchItem | null {
@@ -305,7 +341,7 @@ function findCanonicalSongFromCandidates(
       continue;
     }
     const matchedVideoId = entry.song.videoId!;
-    if (matchedVideoId === track.videoId) continue;
+    if (matchedVideoId === track.videoId || matchedVideoId === track.resolvedVideoId) continue;
     return entry.song;
   }
   return null;
@@ -357,6 +393,13 @@ export async function findAlbumListingMatch(
     const entity = await getEntityDetail(browseId);
     for (const row of entity.tracks) {
       if (!row.videoId || row.videoId === track.videoId) continue;
+      // Never swap onto a music-video or variant row from the album shelf.
+      if (
+        row.kind === "video" ||
+        titleLooksLikeMusicVideo(row.title) ||
+        isVariantRecordingTitle(row.title)
+      )
+        continue;
       if (!artistsMatchForAudioSwap(track.artist, row.artist)) continue;
       if (!titlesMatchForAudioSwap(track.title, row.title)) continue;
       return { videoId: row.videoId, row };
@@ -375,12 +418,14 @@ export async function findAlbumListingVideoId(
   return match?.videoId ?? null;
 }
 
-/** Whether a yt-dlp / stream-resolve failure should try an alternate videoId. */
+/** Whether a yt-dlp / stream-resolve failure is a definite "this id will never play" refusal. */
 export function isUnplayableStreamError(message: string): boolean {
   const lower = message.toLowerCase();
   return (
     lower.includes("sign in to confirm your age") ||
-    (lower.includes("confirm your age")) ||
+    lower.includes("confirm your age") ||
+    lower.includes("confirm you") ||
+    lower.includes("not a bot") ||
     lower.includes("private video") ||
     lower.includes("video unavailable") ||
     lower.includes("this video is not available") ||
@@ -388,6 +433,125 @@ export function isUnplayableStreamError(message: string): boolean {
     lower.includes("unable to download video data") ||
     lower.includes("forbidden")
   );
+}
+
+/** Whether a stream-resolve failure was a frontend timeout rather than a definite refusal. */
+export function isStreamResolveTimeout(message: string): boolean {
+  const lower = message.toLowerCase();
+  return (
+    lower.includes("took too long") ||
+    lower.includes("timed out") ||
+    lower.includes("timeout")
+  );
+}
+
+// Recording-variant suffixes we tolerate when matching a playable alternate
+// for a song whose studio upload is unplayable ("Paranoid Android (Live)",
+// "Song (Acoustic)", "Song (Live at the BBC)", ...). Only parenthesized /
+// dash-prefixed trailing variants are stripped so we never mutate a title
+// that merely contains such a word.
+const RECORDING_VARIANT_SUFFIX_REGEX =
+  /\s*[\(\[]\s*(live(?:\s*[\d\-–]+)?(?:\s+at\s+.+?)?|acoustic|unplugged|remix|demo|outtake|outtakes|instrumental|karaoke|cover|session|reprise|version|ver|normal|special|original|edit|extended|radio)\s*[\)\]]\s*$/i;
+const DASHED_RECORDING_VARIANT_SUFFIX_REGEX =
+  /\s*[-–—]\s*(live(?:\s*[\d\-–]+)?(?:\s+at\s+.+)?|acoustic|unplugged|remix|demo|outtake|outtakes|instrumental|karaoke|cover|session|reprise|version|ver|normal|special|original|edit|extended|radio)\s*$/i;
+
+function stripRecordingVariantSuffix(title: string): string {
+  return title
+    .replace(RECORDING_VARIANT_SUFFIX_REGEX, "")
+    .replace(DASHED_RECORDING_VARIANT_SUFFIX_REGEX, "")
+    .trim()
+    .replace(/[\s\-–—:]+$/g, "")
+    .trim();
+}
+
+/**
+ * Same-song title equivalence for the playback fallback. Unlike
+ * `titlesMatchForAudioSwap` this ALLOWS recording variants (live, acoustic,
+ * official music video, ...) AND cross-edition uploads (a 2007 remaster can
+ * fall back to the original studio cut) because the fallback exists to find
+ * ANY playable upload of the song when the intended studio id is unplayable.
+ * Artist + duration guards downstream keep it from matching a different song
+ * or a cover.
+ */
+function titlesMatchForSameSongFallback(sourceTitle: string, candidateTitle: string): boolean {
+  const source = normalizeAutoplayMatchText(
+    stripRecordingVariantSuffix(cleanAutoplaySearchTitle(sourceTitle)),
+  );
+  const candidate = normalizeAutoplayMatchText(
+    stripRecordingVariantSuffix(cleanAutoplaySearchTitle(candidateTitle)),
+  );
+  if (!source || !candidate) return false;
+  return source === candidate;
+}
+
+type SameSongAlternateInput = Pick<
+  MediaTrack,
+  "artist" | "title" | "videoId" | "resolvedVideoId" | "durationSeconds" | "kind"
+>;
+
+/**
+ * Best playable same-song alternate for a track whose current stream id
+ * failed. Scans song-kind search rows only — a music video (or any other
+ * non-song media) is never acceptable audio, so it can never be an
+ * alternate — and ranks studio uploads above recording variants. Never
+ * returns an id in `excluded` (the failing ids).
+ */
+function findPlayableSameSongAlternate(
+  track: SameSongAlternateInput,
+  candidates: readonly SearchItem[],
+  excluded: ReadonlySet<string>,
+): SearchItem | null {
+  // A studio track must never silently play a recording-variant upload (live,
+  // acoustic, remix, ...) as its audio — that is "wrong audio relative to the
+  // track". Variants are only acceptable alternates when the SOURCE is itself
+  // a variant. Music videos are filtered out before ranking, so they can
+  // never become a fallback at all.
+  const sourceIsVariant = recordingVariantFlags(track.title).hasVariant;
+  const ranked = songAudioCandidates(candidates)
+    .filter((item) => item.videoId && !excluded.has(item.videoId))
+    .map((item, index) => {
+      const variant = recordingVariantFlags(item.title).hasVariant;
+      const priority = variant ? 1 : 0;
+
+      const sourceSeconds = track.durationSeconds;
+      const candidateSeconds = item.durationSeconds;
+      let durationDelta = Number.POSITIVE_INFINITY;
+      if (
+        sourceSeconds != null &&
+        Number.isFinite(sourceSeconds) &&
+        candidateSeconds != null &&
+        Number.isFinite(candidateSeconds)
+      ) {
+        durationDelta = Math.abs(sourceSeconds - candidateSeconds);
+      }
+
+      const artistMatch = artistsMatchForAudioSwap(track.artist, item.artist ?? "");
+      return {
+        item,
+        index,
+        priority,
+        artistMatch,
+        durationDelta,
+        durationOk: isDurationMatchForAutoplaySwap(sourceSeconds, candidateSeconds, {
+          allowMissingCandidate: true,
+        }),
+      };
+    })
+    .filter(
+      (entry) =>
+        entry.durationOk &&
+        entry.artistMatch &&
+        (sourceIsVariant || !recordingVariantFlags(entry.item.title).hasVariant) &&
+        titlesMatchForSameSongFallback(track.title, entry.item.title),
+    )
+    .sort(
+      (a, b) =>
+        a.priority - b.priority ||
+        a.durationDelta - b.durationDelta ||
+        a.index - b.index,
+    );
+
+  return ranked[0]?.item ?? null;
 }
 
 function isCataloguedSongUpload(
@@ -433,8 +597,10 @@ export function trackNeedsStudioSongResolution(
   if (track.kind === "video") return true;
   if (titleExplicitlyMusicVideo(track.title)) return true;
   if (!track.videoId) return false;
-  // Search excludes `kind === "video"` (Rust `should_include_search_item`), so
-  // detect mislabeled uploads when search surfaces a different song row.
+  // Music videos surface in search either as `kind === "video"` or (when
+  // mislabeled) as song rows with an explicit music-video title; `songKindCandidates`
+  // excludes both, so detect mislabeled uploads when search surfaces a
+  // different real studio-song row.
   return hasDistinctStudioSongCandidate(track, candidates);
 }
 
@@ -444,11 +610,11 @@ export function trackNeedsStudioSongResolution(
  * video never resolves to itself.
  */
 export function findStudioSongForTrack(
-  track: Pick<MediaTrack, "artist" | "title" | "videoId" | "durationSeconds">,
+  track: Pick<MediaTrack, "artist" | "title" | "videoId" | "resolvedVideoId" | "durationSeconds">,
   candidates: readonly SearchItem[],
   options?: { allowMissingCandidateDuration?: boolean; skipCataloguedTrust?: boolean },
 ): SearchItem | null {
-  const songs = candidates.filter((item) => item.kind === "song" && item.videoId);
+  const songs = songKindCandidates(candidates);
   if (songs.length === 0) return null;
 
   if (!options?.skipCataloguedTrust && shouldTrustCataloguedUpload(track, candidates)) {
@@ -477,7 +643,7 @@ export function findStudioSongForTrack(
     if (!entry.artistMatch) continue;
     if (!titlesMatchForAudioSwap(track.title, entry.song.title)) continue;
     const matchedVideoId = entry.song.videoId!;
-    if (matchedVideoId === track.videoId) continue;
+    if (matchedVideoId === track.videoId || matchedVideoId === track.resolvedVideoId) continue;
     if (
       !isDurationMatchForAutoplaySwap(track.durationSeconds, entry.song.durationSeconds, {
         allowMissingCandidate: options?.allowMissingCandidateDuration,
@@ -724,14 +890,14 @@ export async function resolveStreamTrackAudio(track: MediaTrack): Promise<MediaT
   try {
     const candidates = await searchCandidatesForTrack(track);
     const needsResolution = trackNeedsStudioSongResolution(track, candidates);
-    let { resolvedVideoId, matched } = await resolvePlaybackVideoId(track, candidates);
+    let { resolvedVideoId, matched: _matched } = await resolvePlaybackVideoId(track, candidates);
 
     if (!resolvedVideoId && needsResolution && track.kind !== "video") {
       const canonicalCandidates = await searchCandidatesForCanonicalTrack(track);
       const canonical = findCanonicalSongFromCandidates(track, canonicalCandidates);
       if (canonical?.videoId && canonical.videoId !== track.videoId) {
         resolvedVideoId = canonical.videoId;
-        matched = canonical;
+        _matched = canonical;
       }
     }
 
@@ -747,18 +913,51 @@ export async function resolveStreamTrackAudio(track: MediaTrack): Promise<MediaT
 
 /**
  * Last-resort playback resolver used when yt-dlp cannot fetch the current
- * videoId (age-gated uploads, etc.). Re-queries YT Music and prefers the
- * album-shelf videoId for the same remaster row.
+ * videoId (age-gated uploads, timeouts, etc.).
+ *
+ * Unlike `resolveStreamTrackAudio` this runs even after the track was already
+ * resolved to a studio upload — the resolved id can itself be unplayable (e.g.
+ * some Radiohead Topic uploads time out in yt-dlp). It re-queries YT Music and
+ * finds a PLAYABLE alternate videoId for the SAME song:
+ *
+ *   1. the album-shelf videoId for the same remaster row (existing behavior),
+ *   2. otherwise the best same-song candidate from the search response,
+ *      scanning song-kind rows only — studio uploads, plus recording
+ *      variants (live, acoustic, ...) when the source is itself a variant.
+ *      Music videos and other non-song media are never used as alternates.
+ *
+ * The returned track only gains a `resolvedVideoId` — its release-scoped
+ * studio-song metadata is preserved, so the row never turns into a music
+ * video. `options.excludeVideoIds` (the id that just failed) keeps retries
+ * from bouncing off the same dead id.
  */
-export async function resolveStreamTrackAudioFallback(track: MediaTrack): Promise<MediaTrack | null> {
+export async function resolveStreamTrackAudioFallback(
+  track: MediaTrack,
+  options?: { excludeVideoIds?: readonly string[] },
+): Promise<MediaTrack | null> {
   if (track.source !== "stream" || !track.videoId) return null;
-  if (track.resolvedVideoId && track.resolvedVideoId !== track.videoId) return null;
+
+  const excluded = new Set<string>();
+  // Only song uploads are ever considered alternates, so a music-video row
+  // the user originally clicked is not a recovery source. Self-replacement
+  // is still prevented because the currently-failing `excludeVideoIds` (the
+  // effective id) is always excluded.
+  if (track.resolvedVideoId) excluded.add(track.resolvedVideoId);
+  for (const id of options?.excludeVideoIds ?? []) {
+    excluded.add(id);
+  }
 
   try {
     const candidates = await searchCandidatesForTrack(track);
+
     const albumListingMatch = await findAlbumListingMatch(track, candidates);
-    if (!albumListingMatch || albumListingMatch.videoId === track.videoId) return null;
-    return trackWithResolvedVideoId(track, albumListingMatch.videoId);
+    if (albumListingMatch && !excluded.has(albumListingMatch.videoId)) {
+      return trackWithResolvedVideoId(track, albumListingMatch.videoId);
+    }
+
+    const alternate = findPlayableSameSongAlternate(track, candidates, excluded);
+    if (!alternate || !alternate.videoId) return null;
+    return trackWithResolvedVideoId(track, alternate.videoId);
   } catch (error) {
     console.warn("Stream playback fallback lookup failed:", error);
     return null;

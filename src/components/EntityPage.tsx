@@ -10,7 +10,12 @@ import {
   Pause,
   Play,
 } from "lucide-react";
-import { getEntityDetail, peekEntityDetail } from "../api";
+import {
+  cacheSavedAlbumDetail,
+  getEntityDetail,
+  peekCachedSavedAlbumDetail,
+  peekEntityDetail,
+} from "../api";
 import { type SavedAlbum } from "../collection";
 import {
   useIsAlbumSaved,
@@ -38,8 +43,8 @@ import { Marquee } from "./Marquee";
 import {
   ALBUM_TRACK_GRID_WITH_PLAYS,
   COMPACT_TRACK_GRID,
-  TrackListHeader,
 } from "./TrackList";
+import { UnifiedTrackList } from "./UnifiedTrackList";
 import type { View } from "./Sidebar";
 import {
   ArtistCreditText,
@@ -53,7 +58,7 @@ import { useSetting, setSetting, type ViewMode } from "../settings";
 import { useTrackMetadataBackfill } from "../hooks/useTrackMetadataBackfill";
 import { useContextTrackTarget } from "../hooks/useContextTrackTarget";
 import { useTrackPlaybackState } from "../hooks/usePlayerSelectors";
-import { VirtualList } from "./VirtualList";
+
 
 export function EntityPage({
   browseId,
@@ -77,27 +82,48 @@ export function EntityPage({
   // first paint, skipping the loading-panel flash the async `.then` would
   // otherwise produce. The effect below still re-fetches (and re-caches)
   // so a stale peek never traps the page in an outdated state.
+  const isAlbumSaved = useIsAlbumSaved(browseId);
+  // Mirror the save state into a ref so the data effect (deps: `browseId`
+  // only) can consult the freshest value when its promise resolves without
+  // re-fetching every time the user toggles the album's saved state.
+  const isAlbumSavedRef = useRef(isAlbumSaved);
+  isAlbumSavedRef.current = isAlbumSaved;
+
   const [state, setState] = useState<{
     status: "loading" | "ready" | "error";
     data?: EntityDetail;
     error?: string;
   }>(() => {
-    const cached = peekEntityDetail(browseId);
+    // Saved albums carry a disk copy of their detail, so a cold launch
+    // (or any offline launch) can render the full album without waiting
+    // for (or failing) the network fetch. Fall back to it after the
+    // in-memory session cache.
+    const cached = peekEntityDetail(browseId) ?? peekCachedSavedAlbumDetail(browseId);
     if (cached) return { status: "ready", data: cached };
     return { status: "loading" };
   });
 
   useEffect(() => {
     let cancelled = false;
-    if (!peekEntityDetail(browseId)) setState({ status: "loading" });
+    if (!peekEntityDetail(browseId) && !peekCachedSavedAlbumDetail(browseId)) {
+      setState({ status: "loading" });
+    }
 
     getEntityDetail(browseId)
       .then((data) => {
         if (cancelled) return;
         setState({ status: "ready", data });
+        // Keep the disk copy fresh whenever a saved album loads online, so
+        // the offline fallback reflects the latest track list / cover.
+        if (data.kind === "album" && isAlbumSavedRef.current) {
+          cacheSavedAlbumDetail(browseId, data);
+        }
       })
       .catch((error) => {
         if (cancelled) return;
+        // `getEntityDetail` already falls back to the disk copy on failure,
+        // so reaching this catch means neither the network nor a saved-album
+        // cache has the page.
         setState({
           status: "error",
           error: error instanceof Error ? error.message : "Failed to load page.",
@@ -198,7 +224,7 @@ function PlaylistPage({
   return (
     <div className="overflow-x-hidden bg-black pb-0">
       <section
-        className="relative flex min-h-[clamp(17.75rem,26vw,22rem)] items-end px-[var(--ui-page-pad)] pl-[var(--ui-page-left-pad)] pb-[clamp(1.35rem,2.2vw,1.9rem)] pt-[calc(var(--ui-topbar-height)+clamp(0.75rem,1.5vw,1.25rem))]"
+        className="relative flex min-h-[clamp(17.75rem,26vw,22rem)] items-end px-[var(--ui-page-pad)] pl-[var(--ui-page-left-pad)] pr-[var(--ui-page-right-pad)] pb-[clamp(1.35rem,2.2vw,1.9rem)] pt-[calc(var(--ui-topbar-height)+clamp(0.75rem,1.5vw,1.25rem))]"
         style={heroStyle}
       >
         <div className="flex min-w-0 flex-col gap-[clamp(1.25rem,2vw,1.75rem)] md:flex-row md:items-end">
@@ -238,7 +264,7 @@ function PlaylistPage({
       </section>
 
       <section
-        className="px-[var(--ui-page-pad)] pl-[var(--ui-page-left-pad)] pb-[clamp(1rem,2vw,1.4rem)] pt-[clamp(1.1rem,2.2vw,1.6rem)] transition-opacity duration-150"
+        className="px-[var(--ui-page-pad)] pl-[var(--ui-page-left-pad)] pr-[var(--ui-page-right-pad)] pb-[clamp(1rem,2vw,1.4rem)] pt-[clamp(1.1rem,2.2vw,1.6rem)] transition-opacity duration-150"
         style={controlStyle}
       >
         <div className="flex min-h-[3rem] flex-wrap items-center gap-4 sm:gap-5">
@@ -274,12 +300,14 @@ function PlaylistPage({
         </div>
       </section>
 
-      <section className="bg-black px-[var(--ui-page-pad)] pl-[var(--ui-page-left-pad)] pb-[clamp(2.5rem,3.125vw,4rem)] pt-[clamp(1.4rem,3vw,2.2rem)]">
-        <VirtualList
-          items={displayPlaylistTracks}
+      <section className="bg-black px-[var(--ui-page-pad)] pl-[var(--ui-page-left-pad)] pr-[var(--ui-page-right-pad)] pb-[clamp(2.5rem,3.125vw,4rem)] pt-[clamp(1.4rem,3vw,2.2rem)]">
+        <UnifiedTrackList
+          tracks={displayPlaylistTracks}
+          variant="playlist"
           estimateSize={56}
           getItemKey={(track) => track.id}
-          renderItem={(track, index) => (
+          headerProps={{ showArtist: true, showAlbum: true }}
+          renderTrack={(track, index) => (
             <TrackRow
               track={track}
               index={index}
@@ -442,7 +470,7 @@ function AlbumPage({
   return (
     <div className="overflow-x-hidden bg-black pb-0">
       <section
-        className="relative flex min-h-[clamp(17.75rem,26vw,22rem)] items-end px-[var(--ui-page-pad)] pl-[var(--ui-page-left-pad)] pb-[clamp(1.35rem,2.2vw,1.9rem)] pt-[calc(var(--ui-topbar-height)+clamp(0.75rem,1.5vw,1.25rem))]"
+        className="relative flex min-h-[clamp(17.75rem,26vw,22rem)] items-end px-[var(--ui-page-pad)] pl-[var(--ui-page-left-pad)] pr-[var(--ui-page-right-pad)] pb-[clamp(1.35rem,2.2vw,1.9rem)] pt-[calc(var(--ui-topbar-height)+clamp(0.75rem,1.5vw,1.25rem))]"
         style={heroStyle}
       >
         <div className="flex min-w-0 flex-col gap-[clamp(1.25rem,2vw,1.75rem)] md:flex-row md:items-end">
@@ -503,7 +531,7 @@ function AlbumPage({
       </section>
 
       <section
-        className="px-[var(--ui-page-pad)] pl-[var(--ui-page-left-pad)] pb-[clamp(1rem,2vw,1.4rem)] pt-[clamp(1.1rem,2.2vw,1.6rem)] transition-opacity duration-150"
+        className="px-[var(--ui-page-pad)] pl-[var(--ui-page-left-pad)] pr-[var(--ui-page-right-pad)] pb-[clamp(1rem,2vw,1.4rem)] pt-[clamp(1.1rem,2.2vw,1.6rem)] transition-opacity duration-150"
         style={controlStyle}
       >
         <div className="flex min-h-[3rem] flex-wrap items-center gap-4 sm:gap-5">
@@ -620,18 +648,14 @@ function AlbumPage({
         resolvePlaylists={resolvePlaylists}
       />
 
-      <section className="bg-black px-[var(--ui-page-pad)] pl-[var(--ui-page-left-pad)] pb-[clamp(2.5rem,3.125vw,4rem)] pt-[clamp(1.4rem,3vw,2.2rem)]">
-        {viewMode === "compact" ? (
-          <TrackListHeader showPlays gridClassName={COMPACT_TRACK_GRID} dividerHidden={firstTrackHovered || firstTrackActive} />
-        ) : (
-          <TrackListHeader showPlays dividerHidden={firstTrackHovered || firstTrackActive} />
-        )}
-
-        <VirtualList
-          items={displayAlbumTracks}
+      <section className="bg-black px-[var(--ui-page-pad)] pl-[var(--ui-page-left-pad)] pr-[var(--ui-page-right-pad)] pb-[clamp(2.5rem,3.125vw,4rem)] pt-[clamp(1.4rem,3vw,2.2rem)]">
+        <UnifiedTrackList
+          tracks={displayAlbumTracks}
+          variant={viewMode === "compact" ? "compact" : "albumWithPlays"}
           estimateSize={viewMode === "compact" ? 44 : 56}
           getItemKey={(track) => track.id}
-          renderItem={(track, index) =>
+          headerProps={{ showPlays: true, dividerHidden: firstTrackHovered || firstTrackActive }}
+          renderTrack={(track, index) =>
             viewMode === "compact" ? (
               <CompactTrackRow
                 track={track}

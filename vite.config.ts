@@ -21,4 +21,19 @@ export default defineConfig({
     },
   },
   envPrefix: ["VITE_", "TAURI_ENV_"],
+  build: {
+    target: "es2022",
+    cssCodeSplit: true,
+    chunkSizeWarningLimit: 600,
+    rollupOptions: {
+      output: {
+        manualChunks: {
+          react: ["react", "react-dom"],
+          tauri: ["@tauri-apps/api", "@tauri-apps/plugin-dialog", "@tauri-apps/plugin-process", "@tauri-apps/plugin-updater", "@tauri-apps/plugin-autostart"],
+          lucide: ["lucide-react"],
+          icons: ["react-icons"],
+        },
+      },
+    },
+  },
 });
