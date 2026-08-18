@@ -8,7 +8,8 @@ const LEADING_SILENCE_CACHE_KEY = "velocity-leading-silence-cache";
 // and 0.35s minimum skip.
 // v6 → v7: switch to sample-accurate atrim re-encode and cap at 8s to avoid
 // trimming intended quiet intros; lyrics no longer offset by silence.
-export const LEADING_SILENCE_ANALYSIS_VERSION = 7;
+// v7 → v8: expand start tolerance to 0.5s and ensure offline playback trims leading silence.
+export const LEADING_SILENCE_ANALYSIS_VERSION = 8;
 export const MIN_LEADING_SILENCE_SKIP = 0.35;
 export const MAX_LEADING_SILENCE_SKIP = 8;
 export const LEADING_SILENCE_DETECT_TIMEOUT_MS = 8000;

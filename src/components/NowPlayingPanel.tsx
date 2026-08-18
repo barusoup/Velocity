@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { convertFileSrc } from "@tauri-apps/api/core";
-import { ChevronRight, Disc3, History, List, LoaderCircle } from "lucide-react";
+import { ChevronRight, Clapperboard, Disc3, History, List, LoaderCircle } from "lucide-react";
+import { getOfflineVideoPath, resolveVideoStream } from "../api";
 import { usePlayer } from "../player";
 import { usePlayerUiStore } from "../store/playerUiStore";
 import {
@@ -28,6 +29,7 @@ import { Marquee } from "./Marquee";
 import { getDirectAlbumBrowseId, getDirectArtistBrowseId, resolveAlbumBrowseId, resolveArtistBrowseId } from "../utils/navigation";
 import { resolveTrackAlbumMetadata } from "../utils/track-metadata-backfill";
 import { isPlaceholderAlbumName } from "../utils/upload-enrichment";
+import { findMusicVideoForTrack } from "../utils/music-video";
 import type { View } from "./Sidebar";
 import { QueuePanelBody } from "./QueuePanel";
 import { useContextTrackTarget } from "../hooks/useContextTrackTarget";
@@ -204,8 +206,8 @@ export function NowPlayingPanel({
   }, [track?.id, track?.videoId, track?.resolvedVideoId, track?.source, track?.findLyrics, track?.title, track?.artist]);
 
   // Keep preview in sync with LyricsPage: if authoritative lyrics are
-  // re-fetched elsewhere (offset correction, clean-provider retry), the
-  // shared bus notifies this panel so it doesn't stay few-seconds behind.
+  // re-fetched elsewhere (e.g. a clean-provider retry), the shared bus
+  // notifies this panel so it doesn't stay few-seconds behind.
   useEffect(() => {
     if (!track || track.source !== "stream") return;
     const ids = new Set(streamIdentityVideoIds(track as unknown as Parameters<typeof streamIdentityVideoIds>[0]));
@@ -457,6 +459,63 @@ export function NowPlayingPanel({
     [player],
   );
 
+  // The Music Video button only appears once a real music video has been
+  // confirmed for this song (a search, not a download — the watch page still
+  // handles the download). Per-song: the check re-runs when the active track
+  // changes, so the button appears and disappears per song. Once confirmed
+  // AND the panel is on screen, the video is preloaded in the background
+  // (skipped when the local offline copy already exists) so opening the
+  // watch page is near-instant instead of waiting on the first-run download.
+  const [musicVideoReady, setMusicVideoReady] = useState<boolean | null>(null);
+  useEffect(() => {
+    if (!track || !track.title?.trim() || !track.artist?.trim()) {
+      setMusicVideoReady(false);
+      return;
+    }
+    let cancelled = false;
+    setMusicVideoReady(null);
+    void findMusicVideoForTrack(track)
+      .then(async (mv) => {
+        if (cancelled) return;
+        setMusicVideoReady(Boolean(mv));
+        if (!mv?.videoId) return;
+        // Only preload while the user can actually see the button — the
+        // panel being on screen is a strong signal they may click it, and
+        // it stops the app from downloading every queued song's MV in the
+        // background.
+        if (!isEffectivelyOpen) return;
+        // Warm the video so a click on the button opens instantly. The
+        // offline lookup is a cheap local check; only when no saved copy
+        // exists do we kick off the (potentially slow) download.
+        try {
+          if (await getOfflineVideoPath(mv.videoId)) return;
+          void resolveVideoStream(mv.videoId).catch(() => {});
+        } catch {
+          // Preload is best-effort; a failure just means the page will
+          // download on open.
+        }
+      })
+      .catch(() => {
+        if (!cancelled) setMusicVideoReady(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    track?.id,
+    track?.videoId,
+    track?.resolvedVideoId,
+    track?.source,
+    track?.title,
+    track?.artist,
+    isEffectivelyOpen,
+  ]);
+
+  const handleOpenMusicVideo = useCallback(() => {
+    if (!track) return;
+    onNavigate({ name: "music-video" });
+  }, [onNavigate, track]);
+
   const handleNavigateToAlbum = useCallback(() => {
     if (!track) return;
     const resolvedBrowseId = albumMetadata?.albumBrowseId;
@@ -602,6 +661,16 @@ export function NowPlayingPanel({
                         </Marquee>
                       </button>
                     )}
+                    {musicVideoReady === true && (
+                      <button
+                        type="button"
+                        onClick={handleOpenMusicVideo}
+                        className="mt-2 inline-flex items-center gap-1.5 rounded-full px-3 py-1 text-[11px] font-semibold text-neutral-400 transition-colors hover:bg-white/10 hover:text-white"
+                      >
+                        <Clapperboard size={12} />
+                        Music Video
+                      </button>
+                    )}
                   </div>
                 </div>
               </div>
@@ -744,8 +813,8 @@ export function NowPlayingPanel({
       {showCrescent && (
         <div
           aria-hidden
-          className="pointer-events-none absolute -bottom-px right-[var(--ui-nowplaying-current)] z-40 h-[21px] w-[20px] bg-neutral-950"
-          style={{ clipPath: "path('M 20 0 C 20 20 6 20 0 20 L 0 21 L 20 21 Z')" }}
+          className="pointer-events-none absolute -bottom-px -mr-px right-[var(--ui-nowplaying-current)] z-40 h-[21px] w-[21px] bg-neutral-950"
+          style={{ clipPath: "path('M 21 0 L 20 0 C 20 20 6 20 0 20 L 0 21 L 21 21 Z')" }}
         />
       )}
     </>

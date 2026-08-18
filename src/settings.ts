@@ -214,6 +214,9 @@ export async function clearAllUserData(): Promise<void> {
     useOfflineStatusStore.getState().clearAll();
     const { cancelAllOfflineSync } = await import("./utils/offline-download-queue");
     cancelAllOfflineSync();
+    const { cancelSavedCollectionRepair, clearRepairState } = await import("./utils/saved-collection-repair");
+    cancelSavedCollectionRepair();
+    clearRepairState();
     const tracks = await listImportedTracks().catch(() => [] as Awaited<ReturnType<typeof listImportedTracks>>);
     await Promise.all(
       tracks.map((t) => removeImportedTrack(t.id).catch(() => {})),

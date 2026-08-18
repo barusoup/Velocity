@@ -169,8 +169,6 @@ export type SyncedLyricsResponse = {
   lines: TimedLyricLine[];
   source?: string | null;
   hasPerWordSync?: boolean;
-  /** Total playback offset (ms) already applied to `lines` (vocal-onset correction). */
-  appliedOffsetMs?: number | null;
 };
 
 export type LyricsAvailability = {
@@ -179,17 +177,6 @@ export type LyricsAvailability = {
   source?: string | null;
   firstLyricMs?: number | null;
   ytmHasTab: boolean;
-};
-
-export type LyricOffsetRecord = {
-  offsetMs: number;
-  confidence: number;
-  method: string;
-  lyricsHash: string;
-  computedAtMs: number;
-  firstLyricMs: number;
-  vocalOnsetMs: number;
-  leadingSilenceMs: number;
 };
 
 export type BackendStatus = {

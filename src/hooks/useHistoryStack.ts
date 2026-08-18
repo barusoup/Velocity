@@ -16,6 +16,7 @@ function viewsEqual(left: View, right: View): boolean {
     case "search":
       return right.name === "search" && left.query === right.query;
     case "lyrics":
+    case "music-video":
     case "settings":
       return true;
     case "album":

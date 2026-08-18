@@ -402,7 +402,7 @@ export const TrackRow = memo(function TrackRow({
   onNavigate?: (view: View) => void;
   queueOrigin?: QueueOrigin | null;
 }) {
-  const { togglePlay } = usePlayerActions();
+  const { togglePlay, warm } = usePlayerActions();
   const { active, playingActive, bufferingActive } = useTrackPlaybackState(track);
   const contextTarget = useContextTrackTarget(track);
   const isSaved = useIsTrackSaved(track);
@@ -434,6 +434,7 @@ export const TrackRow = memo(function TrackRow({
         active ? "bg-neutral-900/70" : ""
       }`}
       onClick={active ? togglePlay : onPlay}
+      onMouseEnter={() => warm(track)}
     >
       <div className="flex items-center justify-center">
         <button

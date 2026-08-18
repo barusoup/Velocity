@@ -414,14 +414,20 @@ export function LyricsPage({
 }) {
   const player = usePlayer();
   const track = player.currentTrack;
-  const [lyrics, setLyrics] = useState<SyncedLyrics | null>(() =>
-    track?.source === "stream" && track
-      ? acceptSyncedLyrics(hydratePersistedLyricsForTrack(track))
-      : null,
-  );
+  const [lyrics, setLyrics] = useState<SyncedLyrics | null>(() => {
+    if (!track) return null;
+    if (track.source === "stream" || (track.source === "upload" && track.findLyrics)) {
+      return acceptSyncedLyrics(hydratePersistedLyricsForTrack(track));
+    }
+    return null;
+  });
   const [loading, setLoading] = useState(() => {
     if (!track) return false;
-    if (track.source === "upload") return Boolean(track.findLyrics);
+    if (track.source === "upload") {
+      if (!track.findLyrics) return false;
+      const cached = hydratePersistedLyricsForTrack(track);
+      return acceptSyncedLyrics(cached) === null;
+    }
     if (track.source === "stream") {
       const cached = hydratePersistedLyricsForTrack(track);
       return acceptSyncedLyrics(cached) === null;
@@ -867,9 +873,10 @@ export function LyricsPage({
     const MAX_ERROR_RETRIES = 2;
     const ERROR_RETRY_DELAY_MS = 800;
 
-    const cachedStreamLyrics = isStream
-      ? acceptSyncedLyrics(hydratePersistedLyricsForTrack(track))
-      : null;
+    const cachedStreamLyrics =
+      isStream || isUploadWithLyrics
+        ? acceptSyncedLyrics(hydratePersistedLyricsForTrack(track))
+        : null;
 
     setLyrics(cachedStreamLyrics);
     setLoading(!cachedStreamLyrics);
@@ -950,10 +957,10 @@ export function LyricsPage({
     };
 
     // Always refresh in the background so the active track picks up the
-    // authoritative full `get_synced_lyrics` resolution (offset-corrected
-    // providers). Cached/persisted lyrics above are only for instant
-    // first paint — skipping the fetch left stale prefetch snapshots
-    // (metadata-only providers + wrong offsets) on screen indefinitely.
+    // authoritative full `get_synced_lyrics` resolution. Cached/persisted
+    // lyrics above are only for instant first paint — skipping the fetch
+    // left stale prefetch snapshots (metadata-only providers) on screen
+    // indefinitely.
     loadLyrics();
 
     return () => {
@@ -976,18 +983,24 @@ export function LyricsPage({
   ]);
 
   // Cross-component sync: if the Now Playing preview (or any other caller)
-  // re-fetches authoritative lyrics after the vocal-offset DSP finishes,
-  // this page picks up the offset-corrected result without waiting for its
-  // own next track change. Keeps the two views lockstepped.
+  // re-fetches authoritative lyrics, this page picks up the fresh result
+  // without waiting for its own next track change. Keeps the two views
+  // lockstepped.
   useEffect(() => {
-    if (!track || track.source !== "stream") return;
-    const ids = new Set(
-      streamIdentityVideoIds(track as unknown as Parameters<typeof streamIdentityVideoIds>[0]),
-    );
+    if (!track) return;
+    const targetVideoId = lyricsCacheVideoId(track);
+    const ids =
+      track.source === "stream"
+        ? new Set(
+            streamIdentityVideoIds(track as unknown as Parameters<typeof streamIdentityVideoIds>[0]),
+          )
+        : new Set(targetVideoId ? [targetVideoId] : []);
     const unsub = subscribeLyricsUpdates((videoId, updated) => {
-      if (!ids.has(videoId)) return;
+      if (!ids.has(videoId) && videoId !== targetVideoId) return;
       const accepted = acceptSyncedLyrics(updated);
       if (!accepted) return;
+      setLoading(false);
+      setTimedOut(false);
       // Use functional update so we compare against the latest visible set
       setLyrics((prev) => {
         if (!prev) return accepted;
@@ -996,7 +1009,15 @@ export function LyricsPage({
       });
     });
     return unsub;
-  }, [track?.id, (track as unknown as { videoId?: string })?.videoId, (track as unknown as { resolvedVideoId?: string })?.resolvedVideoId]);
+  }, [
+    track?.id,
+    (track as unknown as { videoId?: string })?.videoId,
+    (track as unknown as { resolvedVideoId?: string })?.resolvedVideoId,
+    track?.source,
+    track?.findLyrics,
+    track?.title,
+    track?.artist,
+  ]);
 
   useEffect(() => {
     if (activeLyricIndex < 0 || activeLyricIndex === lastScrolledIndexRef.current) return;
@@ -1193,16 +1214,13 @@ export function LyricsPage({
           )}
         </div>
       )}
-      {timedOut && !loading && (
+      {!lyrics && timedOut && !loading && (
         <div
           className="animate-no-lyrics-fadeout pointer-events-none fixed left-[var(--ui-sidebar-current)] right-[var(--ui-nowplaying-current)] z-20 flex -translate-y-1/2 flex-col items-center justify-center gap-4"
           style={{ top: visualizerCenterY }}
         >
           <X size={48} className="text-neutral-300" />
           <span className="text-base text-neutral-300">No synced lyrics available</span>
-          {lyrics?.appliedOffsetMs != null && lyrics.appliedOffsetMs !== 0 && (
-            <span className="text-xs text-neutral-500">Offset {lyrics.appliedOffsetMs}ms applied</span>
-          )}
         </div>
       )}
 

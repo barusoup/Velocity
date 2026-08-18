@@ -176,13 +176,6 @@ impl DataStore {
         Ok(store)
     }
 
-    /// Read a single key's value from the in-memory map. Used by the
-    /// lyric-offset cache lookup (fast path — no disk I/O).
-    pub async fn get(&self, key: &str) -> Option<Value> {
-        let map = self.map.read().await;
-        map.get(key).cloned()
-    }
-
     /// Snapshot of the in-memory map, JSON-encoded per key. Mirrors
     /// the predecessor `load_all` return shape so the IPC body and
     /// `src/storage.ts::init()` see no change in payload form.

@@ -987,7 +987,7 @@ describe("resolveStreamTrackAudioFallback", () => {
     ).resolves.toBeNull();
   });
 
-  it("allows a variant alternate when the SOURCE track is itself a variant", async () => {
+  it("refuses a variant alternate even when the SOURCE track is itself a variant", async () => {
     mockedSearchMusic.mockResolvedValue({
       query: "Radiohead Paranoid Android",
       results: [
@@ -1014,11 +1014,113 @@ describe("resolveStreamTrackAudioFallback", () => {
       source: "stream",
     };
 
-    const resolved = await resolveStreamTrackAudioFallback(track, {
-      excludeVideoIds: ["live-xyz"],
+    // A live take is a different recording of the song, not the song's audio —
+    // not even when the failing source is itself a variant.
+    await expect(
+      resolveStreamTrackAudioFallback(track, { excludeVideoIds: ["live-xyz"] }),
+    ).resolves.toBeNull();
+  });
+
+  it("does not substitute a studio cut for an unplayable variant source", async () => {
+    mockedSearchMusic.mockResolvedValue({
+      query: "Radiohead Paranoid Android",
+      results: [
+        {
+          id: "yt:studio-abc",
+          kind: "song",
+          title: "Paranoid Android",
+          subtitle: "",
+          artist: "Radiohead",
+          videoId: "studio-abc",
+          durationSeconds: 383,
+        },
+      ],
     });
 
-    expect(resolved?.resolvedVideoId).toBe("live-abc");
+    const track: MediaTrack = {
+      id: "yt:live-xyz",
+      kind: "song",
+      title: "Paranoid Android (Live)",
+      artist: "Radiohead",
+      videoId: "live-xyz",
+      resolvedVideoId: "live-xyz",
+      durationSeconds: 400,
+      source: "stream",
+    };
+
+    // The studio cut is a different recording from the live row the user has —
+    // prefer failing over silently changing what plays.
+    await expect(
+      resolveStreamTrackAudioFallback(track, { excludeVideoIds: ["live-xyz"] }),
+    ).resolves.toBeNull();
+  });
+
+  it("does not fall an unplayable remaster row back to the original studio cut", async () => {
+    mockedSearchMusic.mockResolvedValue({
+      query: "Pixies Where Is My Mind?",
+      results: [
+        {
+          id: "yt:original-abc",
+          kind: "song",
+          title: "Where Is My Mind?",
+          subtitle: "",
+          artist: "Pixies",
+          videoId: "original-abc",
+          durationSeconds: 218,
+        },
+      ],
+    });
+
+    const track: MediaTrack = {
+      id: "yt:remaster-xyz",
+      kind: "song",
+      title: "Where Is My Mind? (2007 Remaster)",
+      artist: "Pixies",
+      videoId: "remaster-xyz",
+      resolvedVideoId: "remaster-xyz",
+      durationSeconds: 218,
+      source: "stream",
+    };
+
+    // A different edition is not the same audio — prefer failing over
+    // playing the wrong remaster.
+    await expect(
+      resolveStreamTrackAudioFallback(track, { excludeVideoIds: ["remaster-xyz"] }),
+    ).resolves.toBeNull();
+  });
+
+  it("still falls back to an official-audio upload of the studio song", async () => {
+    mockedSearchMusic.mockResolvedValue({
+      query: "Radiohead Paranoid Android",
+      results: [
+        {
+          id: "yt:official-audio-abc",
+          kind: "song",
+          title: "Paranoid Android (Official Audio)",
+          subtitle: "",
+          artist: "Radiohead",
+          videoId: "official-audio-abc",
+          durationSeconds: 383,
+        },
+      ],
+    });
+
+    const track: MediaTrack = {
+      id: "yt:studio-dead",
+      kind: "song",
+      title: "Paranoid Android",
+      artist: "Radiohead",
+      videoId: "studio-dead",
+      resolvedVideoId: "studio-dead",
+      durationSeconds: 383,
+      source: "stream",
+    };
+
+    const resolved = await resolveStreamTrackAudioFallback(track, {
+      excludeVideoIds: ["studio-dead"],
+    });
+
+    expect(resolved?.resolvedVideoId).toBe("official-audio-abc");
   });
 
   it("refuses to fall a remaster row back to the music video when no studio upload exists", async () => {

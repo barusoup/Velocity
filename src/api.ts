@@ -148,22 +148,24 @@ export function isUnsyncedLyricsSource(source: string | null | undefined): boole
   return typeof source === "string" && source.toLowerCase().includes("youtube music");
 }
 
-// Clean providers are Musixmatch and LRCLIB only. Regional providers
-// (Kugou, QQ Music, NetEase) frequently return poorly formatted /
-// machine-translated LRC that flickers to a better result moments later.
-// We prefer waiting (or showing "no lyrics") over flashing bad lyrics.
-const CLEAN_LYRICS_ALLOWLIST = ["musixmatch", "lrclib"];
+// Clean provider is LRCLIB only. Regional providers (Kugou, QQ Music, NetEase)
+// and legacy providers (Musixmatch) are excluded to ensure clean synced lyrics.
+const CLEAN_LYRICS_ALLOWLIST = ["lrclib"];
 
 export function isCleanLyricsSource(source: string | null | undefined): boolean {
   if (!source) return true; // old cache without source — treat as clean to avoid breaking
   const lower = source.toLowerCase();
-  // Explicit bad-provider block (must stay in sync with lyrics.rs)
-  if (lower.includes("kugou") || lower.includes("qq music") || lower.includes("netease")) {
+  // Explicit bad/excluded provider block (must stay in sync with lyrics.rs)
+  if (
+    lower.includes("kugou") ||
+    lower.includes("qq music") ||
+    lower.includes("netease") ||
+    lower.includes("musixmatch")
+  ) {
     return false;
   }
   if (lower.includes("youtube music")) return false;
-  // Allow only Musixmatch / LRCLIB; unknown sources are rejected to avoid
-  // future regional providers slipping through.
+  // Allow only LRCLIB; unknown sources are rejected.
   return CLEAN_LYRICS_ALLOWLIST.some((token) => lower.includes(token)) || lower.trim() === "";
 }
 
@@ -219,9 +221,8 @@ function persistedLyricsChanged(videoId: string, lyrics: SyncedLyricsResponse): 
 // ---------------------------------------------------------------------------
 // Cross-component lyrics sync — keeps Now Playing preview and LyricsPage
 // in lockstep. Both fetch via `getSyncedLyrics` (shared MemoCache dedup)
-// but hold independent React state; without a bus, one fetching after the
-// vocal-offset DSP finishes would see offset-corrected lyrics while the
-// other stays on the stale un-offset snapshot (few-seconds delay).
+// but hold independent React state; without a bus, one fetching a fresh
+// clean-provider result would update only its own view (few-seconds lag).
 // ---------------------------------------------------------------------------
 type LyricsUpdateListener = (videoId: string, lyrics: SyncedLyricsResponse | null) => void;
 const lyricsUpdateListeners = new Set<LyricsUpdateListener>();
@@ -471,6 +472,24 @@ export function invalidateStream(videoId: string): void {
   streamCache.delete(videoId);
 }
 
+// Music-video resolutions for the watch page. Keyed with an `mv:` prefix so
+// an audio stream resolution for the same video id never aliases into the
+// video cache (the backend namespaces its disk cache the same way).
+const videoStreamCache = new MemoCache<StreamResponse>({ maxSize: 60, ttlMs: 25 * 60 * 1000 });
+
+/** Resolve a playable video file for a music-video id (yt-dlp, cached on disk). */
+export async function resolveVideoStream(videoId: string): Promise<StreamResponse> {
+  const key = `mv:${videoId}`;
+  return videoStreamCache.getOrCreate(key, () =>
+    invokeCommand<StreamResponse>("resolve_video_stream", { videoId }),
+  );
+}
+
+/** Drop a cached music-video resolution so the next call re-invokes the backend. */
+export function invalidateVideoStream(videoId: string): void {
+  videoStreamCache.delete(`mv:${videoId}`);
+}
+
 export function invalidateWatchPlaylist(videoId: string, playlistId?: string | null): void {
   const trimmedPlaylist = playlistId?.trim();
   watchPlaylistCache.delete(`${videoId}|${trimmedPlaylist ?? ""}`);
@@ -639,16 +658,6 @@ export async function probeLyricsAvailability(fields: {
   });
 }
 
-export async function getLyricOffset(
-  videoId: string,
-): Promise<import("./types").LyricOffsetRecord | null> {
-  return invokeCommand<import("./types").LyricOffsetRecord | null>("get_lyric_offset", { videoId });
-}
-
-export async function clearLyricOffset(videoId: string): Promise<void> {
-  await invokeCommand<void>("clear_lyric_offset", { videoId });
-}
-
 export async function getSyncedLyrics(
   videoId: string,
   options?: { persist?: boolean },
@@ -721,68 +730,8 @@ export async function getSyncedLyrics(
   }
   if (result !== null) {
     notifyLyricsUpdate(videoId, result);
-    // If the result has no offset yet, the vocal DSP may still be running.
-    // Poll for the offset and re-fetch so preview and full page converge
-    // instead of staying few-seconds apart.
-    scheduleOffsetWatch(videoId, result);
   }
   return result;
-}
-
-// Background vocal-offset watcher — ensures preview + full page converge
-// when one fetched before the DSP analysis finished. At most one watcher
-// per videoId; polls the lightweight `get_lyric_offset` (cache-only, no ffmpeg)
-// and re-fetches authoritative lyrics once the offset appears.
-const offsetWatchers = new Set<string>();
-function scheduleOffsetWatch(videoId: string, initial: SyncedLyricsResponse | null): void {
-  if (!initial || initial.appliedOffsetMs != null) return;
-  if (initial.lines.length === 0) return;
-  if (offsetWatchers.has(videoId)) return;
-  offsetWatchers.add(videoId);
-  let attempts = 0;
-  const maxAttempts = 7;
-  const timer = setInterval(async () => {
-    attempts += 1;
-    if (attempts > maxAttempts) {
-      clearInterval(timer);
-      offsetWatchers.delete(videoId);
-      return;
-    }
-    try {
-      const rec = await getLyricOffset(videoId);
-      if (!rec) return;
-      // Offset exists — does current cache already reflect it?
-      const cached = syncedLyricsCache.peek(videoId);
-      if (cached && cached.appliedOffsetMs === rec.offsetMs) {
-        clearInterval(timer);
-        offsetWatchers.delete(videoId);
-        return;
-      }
-      // Force a fresh authoritative fetch (now offset-corrected)
-      syncedLyricsCache.delete(videoId);
-      const fresh = await getSyncedLyrics(videoId, { persist: true });
-      if (fresh && fresh.appliedOffsetMs === rec.offsetMs) {
-        clearInterval(timer);
-        offsetWatchers.delete(videoId);
-      } else if (fresh && fresh.appliedOffsetMs != null) {
-        clearInterval(timer);
-        offsetWatchers.delete(videoId);
-      }
-    } catch {
-      // transient — retry
-    }
-  }, 1400);
-  // Safety: clear on page unload
-  if (typeof window !== "undefined") {
-    window.addEventListener(
-      "beforeunload",
-      () => {
-        clearInterval(timer);
-        offsetWatchers.delete(videoId);
-      },
-      { once: true },
-    );
-  }
 }
 
 export function peekSyncedLyrics(videoId: string): SyncedLyricsResponse | null {
@@ -1208,6 +1157,27 @@ export async function removeOffline(videoId: string): Promise<void> {
   await invokeCommand("remove_offline", { videoId });
 }
 
+/**
+ * Persist a music video's local file into the offline folder (mirrors
+ * `save_offline` for audio). Returns the saved file path, or null when no
+ * file could be produced. The file lives under the `mv-` prefix, outside
+ * the TTL-swept streams cache, so a saved song's music video survives
+ * restarts and is playable offline.
+ */
+export async function saveVideoOffline(videoId: string): Promise<string | null> {
+  return invokeCommand<string | null>("save_video_offline", { videoId });
+}
+
+/** Path of a locally-saved music video for a video id, if one exists. */
+export async function getOfflineVideoPath(videoId: string): Promise<string | null> {
+  return invokeCommand<string | null>("get_offline_video_path", { videoId });
+}
+
+/** Delete a locally-saved music video for a video id, if one exists. */
+export async function removeVideoOffline(videoId: string): Promise<void> {
+  await invokeCommand("remove_video_offline", { videoId });
+}
+
 export async function listOfflineSongs(): Promise<string[]> {
   return invokeCommand<string[]>("list_offline");
 }
@@ -1218,6 +1188,12 @@ export async function clearAllOffline(): Promise<void> {
 
 export async function getOfflinePath(videoId: string): Promise<string | null> {
   return invokeCommand<string | null>("get_offline_path", { videoId });
+}
+
+export type OfflineHealOutcome = "missing" | "corrupt" | "trimmed" | "healthy";
+
+export async function healOfflineAudio(videoId: string): Promise<OfflineHealOutcome> {
+  return invokeCommand<OfflineHealOutcome>("heal_offline_audio", { videoId });
 }
 
 /** Offline files are keyed by videoId — try every identity id on the track. */

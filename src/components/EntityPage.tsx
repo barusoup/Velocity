@@ -11,6 +11,7 @@ import {
   Play,
 } from "lucide-react";
 import {
+  cacheArtwork,
   cacheSavedAlbumDetail,
   getEntityDetail,
   peekCachedSavedAlbumDetail,
@@ -117,6 +118,16 @@ export function EntityPage({
         // the offline fallback reflects the latest track list / cover.
         if (data.kind === "album" && isAlbumSavedRef.current) {
           cacheSavedAlbumDetail(browseId, data);
+          if (data.cover) {
+            void cacheArtwork(data.cover).catch(() => {});
+          }
+          if (data.tracks) {
+            for (const track of data.tracks) {
+              if (track.cover) {
+                void cacheArtwork(track.cover).catch(() => {});
+              }
+            }
+          }
         }
       })
       .catch((error) => {
@@ -703,7 +714,7 @@ function AlbumTrackRow({
   queueOrigin?: QueueOrigin | null;
   parentIsSaved?: boolean;
 }) {
-  const { togglePlay } = usePlayerActions();
+  const { togglePlay, warm } = usePlayerActions();
   const rowIsSaved = useIsTrackSaved(track);
   const toggleSave = useToggleTrackSave(track);
   const { active, playingActive, bufferingActive } = useTrackPlaybackState(track);
@@ -741,7 +752,10 @@ function AlbumTrackRow({
         // accidentally fire the play action.
         event.stopPropagation();
       }}
-      onMouseEnter={() => onHoverChange?.(true)}
+      onMouseEnter={() => {
+        onHoverChange?.(true);
+        warm(track);
+      }}
       onMouseLeave={() => onHoverChange?.(false)}
     >
       <div className="relative flex items-center justify-center">
@@ -844,7 +858,7 @@ function CompactTrackRow({
   onHoverChange?: (hovered: boolean) => void;
   queueOrigin?: QueueOrigin | null;
 }) {
-  const { togglePlay } = usePlayerActions();
+  const { togglePlay, warm } = usePlayerActions();
   const { active, playingActive, bufferingActive } = useTrackPlaybackState(track);
   const contextTarget = useContextTrackTarget(track);
 
@@ -862,7 +876,10 @@ function CompactTrackRow({
         // accidentally fire the play action.
         event.stopPropagation();
       }}
-      onMouseEnter={() => onHoverChange?.(true)}
+      onMouseEnter={() => {
+        onHoverChange?.(true);
+        warm(track);
+      }}
       onMouseLeave={() => onHoverChange?.(false)}
     >
       <div className="relative flex items-center justify-center">

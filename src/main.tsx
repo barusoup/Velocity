@@ -50,6 +50,26 @@ async function boot() {
     // best-effort
   }
 
+  // Pre-warm daily recommendations in parallel with module loading if needed
+  try {
+    const { getSettings } = await import("./settings");
+    const { needsDailyRecommendationRefresh, getCachedDailyRecommendations } = await import(
+      "./taste-profile"
+    );
+    const settings = getSettings();
+    if (
+      settings.showHomeMenu &&
+      settings.showHomeTodaysPicks &&
+      needsDailyRecommendationRefresh() &&
+      !getCachedDailyRecommendations()
+    ) {
+      const { generateDailyRecommendations } = await import("./utils/home-recommendations");
+      void generateDailyRecommendations().catch(() => []);
+    }
+  } catch {
+    // best-effort
+  }
+
   const { default: App } = await appModule;
 
   createRoot(document.getElementById("root")!).render(

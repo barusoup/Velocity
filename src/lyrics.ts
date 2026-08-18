@@ -86,10 +86,9 @@ export function lyricsAreEffectivelySame(
  * api.ts; this guard only decides if a visible clean result should be
  * swapped for a fresh clean result mid-viewport.
  *
- * Same-text but timestamp-shifted results (vocal-offset correction)
- * are treated as an upgrade and are allowed to replace, otherwise the
- * Now Playing preview would stay a few seconds behind the Lyrics page
- * when one fetched before the offset was computed and the other after.
+ * Same-text but timestamp-shifted results are treated as an upgrade and
+ * allowed to replace (otherwise the Now Playing preview and the Lyrics
+ * page could diverge when one fetched a fresh provider result first).
  */
 export function shouldReplaceLyricsWith(
   visible: SyncedLyrics | null,
@@ -101,11 +100,7 @@ export function shouldReplaceLyricsWith(
   if (fresh.hasPerWordSync === true && visible.hasPerWordSync !== true) return true;
   const sameText = lyricsAreEffectivelySame(visible, fresh);
   if (sameText) {
-    // Same text but timestamps shifted => vocal-offset correction.
-    // The preview and full page can otherwise diverge by the offset
-    // amount (up to 8s) if one fetched before the DSP analysis finished.
-    const offsetChanged = (visible.appliedOffsetMs ?? 0) !== (fresh.appliedOffsetMs ?? 0);
-    if (offsetChanged) return true;
+    // Same text but timestamps shifted — replace so views don't diverge.
     const firstVisible = visible.lines[0]?.startTimeMs ?? 0;
     const firstFresh = fresh.lines[0]?.startTimeMs ?? 0;
     if (Math.abs(firstVisible - firstFresh) > 400) return true;

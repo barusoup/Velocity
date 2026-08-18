@@ -317,6 +317,7 @@ pub(crate) fn parse_shelf_continuation_items(response: &Value) -> Option<Vec<Val
 /// existing tells the UI the song has lyrics (so the fast probe can report
 /// "available" and skip the long timeout), without ever fetching or serving
 /// YouTube Music's native timed lyrics (which are intentionally not used).
+#[allow(dead_code)]
 pub(crate) fn extract_lyrics_browse_id_from_next(response: &Value) -> Option<String> {
     let tabs = response
         .pointer(

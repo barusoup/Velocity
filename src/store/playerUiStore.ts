@@ -18,6 +18,13 @@ export interface PlayerUiState {
   progress: number;
   /** Live scrubber preview while dragging; null when idle. */
   seekScrubProgress: number | null;
+  /**
+   * Duration override set by the music-video watch page: the video's own
+   * length (e.g. a 4-minute MV for an 8-minute studio track). While set,
+   * the player bar's seek bar/timers use it instead of the audio element's
+   * duration. `null` when no override is active.
+   */
+  videoDuration: number | null;
   currentTrack: TrackIdentity | null;
   currentTrackCover: string | null;
   albumBrowseId: string | null;
@@ -30,6 +37,7 @@ export interface PlayerUiState {
 export interface PlayerUiActions {
   setProgress: (progress: number) => void;
   setSeekScrubProgress: (value: number | null) => void;
+  setVideoDuration: (value: number | null) => void;
   syncPlaybackIdentity: (payload: {
     currentTrack: MediaTrack | null;
     isPlaying: boolean;
@@ -83,6 +91,7 @@ export const usePlayerUiStore = create<PlayerUiStore>()(
   subscribeWithSelector((set, get) => ({
     progress: 0,
     seekScrubProgress: null,
+    videoDuration: null,
     currentTrack: null,
     currentTrackCover: null,
     albumBrowseId: null,
@@ -98,6 +107,10 @@ export const usePlayerUiStore = create<PlayerUiStore>()(
     setSeekScrubProgress: (seekScrubProgress) => {
       if (get().seekScrubProgress === seekScrubProgress) return;
       set({ seekScrubProgress });
+    },
+    setVideoDuration: (videoDuration) => {
+      if (get().videoDuration === videoDuration) return;
+      set({ videoDuration });
     },
     resetProgress: (progress) => {
       const safe = Number.isFinite(progress) ? progress : 0;

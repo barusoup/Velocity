@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import { CircleArrowRight, LoaderCircle, Mic2, Pause, Play, RefreshCw, SkipBack, SkipForward } from "lucide-react";
 import { IconPanelRightClose, IconPanelRightOpen } from "../wrapped-icons";
 import { convertFileSrc } from "@tauri-apps/api/core";
@@ -111,11 +111,13 @@ function ArtistLine({
 
 export default function PlayerBar({
   onNavigate,
+  onExitLyrics,
   viewName,
   nowPlayingOpen = false,
   onToggleNowPlaying,
 }: {
   onNavigate: (view: View) => void;
+  onExitLyrics?: () => void;
   viewName: string;
   nowPlayingOpen?: boolean;
   onToggleNowPlaying?: () => void;
@@ -436,6 +438,15 @@ export default function PlayerBar({
   const resolveSeekDuration = useCallback(() => {
     const p = playerRef.current;
     const trackDuration = p.currentTrack?.durationSeconds;
+    // The music-video watch page overrides the seek bar's duration with the
+    // video's own length (a 4-minute MV for an 8-minute studio track). The
+    // override lives in the UI store so the per-frame paint loop below can
+    // read it without a React re-render.
+    const videoDuration = usePlayerUiStore.getState().videoDuration;
+    if (videoDuration !== null && videoDuration > 0) {
+      liveDurationRef.current = videoDuration;
+      return videoDuration;
+    }
     const fromLive = readLiveMediaDuration(currentAudio.current, trackDuration);
     if (fromLive > 0) {
       liveDurationRef.current = fromLive;
@@ -466,12 +477,17 @@ export default function PlayerBar({
     const paintSeekBar = () => {
       const scrub = seekScrubProgressRef.current;
       const latestAudio = currentAudio.current;
-      const progress =
+      const rawProgress =
         scrub ??
         (latestAudio && Number.isFinite(latestAudio.currentTime)
           ? latestAudio.currentTime
           : usePlayerUiStore.getState().progress);
       const duration = resolveSeekDuration();
+      // Clamp the displayed position to the resolved duration: when the
+      // music-video override is active the video can end before the song
+      // does (a 4-min MV inside an 8-min track), so the seek bar should sit
+      // at its end rather than reading past 100%.
+      const progress = duration > 0 ? Math.min(rawProgress, duration) : rawProgress;
 
       const pct =
         duration > 0
@@ -715,6 +731,7 @@ export default function PlayerBar({
 
   const canNavigateToAlbum = Boolean(directAlbumBrowseId || track?.videoId || track?.album?.trim());
   const onLyricsPage = viewName === "lyrics";
+  const onMusicVideoPage = viewName === "music-video";
   const hasLyrics = lyricsAvailable;
 
   const seekScrubProgress = usePlayerUiStore((state) => state.seekScrubProgress);
@@ -726,7 +743,9 @@ export default function PlayerBar({
       track.durationSeconds ||
       0
     : 0;
-  const displayProgress = track ? (seekScrubProgress ?? storedProgress) : 0;
+  const displayProgress = track
+    ? Math.min(seekScrubProgress ?? storedProgress, duration || Infinity)
+    : 0;
   const remaining = Math.max(0, duration - displayProgress);
   const progressPct = duration ? (displayProgress / duration) * 100 : 0;
 
@@ -980,6 +999,59 @@ export default function PlayerBar({
                 }`}
               />
             </button>
+            <button
+              type="button"
+              onClick={() => {
+                if (onLyricsPage) {
+                  onExitLyrics ? onExitLyrics() : onNavigate({ name: "home" });
+                } else if (hasLyrics) {
+                  onNavigate({ name: "lyrics" });
+                }
+              }}
+              disabled={!onLyricsPage && !hasLyrics}
+              aria-label={
+                onLyricsPage
+                  ? "Close lyrics"
+                  : lyricsLoading
+                  ? "Loading lyrics..."
+                  : hasLyrics
+                  ? "Open lyrics"
+                  : "No lyrics available"
+              }                aria-pressed={onLyricsPage}
+              className={`relative hidden h-9 w-9 items-center justify-center rounded-full transition-[opacity,transform,color] duration-150 ease-out sm:flex ${
+                volumeHover ? "pointer-events-none scale-95 opacity-0" : "scale-100 opacity-100"
+              } ${
+                onLyricsPage
+                  ? "text-white cursor-pointer"
+                  : hasLyrics
+                  ? "text-neutral-400 hover:text-white cursor-pointer"
+                  // No `opacity-*` here: a second opacity utility would
+                  // conflict with the `opacity-0` above (both have equal
+                  // specificity, so `opacity-40` wins and the button — and
+                  // its loading spinner — stays visible under the expanded
+                  // volume slider). Dimming is handled by the 40% alpha
+                  // text color instead.
+                  : "text-neutral-400/40 cursor-not-allowed"
+              }`}
+            >
+              <Mic2
+                size={18}
+                className={`transition-opacity duration-150 ${
+                  lyricsLoading ? "opacity-30" : ""
+                }`}
+              />
+              {onLyricsPage && (
+                <span className="absolute bottom-0.5 h-1 w-1 rounded-full bg-white" />
+              )}
+              {lyricsLoading && (
+                <span className="pointer-events-none absolute inset-0 flex items-center justify-center">
+                  <LoaderCircle
+                    size={18}
+                    className="animate-spin text-white"
+                  />
+                </span>
+              )}
+            </button>
             <div
               ref={volumeContainerRef}
               className="relative flex items-center justify-end"
@@ -1034,97 +1106,57 @@ export default function PlayerBar({
                 </div>
               </div>
             </div>
-            <button
-              type="button"
-              onClick={() => {
-                if (hasLyrics) {
-                  onNavigate({ name: "lyrics" });
-                }
-              }}
-              disabled={!hasLyrics}
-              aria-label={
-                lyricsLoading
-                  ? "Loading lyrics..."
-                  : hasLyrics
-                  ? onLyricsPage
-                    ? "Lyrics open"
-                    : "Open lyrics"
-                  : "No lyrics available"
-              }
-              aria-pressed={onLyricsPage}
-              className={`relative hidden h-9 w-9 items-center justify-center rounded-full transition-[opacity,transform,color] duration-150 ease-out sm:flex ${
-                onLyricsPage
-                  ? "text-white"
-                  : hasLyrics
-                  ? "text-neutral-400 hover:text-white cursor-pointer"
-                  : "text-neutral-400/40 opacity-40 cursor-not-allowed"
-              }`}
-            >
-              <Mic2
-                size={18}
-                className={`transition-opacity duration-150 ${
-                  lyricsLoading ? "opacity-30" : ""
-                }`}
-              />
-              {onLyricsPage && (
-                <span className="absolute bottom-0.5 h-1 w-1 rounded-full bg-white" />
-              )}
-              {lyricsLoading && (
-                <span className="pointer-events-none absolute inset-0 flex items-center justify-center">
-                  <LoaderCircle
-                    size={18}
-                    className="animate-spin text-white"
-                  />
-                </span>
-              )}
-            </button>
             {onToggleNowPlaying && (
-              <button
-                type="button"
-                disabled={!track}
-                onClick={track ? onToggleNowPlaying : undefined}
-                aria-label={
-                  !track
-                    ? "Now playing unavailable"
-                    : nowPlayingOpen
-                      ? "Close now playing"
-                      : "Open now playing"
-                }
-                aria-pressed={track ? nowPlayingOpen : false}
-                className={`hidden h-9 w-9 items-center justify-center rounded-full transition duration-150 ease-out sm:flex ${
-                  !track
-                    ? "text-neutral-400/40 opacity-40 cursor-not-allowed"
-                    : nowPlayingOpen
-                      ? "bg-white text-black"
-                      : "text-neutral-400 hover:bg-white/10 hover:text-white"
-                }`}
-              >
-                {nowPlayingOpen && track ? <IconPanelRightClose size={18} /> : <IconPanelRightOpen size={18} />}
-              </button>
+              <AnimatedPlayerBarButton visible={!onMusicVideoPage} className="hidden sm:flex">
+                <button
+                  type="button"
+                  disabled={!track}
+                  onClick={track ? onToggleNowPlaying : undefined}
+                  aria-label={
+                    !track
+                      ? "Now playing unavailable"
+                      : nowPlayingOpen
+                        ? "Close now playing"
+                        : "Open now playing"
+                  }
+                  aria-pressed={track ? nowPlayingOpen : false}
+                  className={`flex h-9 w-9 items-center justify-center rounded-full transition duration-150 ease-out ${
+                    !track
+                      ? "text-neutral-400/40 opacity-40 cursor-not-allowed"
+                      : nowPlayingOpen
+                        ? "bg-white text-black"
+                        : "text-neutral-400 hover:bg-white/10 hover:text-white"
+                  }`}
+                >
+                  {nowPlayingOpen && track ? <IconPanelRightClose size={18} /> : <IconPanelRightOpen size={18} />}
+                </button>
+              </AnimatedPlayerBarButton>
             )}
           </div>
           <div className="flex items-center gap-1 min-[720px]:hidden">
             <button
               type="button"
               onClick={() => {
-                if (hasLyrics) {
+                if (onLyricsPage) {
+                  onExitLyrics ? onExitLyrics() : onNavigate({ name: "home" });
+                } else if (hasLyrics) {
                   onNavigate({ name: "lyrics" });
                 }
               }}
-              disabled={!hasLyrics}
+              disabled={!onLyricsPage && !hasLyrics}
               aria-label={
-                lyricsLoading
+                onLyricsPage
+                  ? "Close lyrics"
+                  : lyricsLoading
                   ? "Loading lyrics..."
                   : hasLyrics
-                  ? onLyricsPage
-                    ? "Lyrics open"
-                    : "Open lyrics"
+                  ? "Open lyrics"
                   : "No lyrics available"
               }
               aria-pressed={onLyricsPage}
               className={`relative flex h-9 w-9 shrink-0 items-center justify-center rounded-full transition-[opacity,transform,color] duration-150 ease-out ${
                 onLyricsPage
-                  ? "text-white"
+                  ? "text-white cursor-pointer"
                   : hasLyrics
                   ? "text-neutral-400 hover:text-white cursor-pointer"
                   : "text-neutral-400/40 opacity-40 cursor-not-allowed"
@@ -1149,28 +1181,30 @@ export default function PlayerBar({
               )}
             </button>
             {onToggleNowPlaying && (
-              <button
-                type="button"
-                disabled={!track}
-                onClick={track ? onToggleNowPlaying : undefined}
-                aria-label={
-                  !track
-                    ? "Now playing unavailable"
-                    : nowPlayingOpen
-                      ? "Close now playing"
-                      : "Open now playing"
-                }
-                aria-pressed={track ? nowPlayingOpen : false}
-                className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-full transition duration-150 ease-out ${
-                  !track
-                    ? "text-neutral-400/40 opacity-40 cursor-not-allowed"
-                    : nowPlayingOpen
-                      ? "bg-white text-black"
-                      : "text-neutral-400 hover:bg-white/10 hover:text-white"
-                }`}
-              >
-                {nowPlayingOpen && track ? <IconPanelRightClose size={18} /> : <IconPanelRightOpen size={18} />}
-              </button>
+              <AnimatedPlayerBarButton visible={!onMusicVideoPage}>
+                <button
+                  type="button"
+                  disabled={!track}
+                  onClick={track ? onToggleNowPlaying : undefined}
+                  aria-label={
+                    !track
+                      ? "Now playing unavailable"
+                      : nowPlayingOpen
+                        ? "Close now playing"
+                        : "Open now playing"
+                  }
+                  aria-pressed={track ? nowPlayingOpen : false}
+                  className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-full transition duration-150 ease-out ${
+                    !track
+                      ? "text-neutral-400/40 opacity-40 cursor-not-allowed"
+                      : nowPlayingOpen
+                        ? "bg-white text-black"
+                        : "text-neutral-400 hover:bg-white/10 hover:text-white"
+                  }`}
+                >
+                  {nowPlayingOpen && track ? <IconPanelRightClose size={18} /> : <IconPanelRightOpen size={18} />}
+                </button>
+              </AnimatedPlayerBarButton>
             )}
           </div>
         </div>
@@ -1189,5 +1223,109 @@ function PlayerBarTrackSave({ track }: { track: MediaTrack }) {
       ariaLabel={isSaved ? "Remove from collection" : "Save to collection"}
       className="!h-[19px] !w-[19px]"
     />
+  );
+}
+
+/**
+ * Player-bar button collapse slot — the horizontal twin of the sidebar's
+ * `AnimatedSidebarNavItem` (same 260ms cubic-bezier collapse, same
+ * enter/exit pop keyframes). Used to hide the Now Playing toggle while the
+ * music-video page is open, so the button animates away/reappears smoothly
+ * instead of snapping in and out.
+ */
+function AnimatedPlayerBarButton({
+  visible,
+  className,
+  children,
+}: {
+  visible: boolean;
+  className?: string;
+  children: ReactNode;
+}) {
+  const [contentMounted, setContentMounted] = useState(visible);
+  const [slotOpen, setSlotOpen] = useState(visible);
+  const [motion, setMotion] = useState<"enter" | "exit" | null>(null);
+  const prevVisibleRef = useRef(visible);
+  const initialRenderRef = useRef(true);
+
+  useEffect(() => {
+    const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+    if (initialRenderRef.current) {
+      initialRenderRef.current = false;
+      prevVisibleRef.current = visible;
+      setContentMounted(visible);
+      setSlotOpen(visible);
+      return;
+    }
+
+    if (visible === prevVisibleRef.current) return;
+    prevVisibleRef.current = visible;
+
+    if (visible) {
+      setContentMounted(true);
+      if (reducedMotion) {
+        setSlotOpen(true);
+        setMotion(null);
+        return;
+      }
+      setSlotOpen(false);
+      setMotion(null);
+      requestAnimationFrame(() => {
+        requestAnimationFrame(() => {
+          setSlotOpen(true);
+          setMotion("enter");
+        });
+      });
+      return;
+    }
+
+    if (reducedMotion) {
+      setSlotOpen(false);
+      setContentMounted(false);
+      setMotion(null);
+      return;
+    }
+
+    setMotion("exit");
+    setSlotOpen(false);
+  }, [visible]);
+
+  const handleSlotTransitionEnd = useCallback(
+    (event: React.TransitionEvent<HTMLDivElement>) => {
+      if (event.propertyName !== "max-width") return;
+      if (slotOpen || motion !== "exit") return;
+      setContentMounted(false);
+      setMotion(null);
+    },
+    [slotOpen, motion],
+  );
+
+  const handleAnimationEnd = useCallback(() => {
+    if (motion === "enter") {
+      setMotion(null);
+    }
+  }, [motion]);
+
+  return (
+    <div
+      className={`playerbar-btn-slot ${slotOpen ? "is-open" : ""} ${className ?? ""}`}
+      onTransitionEnd={handleSlotTransitionEnd}
+    >
+      {contentMounted ? (
+        <div
+          className={
+            motion === "enter"
+              ? "sidebar-nav-item-enter"
+              : motion === "exit"
+                ? "sidebar-nav-item-exit"
+                : ""
+          }
+          onAnimationEnd={handleAnimationEnd}
+        >
+          {children}
+        </div>
+      ) : null}
+    </div>
   );
 }

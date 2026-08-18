@@ -230,4 +230,13 @@ describe("taste profile", () => {
     expect(getYesterdayDailyRecommendationVideoIds(today)).toEqual(new Set(["abc", "yesterday-b"]));
     expect(getYesterdayDailyRecommendationVideoIds(today - 24 * 60 * 60 * 1000)).toEqual(new Set());
   });
+
+  it("deduplicates concurrent in-flight daily recommendation calls", async () => {
+    const { generateDailyRecommendations } = await import("./utils/home-recommendations");
+    const promise1 = generateDailyRecommendations();
+    const promise2 = generateDailyRecommendations();
+    expect(promise1).toBe(promise2);
+    const [res1, res2] = await Promise.all([promise1, promise2]);
+    expect(res1).toEqual(res2);
+  });
 });

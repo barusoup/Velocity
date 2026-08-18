@@ -1462,6 +1462,25 @@ input[type="number"]::-webkit-inner-spin-button {
   max-height: 2.75rem;
 }
 
+/* Player-bar button slot — the Now Playing toggle in the player bar. Same
+   collapse animation as the sidebar Home slot, but horizontal (the bar's
+   controls sit in a row), so the button shrinks width-wise. The negative
+   left margin cancels the row's `gap-1` once the button is gone, so the
+   collapse leaves no residual gap. */
+.playerbar-btn-slot {
+  overflow: hidden;
+  max-width: 0;
+  margin-left: -0.25rem;
+  transition:
+    max-width 260ms cubic-bezier(0.22, 1, 0.36, 1),
+    margin-left 260ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.playerbar-btn-slot.is-open {
+  max-width: 2.25rem;
+  margin-left: 0;
+}
+
 .sidebar-nav-item-enter {
   animation: sidebar-nav-item-enter 260ms cubic-bezier(0.22, 1, 0.36, 1) both;
 }
@@ -1510,7 +1529,8 @@ input[type="number"]::-webkit-inner-spin-button {
     animation: none;
   }
 
-  .sidebar-nav-slot {
+  .sidebar-nav-slot,
+  .playerbar-btn-slot {
     transition: none;
   }
 

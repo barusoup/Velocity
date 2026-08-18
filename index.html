@@ -40,28 +40,19 @@
         user-select: none;
         -webkit-user-select: none;
         z-index: 99999;
-        opacity: 0;
-        visibility: hidden;
-        pointer-events: none;
+        opacity: 1;
+        visibility: visible;
+        pointer-events: auto;
         border-radius: 10px;
         overflow: hidden;
         transition:
-          opacity 0.18s ease,
-          transform 0.5s cubic-bezier(0.25, 1, 0.5, 1),
-          visibility 0s linear 0.18s;
+          opacity 0.3s ease,
+          transform 0.45s cubic-bezier(0.25, 1, 0.5, 1),
+          visibility 0.3s linear;
       }
       html[data-window-maximized="true"] .initial-loader-wrapper,
       html[data-window-fullscreen="true"] .initial-loader-wrapper {
         border-radius: 0;
-      }
-      .initial-loader-wrapper.is-visible {
-        opacity: 1;
-        visibility: visible;
-        pointer-events: auto;
-        transition:
-          opacity 0.18s ease,
-          transform 0.5s cubic-bezier(0.25, 1, 0.5, 1),
-          visibility 0s;
       }
       .initial-loader-drag-region {
         position: absolute;
@@ -73,6 +64,7 @@
       .initial-loader-wrapper.fade-out {
         opacity: 0;
         transform: scale(1.04);
+        visibility: hidden;
         pointer-events: none;
       }
       .initial-loader-icon {
@@ -190,29 +182,24 @@
         velocitySplashTipState.timer = window.setTimeout(velocityShowNextSplashTip, 5000);
       }
 
-      window.__velocityShowSplashTimer = window.setTimeout(() => {
-        const loader = document.getElementById("initial-loader");
-        if (!loader || loader.dataset.hidden === "true") return;
-        loader.classList.add("is-visible");
+      if (document.readyState === "loading") {
+        document.addEventListener("DOMContentLoaded", () => {
+          velocityShowNextSplashTip();
+        });
+      } else {
         velocityShowNextSplashTip();
-      }, 750);
+      }
 
       window.__velocityHideSplash = () => {
         const loader = document.getElementById("initial-loader");
         if (!loader || loader.dataset.hidden === "true") return;
         loader.dataset.hidden = "true";
-        window.clearTimeout(window.__velocityShowSplashTimer);
         window.clearTimeout(velocitySplashTipState.timer);
         loader.classList.add("fade-out");
         window.clearTimeout(window.__velocitySplashRemoveTimer);
-        window.clearTimeout(window.__velocitySplashStatusTimer);
-        if (!loader.classList.contains("is-visible")) {
-          loader.remove();
-          return;
-        }
         window.__velocitySplashRemoveTimer = window.setTimeout(() => {
           loader.remove();
-        }, 500);
+        }, 450);
       };
 
       window.addEventListener("error", (event) => {

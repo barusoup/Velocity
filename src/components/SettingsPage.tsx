@@ -226,7 +226,12 @@ export function SettingsPage() {
 
   useEffect(() => {
     const unsub = subscribe((key, _value) => {
-      if (key === "__all__" || key === "masterVolume" || key === "equalizerBands") {
+      if (
+        key === "__all__" ||
+        key === "launchOnStartup" ||
+        key === "masterVolume" ||
+        key === "equalizerBands"
+      ) {
         const s = getSettings();
         setSettingsState(s);
         if (key === "__all__" || key === "masterVolume") {
@@ -235,6 +240,32 @@ export function SettingsPage() {
       }
     });
     return unsub;
+  }, []);
+
+  // Reconcile the persisted "launch on startup" toggle with the real OS
+  // autostart registration each time the settings page opens. The OS
+  // registration is the source of truth for whether the app actually
+  // launches at login, so an external change — e.g. toggled off in the
+  // Windows Task Manager startup tab or macOS Login Items — can't leave
+  // the switch showing a stale value.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const { isEnabled } = await import("@tauri-apps/plugin-autostart");
+        const actual = await isEnabled();
+        if (cancelled) return;
+        if (actual !== getSettings().launchOnStartup) {
+          setSetting("launchOnStartup", actual);
+        }
+      } catch {
+        // Plugin unavailable (e.g. running outside Tauri) — keep the stored
+        // value rather than failing the page.
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   const updateSetting = useCallback(<K extends keyof Settings>(
@@ -434,7 +465,7 @@ export function SettingsPage() {
           ))}
         </div>
         <p className="shrink-0 text-xs font-medium tracking-[0.04em] text-neutral-500">
-          Velocity v0.1.6 Experimental
+          Velocity v0.1.7 Experimental
         </p>
       </div>
 
@@ -785,6 +816,18 @@ async function setLaunchOnStartup(enabled: boolean): Promise<void> {
     }
   } catch (e) {
     console.warn("Failed to set launch on startup:", e);
+  }
+  // Read back what the OS actually has registered and persist that as the
+  // toggle's value, so a failed enable/disable can't leave the setting
+  // claiming a state the OS didn't apply.
+  try {
+    const { isEnabled } = await import("@tauri-apps/plugin-autostart");
+    const actual = await isEnabled();
+    if (actual !== getSettings().launchOnStartup) {
+      setSetting("launchOnStartup", actual);
+    }
+  } catch (e) {
+    console.warn("Failed to verify launch on startup state:", e);
   }
 }
 

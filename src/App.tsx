@@ -55,6 +55,7 @@ const CollectionPage = lazy(() => import("./components/CollectionPage").then((m)
 const EntityPage = lazy(() => import("./components/EntityPage").then((m) => ({ default: m.EntityPage })));
 const ArtistPage = lazy(() => import("./components/ArtistPage").then((m) => ({ default: m.ArtistPage })));
 const LyricsPage = lazy(() => import("./components/LyricsPage").then((m) => ({ default: m.LyricsPage })));
+const MusicVideoPage = lazy(() => import("./components/MusicVideoPage").then((m) => ({ default: m.MusicVideoPage })));
 const SettingsPage = lazy(() => import("./components/SettingsPage").then((m) => ({ default: m.SettingsPage })));
 const UserPlaylistPage = lazy(() => import("./components/UserPlaylistPage").then((m) => ({ default: m.UserPlaylistPage })));
 const UserPlaylistsPage = lazy(() => import("./components/UserPlaylistsPage").then((m) => ({ default: m.UserPlaylistsPage })));
@@ -82,6 +83,8 @@ function getViewAnimationKey(view: View): string {
       return `search:${view.query}`;
     case "lyrics":
       return "lyrics";
+    case "music-video":
+      return "music-video";
     case "album":
     case "artist":
     case "playlist":
@@ -232,22 +235,36 @@ function Shell() {
     view.name === "user-playlist" ||
     view.name === "user-playlists" ||
     view.name === "artist" ||
-    view.name === "lyrics";
+    view.name === "lyrics" ||
+    view.name === "music-video";
 
   const hideSidebarOnLyrics = useSetting("hideSidebarOnLyrics");
   const hideNowPlayingOnLyrics = useSetting("hideNowPlayingOnLyrics");
   const onLyricsPage = view.name === "lyrics";
+  const onMusicVideoPage = view.name === "music-video";
+  // The music-video page is a full-bleed view like the lyrics page — it
+  // reuses the same "hide chrome on immersive pages" behavior so the video
+  // is unobstructed (the sidebar slides out on edge hover). Unlike the
+  // lyrics page, the Now Playing menu is hidden ENTIRELY there (it doesn't
+  // even follow the persistent open/closed state), and the player bar's
+  // toggle button animates away too — the user wants nothing of the menu
+  // while watching. Both come back when the page is exited.
+  const onImmersivePage = onLyricsPage || onMusicVideoPage;
   // With the "hide sidebar on lyrics" toggle ON, the sidebar stays hidden
   // on the lyrics page and slides out while the cursor hovers near the
   // left edge (or Ctrl+B is pressed). With the toggle OFF it behaves like
   // every other page, following the persistent open/closed state.
   const lyricsSidebarHidden =
-    onLyricsPage && hideSidebarOnLyrics && !lyricsControlsRevealed;
+    onImmersivePage && hideSidebarOnLyrics && !lyricsControlsRevealed;
   // With the "hide now playing on lyrics" toggle ON, the now playing menu
   // stays hidden on the lyrics page and slides out while the cursor hovers near
-  // the right edge (or the toggle button is clicked).
+  // the right edge (or the toggle button is clicked). On the music-video
+  // page the menu is always hidden — this is unconditional, not governed by
+  // the setting, since the user wants the menu (and its player-bar toggle)
+  // completely gone while watching.
   const lyricsNowPlayingHidden =
-    onLyricsPage && hideNowPlayingOnLyrics && !lyricsNowPlayingRevealed;
+    onMusicVideoPage ||
+    (onLyricsPage && hideNowPlayingOnLyrics && !lyricsNowPlayingRevealed);
 
   // Sidebar toggle. Works the same everywhere: toggles the persistent
   // open/closed state. On the lyrics page the toggle also brings the
@@ -258,11 +275,11 @@ function Shell() {
   // footprint, with nothing re-evaluating it until the next mouse move.
   const handleToggleSidebar = useCallback(() => {
     const next = !sidebarOpen;
-    if (onLyricsPage && hideSidebarOnLyrics) {
+    if (onImmersivePage && hideSidebarOnLyrics) {
       setLyricsControlsRevealed(next);
     }
     setSetting("sidebarOpen", next);
-  }, [onLyricsPage, hideSidebarOnLyrics, sidebarOpen]);
+  }, [onImmersivePage, hideSidebarOnLyrics, sidebarOpen]);
 
   const handleToggleNowPlaying = useCallback(() => {
     if (!player.currentTrack) return;
@@ -272,6 +289,14 @@ function Shell() {
     }
     setSetting("nowPlayingOpen", next);
   }, [onLyricsPage, hideNowPlayingOnLyrics, nowPlayingOpen, player.currentTrack]);
+
+  const handleExitLyrics = useCallback(() => {
+    if (canBack) {
+      goBack();
+    } else {
+      navigate(showHomeMenu ? { name: "home" } : { name: "collection" });
+    }
+  }, [canBack, goBack, navigate, showHomeMenu]);
 
   useGlobalShortcuts({ onToggleSidebar: handleToggleSidebar });
 
@@ -283,7 +308,7 @@ function Shell() {
   // oscillates when the pointer hovers near the sidebar's edge — it
   // decisively stays open or closed instead of jittering.
   useEffect(() => {
-    if (!onLyricsPage || !hideSidebarOnLyrics) return;
+    if (!onImmersivePage || !hideSidebarOnLyrics) return;
     let frame = 0;
     // The footprint matches the sidebar's intended rendered size
     // (expanded or collapsed per the persistent preference), so hovering
@@ -308,6 +333,18 @@ function Shell() {
       if (frame) return;
       frame = requestAnimationFrame(() => {
         frame = 0;
+        // A trailing `mousemove` can report coordinates already past the
+        // window edge as the pointer crosses the boundary — treat that
+        // the same as a leave (see `dropReveal` below).
+        if (
+          event.clientX < 0 ||
+          event.clientY < 0 ||
+          event.clientX >= window.innerWidth ||
+          event.clientY >= window.innerHeight
+        ) {
+          setLyricsControlsRevealed(false);
+          return;
+        }
         const dock = document.querySelector(".player-bar-dock");
         const zoneBottom = dock ? dock.getBoundingClientRect().top : window.innerHeight;
         const width = intendedWidth > 0 ? intendedWidth : 64;
@@ -323,20 +360,56 @@ function Shell() {
         });
       });
     };
+    // Once the cursor exits the window it stops producing `mousemove`
+    // events entirely, so the hover reveal would stay open with the cursor
+    // gone unless the exit itself is detected. Close it on every signal
+    // that proves the pointer left the window: `mouseout`/`pointerout`
+    // with `relatedTarget === null` (the canonical "left the frame"
+    // signal, used by the top-bar sensor), `mouseleave`/`pointerleave`
+    // on the document, and `blur` when the app loses focus. Crucially the
+    // pending `mousemove` rAF must be cancelled before closing, or the
+    // last stale move's coordinate check re-reveals the panel one frame
+    // after the close — which reads as the panel "never closing" on exit.
+    const dropReveal = () => {
+      if (frame) {
+        cancelAnimationFrame(frame);
+        frame = 0;
+      }
+      setLyricsControlsRevealed(false);
+    };
+    const handlePointerLeaveWindow = (event: MouseEvent) => {
+      if (event.relatedTarget !== null) return;
+      dropReveal();
+    };
     window.addEventListener("mousemove", handlePointerMove);
     window.addEventListener("resize", measureIntended);
+    window.addEventListener("blur", dropReveal);
+    document.addEventListener("mouseout", handlePointerLeaveWindow);
+    document.addEventListener("pointerout", handlePointerLeaveWindow);
+    document.addEventListener("mouseleave", dropReveal);
+    document.addEventListener("pointerleave", dropReveal);
+    document.documentElement.addEventListener("mouseleave", dropReveal);
+    document.documentElement.addEventListener("pointerleave", dropReveal);
     return () => {
       window.removeEventListener("mousemove", handlePointerMove);
       window.removeEventListener("resize", measureIntended);
+      window.removeEventListener("blur", dropReveal);
+      document.removeEventListener("mouseout", handlePointerLeaveWindow);
+      document.removeEventListener("pointerout", handlePointerLeaveWindow);
+      document.removeEventListener("mouseleave", dropReveal);
+      document.removeEventListener("pointerleave", dropReveal);
+      document.documentElement.removeEventListener("mouseleave", dropReveal);
+      document.documentElement.removeEventListener("pointerleave", dropReveal);
       if (frame) cancelAnimationFrame(frame);
     };
-  }, [onLyricsPage, hideSidebarOnLyrics, sidebarOpen]);
+  }, [onImmersivePage, hideSidebarOnLyrics, sidebarOpen]);
 
   // Hover reveal with hysteresis for Now Playing panel on lyrics page
   useEffect(() => {
     if (!onLyricsPage || !hideNowPlayingOnLyrics || !effectiveNowPlayingOpen) return;
     let frame = 0;
     let intendedWidth = 0;
+    let intendedTopHeight = 0;
     const measureIntended = () => {
       const root = document.getElementById("root");
       if (!root) return;
@@ -345,8 +418,10 @@ function Shell() {
       probe.style.visibility = "hidden";
       probe.style.pointerEvents = "none";
       probe.style.width = "var(--ui-nowplaying-open)";
+      probe.style.height = "var(--ui-topbar-height)";
       root.appendChild(probe);
       intendedWidth = parseFloat(getComputedStyle(probe).width) || 0;
+      intendedTopHeight = parseFloat(getComputedStyle(probe).height) || 0;
       probe.remove();
     };
     measureIntended();
@@ -354,36 +429,95 @@ function Shell() {
       if (frame) return;
       frame = requestAnimationFrame(() => {
         frame = 0;
+        // A trailing `mousemove` can report coordinates already past the
+        // window edge as the pointer crosses the boundary — treat that
+        // the same as a leave (see `dropReveal` below).
+        if (
+          event.clientX < 0 ||
+          event.clientY < 0 ||
+          event.clientX >= window.innerWidth ||
+          event.clientY >= window.innerHeight
+        ) {
+          setLyricsNowPlayingRevealed(false);
+          return;
+        }
         const dock = document.querySelector(".player-bar-dock");
         const zoneBottom = dock ? dock.getBoundingClientRect().top : window.innerHeight;
+        const topbar = document.querySelector(".topbar-drag-region");
+        const topControls = document.querySelector(".topbar-window-controls");
+        const topbarBottom = topbar?.getBoundingClientRect().bottom ?? 0;
+        const controlsBottom = topControls?.getBoundingClientRect().bottom ?? 0;
+        const zoneTop = Math.max(topbarBottom, controlsBottom, intendedTopHeight > 0 ? intendedTopHeight : 52);
         const width = intendedWidth > 0 ? intendedWidth : 320;
         const hideMargin = Math.max(28, Math.round(width * 0.18));
         setLyricsNowPlayingRevealed((revealed) => {
-          const abovePlayerBar = event.clientY < zoneBottom;
+          const inVerticalZone = event.clientY >= zoneTop && event.clientY < zoneBottom;
           const distFromRight = window.innerWidth - event.clientX;
           if (revealed) {
-            // Stay open until the pointer clearly leaves the now playing panel.
-            return abovePlayerBar && distFromRight < width + hideMargin;
+            // Stay open until the pointer clearly leaves the now playing panel
+            // or enters the top drag / window-control area.
+            return inVerticalZone && distFromRight < width + hideMargin;
           }
-          // Reveal as soon as the pointer approaches the now playing panel.
-          return abovePlayerBar && distFromRight < width + 12;
+          // Reveal as soon as the pointer approaches the now playing panel,
+          // excluding the top drag / window controls region.
+          return inVerticalZone && distFromRight < width + 12;
         });
       });
     };
+    // Once the cursor exits the window it stops producing `mousemove`
+    // events entirely, so the hover reveal would stay open with the cursor
+    // gone unless the exit itself is detected. Close it on every signal
+    // that proves the pointer left the window: `mouseout`/`pointerout`
+    // with `relatedTarget === null` (the canonical "left the frame"
+    // signal, used by the top-bar sensor), `mouseleave`/`pointerleave`
+    // on the document, and `blur` when the app loses focus. Crucially the
+    // pending `mousemove` rAF must be cancelled before closing, or the
+    // last stale move's coordinate check re-reveals the panel one frame
+    // after the close — which reads as the panel "never closing" on exit.
+    const dropReveal = () => {
+      if (frame) {
+        cancelAnimationFrame(frame);
+        frame = 0;
+      }
+      setLyricsNowPlayingRevealed(false);
+    };
+    const handlePointerLeaveWindow = (event: MouseEvent) => {
+      if (event.relatedTarget !== null) return;
+      dropReveal();
+    };
     window.addEventListener("mousemove", handlePointerMove);
     window.addEventListener("resize", measureIntended);
+    window.addEventListener("blur", dropReveal);
+    document.addEventListener("mouseout", handlePointerLeaveWindow);
+    document.addEventListener("pointerout", handlePointerLeaveWindow);
+    document.addEventListener("mouseleave", dropReveal);
+    document.addEventListener("pointerleave", dropReveal);
+    document.documentElement.addEventListener("mouseleave", dropReveal);
+    document.documentElement.addEventListener("pointerleave", dropReveal);
     return () => {
       window.removeEventListener("mousemove", handlePointerMove);
       window.removeEventListener("resize", measureIntended);
+      window.removeEventListener("blur", dropReveal);
+      document.removeEventListener("mouseout", handlePointerLeaveWindow);
+      document.removeEventListener("pointerout", handlePointerLeaveWindow);
+      document.removeEventListener("mouseleave", dropReveal);
+      document.removeEventListener("pointerleave", dropReveal);
+      document.documentElement.removeEventListener("mouseleave", dropReveal);
+      document.documentElement.removeEventListener("pointerleave", dropReveal);
       if (frame) cancelAnimationFrame(frame);
     };
   }, [onLyricsPage, hideNowPlayingOnLyrics, effectiveNowPlayingOpen]);
 
-  // Leaving the lyrics page drops the hover reveal so the sidebar and
-  // now playing panel return to their persistent states.
+  // Leaving the lyrics / music-video page drops the sidebar hover reveal so
+  // the sidebar returns to its persistent state. The now playing reveal is
+  // lyrics-only (the music-video page never auto-hides the menu), so it is
+  // dropped when leaving the lyrics page specifically.
+  useEffect(() => {
+    if (onImmersivePage) return;
+    setLyricsControlsRevealed(false);
+  }, [onImmersivePage]);
   useEffect(() => {
     if (onLyricsPage) return;
-    setLyricsControlsRevealed(false);
     setLyricsNowPlayingRevealed(false);
   }, [onLyricsPage]);
 
@@ -1124,6 +1258,8 @@ function Shell() {
 
                 {view.name === "lyrics" && <LyricsPage onNavigate={navigate} />}
 
+                {view.name === "music-video" && <MusicVideoPage onExit={handleExitLyrics} />}
+
                  {view.name === "settings" && (
                   <SettingsPage />
                 )}
@@ -1156,6 +1292,7 @@ function Shell() {
 
       <PlayerBar
         onNavigate={navigate}
+        onExitLyrics={handleExitLyrics}
         viewName={view.name}
         nowPlayingOpen={effectiveNowPlayingOpen}
         onToggleNowPlaying={handleToggleNowPlaying}

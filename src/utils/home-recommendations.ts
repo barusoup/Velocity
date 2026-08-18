@@ -145,48 +145,63 @@ function buildRecommendationExclusions(now = Date.now()): Set<string> {
   return excludedVideoIds;
 }
 
-export async function generateDailyRecommendations(now = Date.now()): Promise<MediaTrack[]> {
-  const seeds = getTasteSeeds(RECOMMENDATION_SEED_LIMIT, now);
-  if (seeds.length === 0) {
-    storeDailyRecommendations([], now);
-    return [];
+let inFlightDailyRecommendations: Promise<MediaTrack[]> | null = null;
+
+export function generateDailyRecommendations(now = Date.now()): Promise<MediaTrack[]> {
+  if (inFlightDailyRecommendations) {
+    return inFlightDailyRecommendations;
   }
 
-  const known = getRecentRecommendationVideoIds(7, now);
-  const excludedVideoIds = buildRecommendationExclusions(now);
-  const seedVideoIds = shuffleInPlace(seeds.map((entry) => entry.videoId));
-  const gathered: MediaTrack[] = [];
+  const promise = (async () => {
+    try {
+      const seeds = getTasteSeeds(RECOMMENDATION_SEED_LIMIT, now);
+      if (seeds.length === 0) {
+        storeDailyRecommendations([], now);
+        return [];
+      }
 
-  for (const seedVideoId of seedVideoIds) {
-    const batch = await fetchSeedCandidates(seedVideoId);
-    gathered.push(...batch);
-    const unique = dedupeTracks(gathered);
-    const eligibleCount = unique.filter((track) =>
-      isEligibleRecommendation(track, excludedVideoIds),
-    ).length;
-    if (eligibleCount >= MIN_CANDIDATE_POOL) break;
-  }
+      const known = getRecentRecommendationVideoIds(7, now);
+      const excludedVideoIds = buildRecommendationExclusions(now);
+      const seedVideoIds = shuffleInPlace(seeds.map((entry) => entry.videoId));
+      const gathered: MediaTrack[] = [];
 
-  if (gathered.length > 0) {
-    const unique = dedupeTracks(gathered);
-    const eligibleCount = unique.filter((track) =>
-      isEligibleRecommendation(track, excludedVideoIds),
-    ).length;
-    if (eligibleCount < DAILY_RECOMMENDATIONS_TARGET) {
       for (const seedVideoId of seedVideoIds) {
         const batch = await fetchSeedCandidates(seedVideoId);
         gathered.push(...batch);
-        const nextUnique = dedupeTracks(gathered);
-        const nextEligible = nextUnique.filter((track) =>
+        const unique = dedupeTracks(gathered);
+        const eligibleCount = unique.filter((track) =>
           isEligibleRecommendation(track, excludedVideoIds),
         ).length;
-        if (nextEligible >= DAILY_RECOMMENDATIONS_TARGET) break;
+        if (eligibleCount >= MIN_CANDIDATE_POOL) break;
       }
-    }
-  }
 
-  const unique = dedupeTracks(gathered);
-  const final = pickDailyRecommendations(unique, known, excludedVideoIds);
-  storeDailyRecommendations(final, now);
-  return final;
+      if (gathered.length > 0) {
+        const unique = dedupeTracks(gathered);
+        const eligibleCount = unique.filter((track) =>
+          isEligibleRecommendation(track, excludedVideoIds),
+        ).length;
+        if (eligibleCount < DAILY_RECOMMENDATIONS_TARGET) {
+          for (const seedVideoId of seedVideoIds) {
+            const batch = await fetchSeedCandidates(seedVideoId);
+            gathered.push(...batch);
+            const nextUnique = dedupeTracks(gathered);
+            const nextEligible = nextUnique.filter((track) =>
+              isEligibleRecommendation(track, excludedVideoIds),
+            ).length;
+            if (nextEligible >= DAILY_RECOMMENDATIONS_TARGET) break;
+          }
+        }
+      }
+
+      const unique = dedupeTracks(gathered);
+      const final = pickDailyRecommendations(unique, known, excludedVideoIds);
+      storeDailyRecommendations(final, now);
+      return final;
+    } finally {
+      inFlightDailyRecommendations = null;
+    }
+  })();
+
+  inFlightDailyRecommendations = promise;
+  return promise;
 }

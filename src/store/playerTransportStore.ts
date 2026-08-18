@@ -39,10 +39,24 @@ export interface PlayerTransportState {
    * yet. Used as the post-norm scalar in the gain factor chain.
    */
   normGain: number;
+  /**
+   * Volume scalar while the slider is being dragged (0..1), or null when
+   * no drag is in progress. `setLiveVolume` (slider onChange) publishes
+   * here so external audio consumers that mirror the player's gain — like
+   * the music-video page's video element — can follow the slider in real
+   * time instead of waiting for the drag to commit on mouseup.
+   */
+  liveVolume: number | null;
 }
 
 export interface PlayerTransportActions {
   setVolume: (value: number) => void;
+  /**
+   * Publish an in-progress slider value. Does NOT touch `volume` — the
+   * player's own gain node is driven directly during a drag; this field is
+   * purely for external mirrors that subscribe to the store.
+   */
+  setLiveVolume: (value: number) => void;
   setMuted: (value: boolean) => void;
   setNormGain: (value: number) => void;
   toggleMuted: () => void;
@@ -63,11 +77,22 @@ export const usePlayerTransportStore = create<PlayerTransportStore>()(
     volume: DEFAULT_VOLUME,
     muted: false,
     normGain: 1,
+    liveVolume: null,
     setVolume: (value) =>
       set((state) => ({
         volume: clampVolumeScalar(
           typeof value === "function"
             ? (value as (prev: number) => number)(state.volume)
+            : value,
+        ),
+        // A committed volume ends any in-progress drag mirror.
+        liveVolume: null,
+      })),
+    setLiveVolume: (value) =>
+      set((state) => ({
+        liveVolume: clampVolumeScalar(
+          typeof value === "function"
+            ? (value as (prev: number) => number)(state.liveVolume ?? state.volume)
             : value,
         ),
       })),
@@ -91,6 +116,7 @@ export const usePlayerTransportStore = create<PlayerTransportStore>()(
         volume: clampVolumeScalar(defaultVolume),
         muted: false,
         normGain: 1,
+        liveVolume: null,
       }),
   })),
 );
@@ -118,15 +144,19 @@ export function subscribeTransport(
       volume: state.volume,
       muted: state.muted,
       normGain: state.normGain,
+      liveVolume: state.liveVolume,
     }),
     listener,
     {
       // Equality by field so the listener only fires when one of the
-      // three transport values actually changes. Without `equalityFn`,
+      // four transport values actually changes. Without `equalityFn`,
       // Zustand's default shallow equality would still fire on no-op
       // `set({})` calls.
       equalityFn: (a, b) =>
-        a.volume === b.volume && a.muted === b.muted && a.normGain === b.normGain,
+        a.volume === b.volume &&
+        a.muted === b.muted &&
+        a.normGain === b.normGain &&
+        a.liveVolume === b.liveVolume,
     },
   );
 }

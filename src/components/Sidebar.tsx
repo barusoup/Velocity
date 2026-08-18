@@ -58,6 +58,7 @@ export type View =
   | { name: "user-playlist"; id: string }
   | { name: "user-playlists" }
   | { name: "lyrics" }
+  | { name: "music-video" }
   | { name: "settings" };
 
 export function isSearchWorkspace(view: View): boolean {
@@ -122,9 +123,9 @@ export function Sidebar({
   // The outward bottom-right curve. Lives OUTSIDE the <aside> (which is
   // overflow-hidden, so a clipped child wedge would artifact) and follows
   // the animated sidebar width so it glides in sync with collapse/expand.
-  // Overlaps the player bar by 1px (-bottom-px + 21px + 20→21 clip) so the
-  // seam between crescent and player bar is seamless (covers subpixel/DPR
-  // hairline gaps). See PlayerBar -mt-px counterpart.
+  // Overlaps the sidebar by 1px (-ml-px + 21px width) and the player bar by
+  // 1px (-bottom-px + 21px height + 20→21 clip) so the joins are fully
+  // seamless (covers subpixel/DPR hairline gaps). See PlayerBar -mt-px counterpart.
   const showCrescent = !hidden && !(narrowCollapsed && !expanded);
 
   return (
@@ -255,8 +256,8 @@ export function Sidebar({
     {showCrescent && (
       <div
         aria-hidden
-        className="pointer-events-none absolute -bottom-px left-[var(--ui-sidebar-current)] z-40 h-[21px] w-[20px] bg-neutral-950"
-        style={{ clipPath: "path('M 0 0 C 0 20 14 20 20 20 L 20 21 L 0 21 Z')" }}
+        className="pointer-events-none absolute -bottom-px -ml-px left-[var(--ui-sidebar-current)] z-40 h-[21px] w-[21px] bg-neutral-950"
+        style={{ clipPath: "path('M 0 0 L 1 0 C 1 20 15 20 21 20 L 21 21 L 0 21 Z')" }}
       />
     )}
     </>

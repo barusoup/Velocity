@@ -19,11 +19,18 @@
 // ---------------------------------------------------------------------------
 
 import type { MediaTrack } from "../types";
-import { getSyncedLyricsForTrack, saveOffline } from "../api";
+import {
+  cacheArtwork,
+  getOfflineVideoPath,
+  getSyncedLyricsForTrack,
+  saveOffline,
+  saveVideoOffline,
+} from "../api";
 import { getSetting } from "../settings";
 import { useOfflineStatusStore } from "../store/offlineStatusStore";
 import { createSemaphore } from "./concurrency";
 import { streamIdentityVideoIds } from "./media";
+import { findMusicVideoForTrack } from "./music-video";
 import { resolveStreamTrackAudio, songMetadataFromMatch } from "./song-resolution";
 
 export type OfflineSyncMetadataUpdates = Partial<
@@ -166,6 +173,10 @@ async function runOfflineDownload(
     ...metadataUpdates,
     resolvedVideoId: metadataUpdates.resolvedVideoId ?? track.resolvedVideoId ?? null,
   };
+  const coverUrl = lyricsTrack.cover ?? track.cover;
+  if (coverUrl) {
+    void cacheArtwork(coverUrl).catch(() => {});
+  }
   try {
     await getSyncedLyricsForTrack(lyricsTrack, { persist: true });
   } catch {
@@ -243,6 +254,59 @@ export function enqueueOfflineSync(
     );
 }
 
+// ---------------------------------------------------------------------------
+// Music-video offline saves
+// ---------------------------------------------------------------------------
+//
+// Saved songs with a music video persist the MV into the offline folder via
+// the same bounded queue (the backend `save_video_offline` resolves the video
+// through the streams cache and copies it into place). The video id is the
+// MUSIC VIDEO's id (what `findMusicVideoForTrack` found), not the song's
+// audio id — it gets its own pending-dedupe namespace (`mv:` prefix) so it
+// can't collide with the audio queue's id set.
+
+/** Music-video ids currently queued / in flight (namespace `mv:`). */
+const videoPendingIds = new Set<string>();
+
+async function runMusicVideoOfflineSave(track: MediaTrack): Promise<void> {
+  // Find the MV (cached by the Now Playing button check when it exists),
+  // then skip when the file is already saved locally.
+  const mv = await findMusicVideoForTrack(track);
+  if (!mv?.videoId) return;
+  const key = `mv:${mv.videoId}`;
+  if (videoPendingIds.has(key)) return;
+  if (await getOfflineVideoPath(mv.videoId)) return;
+  videoPendingIds.add(key);
+  try {
+    await saveVideoOffline(mv.videoId);
+  } finally {
+    videoPendingIds.delete(key);
+  }
+}
+
+/**
+ * Enqueue a background music-video offline save for a stream track. Runs
+ * through the same bounded semaphore as audio downloads so saving a whole
+ * album can't fire a dozen yt-dlp video downloads at once. Best-effort: a
+ * failed MV save must never fail the song save it piggybacks on.
+ */
+export function enqueueMusicVideoOfflineSync(track: MediaTrack): void {
+  if (track.source !== "stream" || !track.videoId) return;
+  void semaphore.run(() => runMusicVideoOfflineSave(track)).catch(() => {});
+}
+
+/**
+ * Cancel any queued / in-flight music-video offline save for the given MUSIC
+ * VIDEO ids (not the song's audio ids). Called when a song is removed from
+ * the collection so a background save can't re-create the MV file after the
+ * user unsaved it. Does not touch files already on disk.
+ */
+export function cancelMusicVideoOfflineSync(musicVideoIds: readonly string[]): void {
+  for (const id of musicVideoIds) {
+    videoPendingIds.delete(`mv:${id}`);
+  }
+}
+
 /**
  * Sweep a list of saved songs and quietly enqueue downloads for every
  * stream track that does not yet have a local file. This is what makes a
@@ -257,5 +321,8 @@ export function enqueueOfflineSyncForSavedSongs(
   for (const track of tracks) {
     if (track.source !== "stream" || !track.videoId) continue;
     enqueueOfflineSync(track, updateSongMetadata);
+    // Saved songs with a music video also get the MV persisted locally, so
+    // the watch page can play it offline / without re-downloading.
+    enqueueMusicVideoOfflineSync(track);
   }
 }

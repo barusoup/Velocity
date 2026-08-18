@@ -69,6 +69,7 @@ export function SearchPage({
   const lastRetryTokenRef = useRef(retryToken);
   const onSearchResolvedRef = useRef(onSearchResolved);
   const onSearchLoadingChangeRef = useRef(onSearchLoadingChange);
+  const { warm } = usePlayerActions();
 
   useEffect(() => {
     onSearchResolvedRef.current = onSearchResolved;
@@ -157,6 +158,11 @@ export function SearchPage({
         const item = candidates[index++]!;
         if (item.kind !== "song" || !item.videoId) continue;
         void getSyncedLyrics(item.videoId).catch(() => {});
+        // Warm the stream too: the top song results are the most likely
+        // manual pick, so start their resolve + download now (rate-limited
+        // inside `warm`) instead of paying the download wait on click.
+        const warmTrack = toTrack(item);
+        if (warmTrack) warm(warmTrack);
         // Stagger by one microtask so we don't burst 5 invokes in same frame.
         if (index < candidates.length) {
           queueMicrotask(pump);
@@ -168,7 +174,7 @@ export function SearchPage({
     return () => {
       cancelled = true;
     };
-  }, [state.data]);
+  }, [state.data, warm]);
 
   const top = state.data?.topResult;
   const results = state.data?.results ?? [];
@@ -320,7 +326,7 @@ function TopResultBlock({
 }) {
   const rounded = getArtworkRoundedClass(item.kind === "artist" ? "circle" : "square");
   const titleView = getSearchItemTitleView(item);
-  const { togglePlay } = usePlayerActions();
+  const { togglePlay, warm } = usePlayerActions();
   const { active, playingActive: currentlyPlaying, bufferingActive } =
     useSearchItemPlaybackState(item);
   const contextTrack = useMemo(() => (item.kind === "song" ? toTrack(item) : null), [item]);
@@ -363,6 +369,9 @@ function TopResultBlock({
         : {})}
       onContextMenu={(e) => {
         if (contextTrack || contextAlbum) e.stopPropagation();
+      }}
+      onMouseEnter={() => {
+        if (contextTrack) warm(contextTrack);
       }}
     >
       <div className="flex items-center gap-[clamp(1rem,1.5625vw,1.25rem)]">
@@ -454,7 +463,7 @@ function SearchResultRow({
 }) {
   const rounded = getArtworkRoundedClass(item.kind === "artist" ? "circle" : "square");
   const titleView = getSearchItemTitleView(item);
-  const { togglePlay } = usePlayerActions();
+  const { togglePlay, warm } = usePlayerActions();
   const { active, playingActive: currentlyPlaying, bufferingActive } =
     useSearchItemPlaybackState(item);
   const contextTrack = useMemo(() => (item.kind === "song" ? toTrack(item) : null), [item]);
@@ -506,6 +515,9 @@ function SearchResultRow({
         : {})}
       onContextMenu={(e) => {
         if (contextTrack || contextAlbum) e.stopPropagation();
+      }}
+      onMouseEnter={() => {
+        if (contextTrack) warm(contextTrack);
       }}
       >
       <div className={`h-[var(--ui-art-row)] w-[var(--ui-art-row)] flex-shrink-0 overflow-hidden bg-neutral-800 ${rounded}`}>

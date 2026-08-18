@@ -689,7 +689,7 @@ function AlbumTrackRow({
   onHoverChange?: (hovered: boolean) => void;
   queueOrigin?: QueueOrigin | null;
 }) {
-  const { togglePlay } = usePlayerActions();
+  const { togglePlay, warm } = usePlayerActions();
   const { active, playingActive, bufferingActive } = useTrackPlaybackState(track);
   const contextTarget = useContextTrackTarget(track);
   const isSaved = useIsTrackSaved(track);
@@ -724,7 +724,10 @@ function AlbumTrackRow({
       onContextMenu={(event) => {
         event.stopPropagation();
       }}
-      onMouseEnter={() => onHoverChange?.(true)}
+      onMouseEnter={() => {
+        onHoverChange?.(true);
+        warm(track);
+      }}
       onMouseLeave={() => onHoverChange?.(false)}
     >
       <div className="relative flex items-center justify-center">
@@ -848,7 +851,7 @@ function CompactTrackRow({
   onHoverChange?: (hovered: boolean) => void;
   queueOrigin?: QueueOrigin | null;
 }) {
-  const { togglePlay } = usePlayerActions();
+  const { togglePlay, warm } = usePlayerActions();
   const { active, playingActive, bufferingActive } = useTrackPlaybackState(track);
   const contextTarget = useContextTrackTarget(track);
 
@@ -862,7 +865,10 @@ function CompactTrackRow({
       onContextMenu={(event) => {
         event.stopPropagation();
       }}
-      onMouseEnter={() => onHoverChange?.(true)}
+      onMouseEnter={() => {
+        onHoverChange?.(true);
+        warm(track);
+      }}
       onMouseLeave={() => onHoverChange?.(false)}
     >
       <div className="relative flex items-center justify-center">

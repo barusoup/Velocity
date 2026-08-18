@@ -113,6 +113,12 @@ import {
 } from "./player/helpers";
 
 export const currentAudio: { current: HTMLAudioElement | null } = { current: null };
+// While the music-video watch page is open, the video element owns the
+// audible audio. This flag keeps the player's audio element silent even when
+// the user drags the volume slider or toggles mute — those actions are
+// mirrored onto the video instead of unmuting the background track and
+// playing it on top of the video.
+export const audioMuteOverride: { current: boolean } = { current: false };
 
 type RepeatMode = "off" | "all" | "one";
 
@@ -162,6 +168,13 @@ type PlayerActions = {
   clearPlaybackHistory: () => void;
   removeTrackFromQueue: (trackId: string) => void;
   appendToQueue: (tracks: MediaTrack[], origin?: QueueOrigin) => void;
+  /**
+   * Best-effort stream warm-up for a track the user is *likely* to play
+   * next (row hover, top search result). Kicks off the same resolve +
+   * download as the queue prefetch so a manual pick is already cached by
+   * the time play is requested. Rate-limited and deduped; never rejects.
+   */
+  warm: (track: MediaTrack) => void;
   togglePlay: () => void;
   next: (recordRecentlyPlayed?: boolean) => void;
   prev: () => void;
@@ -878,6 +891,32 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
     }
   }, [patchQueueTrackInRef]);
 
+  // Rate budget for hover / search-result warm prefetches. These start real
+  // yt-dlp downloads ahead of a possible play, so cap how many can begin per
+  // minute — a browsing spree must not become a download stampede that makes
+  // YouTube raise the per-IP stream throttle (the `available_at` gate grows
+  // with download frequency). Deduped warm-ups (track already in flight)
+  // don't consume budget.
+  const WARM_PREFETCH_MAX_PER_MINUTE = 12;
+  const warmStartsRef = useRef<number[]>([]);
+
+  const warm = useCallback(
+    (track: MediaTrack) => {
+      if (track.source !== "stream") return;
+      // The active track is already being resolved by the load path.
+      if (trackRef.current?.id === track.id) return;
+      // Already warming / downloading: prefetchStreamTrack dedupes by id.
+      if (streamPrefetchInFlightRef.current.has(track.id)) return;
+      const now = Date.now();
+      const windowStart = now - 60_000;
+      warmStartsRef.current = warmStartsRef.current.filter((t) => t > windowStart);
+      if (warmStartsRef.current.length >= WARM_PREFETCH_MAX_PER_MINUTE) return;
+      warmStartsRef.current.push(now);
+      void prefetchStreamTrack(track);
+    },
+    [prefetchStreamTrack],
+  );
+
   const upcomingPrefetchKey = useMemo(
     () =>
       queue
@@ -965,7 +1004,7 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
     } else {
       audio.volume = clampVolume(target);
     }
-    audio.muted = nextMuted;
+    audio.muted = audioMuteOverride.current || nextMuted;
   }, []);
 
   const stopCurrentPlayback = useCallback((options?: {
@@ -3339,6 +3378,13 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
   }, [setMutedTransport, setVolumeTransport]);
 
   const setLiveVolume = useCallback((value: number) => {
+    // Publish the in-progress value so external audio mirrors (the
+    // music-video page's video element) follow the slider live during the
+    // drag, not just on mouseup when `setVolume` commits. `liveVolume` is
+    // separate from `volume` on purpose: the store publish must not trigger
+    // the player's own `applyOutputLevels` effect (which depends on
+    // `volume`/`muted`/`normGain`), or the drag would fight the gain ramp.
+    usePlayerTransportStore.getState().setLiveVolume(value);
     const audio = audioRef.current;
     if (!audio) return;
     // Route through `computeAppliedGain` so the slider uses the same
@@ -3357,7 +3403,7 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
     } else {
       audio.volume = clampVolume(target);
     }
-    audio.muted = false;
+    audio.muted = audioMuteOverride.current;
   }, []);
 
   const toggleMute = useCallback(() => {
@@ -3640,6 +3686,7 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
       clearPlaybackHistory,
       removeTrackFromQueue,
       appendToQueue,
+      warm,
       togglePlay,
       next,
       prev,
@@ -3690,6 +3737,7 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
       togglePlay,
       toggleShuffle,
       updateSeekScrubPreview,
+      warm,
     ],
   );
 

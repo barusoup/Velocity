@@ -445,45 +445,6 @@ export function isStreamResolveTimeout(message: string): boolean {
   );
 }
 
-// Recording-variant suffixes we tolerate when matching a playable alternate
-// for a song whose studio upload is unplayable ("Paranoid Android (Live)",
-// "Song (Acoustic)", "Song (Live at the BBC)", ...). Only parenthesized /
-// dash-prefixed trailing variants are stripped so we never mutate a title
-// that merely contains such a word.
-const RECORDING_VARIANT_SUFFIX_REGEX =
-  /\s*[\(\[]\s*(live(?:\s*[\d\-–]+)?(?:\s+at\s+.+?)?|acoustic|unplugged|remix|demo|outtake|outtakes|instrumental|karaoke|cover|session|reprise|version|ver|normal|special|original|edit|extended|radio)\s*[\)\]]\s*$/i;
-const DASHED_RECORDING_VARIANT_SUFFIX_REGEX =
-  /\s*[-–—]\s*(live(?:\s*[\d\-–]+)?(?:\s+at\s+.+)?|acoustic|unplugged|remix|demo|outtake|outtakes|instrumental|karaoke|cover|session|reprise|version|ver|normal|special|original|edit|extended|radio)\s*$/i;
-
-function stripRecordingVariantSuffix(title: string): string {
-  return title
-    .replace(RECORDING_VARIANT_SUFFIX_REGEX, "")
-    .replace(DASHED_RECORDING_VARIANT_SUFFIX_REGEX, "")
-    .trim()
-    .replace(/[\s\-–—:]+$/g, "")
-    .trim();
-}
-
-/**
- * Same-song title equivalence for the playback fallback. Unlike
- * `titlesMatchForAudioSwap` this ALLOWS recording variants (live, acoustic,
- * official music video, ...) AND cross-edition uploads (a 2007 remaster can
- * fall back to the original studio cut) because the fallback exists to find
- * ANY playable upload of the song when the intended studio id is unplayable.
- * Artist + duration guards downstream keep it from matching a different song
- * or a cover.
- */
-function titlesMatchForSameSongFallback(sourceTitle: string, candidateTitle: string): boolean {
-  const source = normalizeAutoplayMatchText(
-    stripRecordingVariantSuffix(cleanAutoplaySearchTitle(sourceTitle)),
-  );
-  const candidate = normalizeAutoplayMatchText(
-    stripRecordingVariantSuffix(cleanAutoplaySearchTitle(candidateTitle)),
-  );
-  if (!source || !candidate) return false;
-  return source === candidate;
-}
-
 type SameSongAlternateInput = Pick<
   MediaTrack,
   "artist" | "title" | "videoId" | "resolvedVideoId" | "durationSeconds" | "kind"
@@ -491,9 +452,16 @@ type SameSongAlternateInput = Pick<
 
 /**
  * Best playable same-song alternate for a track whose current stream id
- * failed. Scans song-kind search rows only — a music video (or any other
- * non-song media) is never acceptable audio, so it can never be an
- * alternate — and ranks studio uploads above recording variants. Never
+ * failed. Scans song-kind search rows only and accepts ONLY studio uploads of
+ * the same song — a music video (or any other non-song media) is never
+ * acceptable audio, and neither is a recording variant (live, acoustic, remix,
+ * ...), which is a different take rather than the song itself.
+ *
+ * Matching reuses the same strict rules as the primary swap
+ * (`titlesMatchForAudioSwap`): same artist, same cleaned title, compatible
+ * edition, and identical recording-variant flags — so a variant or
+ * different-edition source can never match either. When no studio alternate
+ * exists, the caller prefers to fail rather than play wrong audio. Never
  * returns an id in `excluded` (the failing ids).
  */
 function findPlayableSameSongAlternate(
@@ -501,18 +469,12 @@ function findPlayableSameSongAlternate(
   candidates: readonly SearchItem[],
   excluded: ReadonlySet<string>,
 ): SearchItem | null {
-  // A studio track must never silently play a recording-variant upload (live,
-  // acoustic, remix, ...) as its audio — that is "wrong audio relative to the
-  // track". Variants are only acceptable alternates when the SOURCE is itself
-  // a variant. Music videos are filtered out before ranking, so they can
-  // never become a fallback at all.
-  const sourceIsVariant = recordingVariantFlags(track.title).hasVariant;
   const ranked = songAudioCandidates(candidates)
     .filter((item) => item.videoId && !excluded.has(item.videoId))
+    // Studio cuts only: a recording variant is a different take, never a
+    // stand-in for the song's audio.
+    .filter((item) => !recordingVariantFlags(item.title).hasVariant)
     .map((item, index) => {
-      const variant = recordingVariantFlags(item.title).hasVariant;
-      const priority = variant ? 1 : 0;
-
       const sourceSeconds = track.durationSeconds;
       const candidateSeconds = item.durationSeconds;
       let durationDelta = Number.POSITIVE_INFINITY;
@@ -529,7 +491,6 @@ function findPlayableSameSongAlternate(
       return {
         item,
         index,
-        priority,
         artistMatch,
         durationDelta,
         durationOk: isDurationMatchForAutoplaySwap(sourceSeconds, candidateSeconds, {
@@ -541,15 +502,9 @@ function findPlayableSameSongAlternate(
       (entry) =>
         entry.durationOk &&
         entry.artistMatch &&
-        (sourceIsVariant || !recordingVariantFlags(entry.item.title).hasVariant) &&
-        titlesMatchForSameSongFallback(track.title, entry.item.title),
+        titlesMatchForAudioSwap(track.title, entry.item.title),
     )
-    .sort(
-      (a, b) =>
-        a.priority - b.priority ||
-        a.durationDelta - b.durationDelta ||
-        a.index - b.index,
-    );
+    .sort((a, b) => a.durationDelta - b.durationDelta || a.index - b.index);
 
   return ranked[0]?.item ?? null;
 }
@@ -918,13 +873,16 @@ export async function resolveStreamTrackAudio(track: MediaTrack): Promise<MediaT
  * Unlike `resolveStreamTrackAudio` this runs even after the track was already
  * resolved to a studio upload — the resolved id can itself be unplayable (e.g.
  * some Radiohead Topic uploads time out in yt-dlp). It re-queries YT Music and
- * finds a PLAYABLE alternate videoId for the SAME song:
+ * finds a PLAYABLE alternate videoId for the SAME studio song:
  *
  *   1. the album-shelf videoId for the same remaster row (existing behavior),
- *   2. otherwise the best same-song candidate from the search response,
- *      scanning song-kind rows only — studio uploads, plus recording
- *      variants (live, acoustic, ...) when the source is itself a variant.
- *      Music videos and other non-song media are never used as alternates.
+ *   2. otherwise the best same-song studio candidate from the search response.
+ *
+ * Only studio uploads of the song are acceptable alternates. Music videos and
+ * other non-song media are never used as audio, and neither are recording
+ * variants (live, acoustic, remix, ...) — a different take is not the song.
+ * When no studio alternate exists this returns null and playback fails rather
+ * than substitute wrong audio.
  *
  * The returned track only gains a `resolvedVideoId` — its release-scoped
  * studio-song metadata is preserved, so the row never turns into a music

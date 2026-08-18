@@ -271,12 +271,12 @@ export function CollectionPage(props: CollectionPageProps) {
     const controller = new AbortController();
     const run = () => {
       const urls = [
-        ...savedAlbums.slice(0, 20).map((album) => album.cover),
-        ...savedArtists.slice(0, 20).flatMap((artist) => [artist.cover, artist.banner]),
-        ...savedSongs.slice(0, 20).map((song) => song.cover),
-        ...sortedLocal.slice(0, 20).map((track) => track.cover),
+        ...savedAlbums.map((album) => album.cover),
+        ...savedArtists.flatMap((artist) => [artist.cover, artist.banner]),
+        ...savedSongs.map((song) => song.cover),
+        ...sortedLocal.map((track) => track.cover),
       ];
-      preloadArtworkUrls(urls, { signal: controller.signal, concurrency: 3 });
+      preloadArtworkUrls(urls, { signal: controller.signal, concurrency: 2 });
     };
     if (typeof window.requestIdleCallback === "function") {
       handle = window.requestIdleCallback(run, { timeout: 2000 });
@@ -1185,7 +1185,7 @@ function CollectionRowShell({
   compact?: boolean;
   index?: number;
 }) {
-  const { togglePlay } = usePlayerActions();
+  const { togglePlay, warm } = usePlayerActions();
   const { active, playingActive, bufferingActive } = useTrackPlaybackState(track);
   const contextTarget = useContextTrackTarget(track, Boolean(withContextTarget));
 
@@ -1250,6 +1250,7 @@ function CollectionRowShell({
         active && "bg-neutral-900/70",
       )}
       onClick={active ? togglePlay : onPlay}
+      onMouseEnter={() => warm(track)}
     >
       {compact ? (
         <div className="relative flex items-center justify-center">

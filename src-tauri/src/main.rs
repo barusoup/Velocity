@@ -47,7 +47,7 @@ use serde_json::{json, Value};
 use tauri::{AppHandle, Manager, State};
 use tokio::{
     process::Command,
-    sync::{oneshot, Mutex, Notify, Semaphore},
+    sync::{oneshot, Mutex, Notify},
 };
 
 #[cfg(target_os = "windows")]
@@ -100,6 +100,35 @@ const YT_DLP_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(120);
 /// slowly" failure mode is exactly the runtime starving under leaked child
 /// processes.
 const STREAM_RESOLVE_TIMEOUT: Duration = Duration::from_secs(90);
+/// Upper bound for a single `resolve_video_stream` yt-dlp download. Music
+/// video files (1080p merged h264+aac) are much larger than audio-only
+/// streams, so this is deliberately looser than `STREAM_RESOLVE_TIMEOUT`; it
+/// still reaps a wedged yt-dlp so a stalled download can't pin a worker
+/// forever.
+const VIDEO_STREAM_RESOLVE_TIMEOUT: Duration = Duration::from_secs(240);
+/// yt-dlp format selector for music-video downloads. The default
+/// (android_vr) player client exposes no single combined file above 360p for
+/// most music videos, so the high-quality path is a merged pair: 1080p h264
+/// video + AAC audio, muxed into a universally playable mp4 by the bundled
+/// ffmpeg (see `resolve_ffmpeg`). The remaining alternatives keep the
+/// download working when the merge can't run or only lower formats exist.
+const VIDEO_STREAM_FORMAT: &str =
+    "bestvideo[height<=1080][vcodec^=avc1][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=1080]+bestaudio/best[height<=1080]/best";
+/// Merge-free fallback used when the bundled ffmpeg is unavailable — single
+/// combined files only, capped at 1080p.
+const VIDEO_STREAM_FORMAT_NO_MERGE: &str = "best[height<=1080]/best";
+/// YouTube 403s the default `android_vr` player client's CDN URLs for many
+/// residential IPs ("ERROR: unable to download video data: HTTP Error 403:
+/// Forbidden"), even on the latest yt-dlp stable — extraction succeeds but
+/// the media fetch from googlevideo is refused. Force the embed player
+/// client, which exposes the same audio-only webm/opus the app already
+/// plays at full quality. The `android` client is deliberately NOT used as
+/// a fallback: its only format is a 22 kHz 360p combined video+audio file,
+/// a real quality regression for a music app. The rare embed-restricted
+/// video is instead handled by the playback alternate-id walk. Shared by
+/// every yt-dlp audio-download call site.
+const YT_DLP_PLAYER_CLIENT_EXTRACTOR_ARGS: [&str; 2] =
+    ["--extractor-args", "youtube:player_client=web_embedded"];
 /// Bound for per-track ffmpeg analysis (loudness + leading-silence detection).
 /// Each decodes up to ~45s of audio; healthy runs finish in seconds, so this
 /// is generous but still prevents a wedged ffmpeg from pinning a worker.
@@ -130,25 +159,12 @@ use innertube::{
     square_artist_thumbnail_url, text_from_value, text_indicates_video, watch_next_payload,
 };
 
-/// Serializes vocal-onset ffmpeg analyses. Each run decodes ~45s of audio via
-/// ffmpeg and then scans it in-process — genuinely CPU/IO heavy. Without a
-/// bound, loading a playlist spawns one such job per track and the machine
-/// thrashes (the macOS "inputs freeze / loads extremely slowly" symptom).
-/// One-at-a-time is plenty: the offset is a background enhancement, and a
-/// missed warm-up is simply recomputed on the next lyrics fetch.
-static VOCAL_ANALYSIS_SEMAPHORE: Lazy<Arc<Semaphore>> =
-    Lazy::new(|| Arc::new(Semaphore::new(1)));
-
 pub(crate) struct AppState {
     client_config: Mutex<Option<innertube::InnerTubeConfig>>,
     stream_cache: Mutex<crate::cache::TtlCache<String, CachedStream>>,
     watch_playlist_cache: Mutex<crate::cache::TtlCache<String, CachedWatchPlaylist>>,
     track_duration_cache: Mutex<crate::cache::TtlCache<String, CachedTrackDuration>>,
     import_library: Mutex<()>,
-    musixmatch_token: Mutex<Option<lyrics::MusixmatchTokenCache>>,
-    /// In-memory cache of per-video lyric offsets (vocal-onset correction for
-    /// third-party LRC). Persisted to the data store; this map is the fast path.
-    lyric_offset_cache: Mutex<HashMap<String, lyrics::LyricOffsetRecord>>,
     /// Active "Save to my device" exports, keyed by the frontend's
     /// `request_id`. When the user clicks Cancel the frontend fires
     /// `cancel_save_export(request_id)`, which pulls the sender out
@@ -162,6 +178,13 @@ pub(crate) struct AppState {
     /// parallel downloads of one id were getting the app rate-limited and
     /// leaving partial files. Entries are removed when the leader finishes.
     in_flight_streams: Mutex<HashMap<String, InFlightStream>>,
+    /// Music-video downloads for the watch page (`resolve_video_stream`),
+    /// keyed by the `mv-{videoId}` namespace. Separate from `stream_cache`
+    /// so an audio-only stream resolution for the same video id never
+    /// serves the video file (and vice versa).
+    video_cache: Mutex<crate::cache::TtlCache<String, CachedStream>>,
+    /// In-flight `resolve_video_stream` downloads, keyed by `mv-{videoId}`.
+    in_flight_videos: Mutex<HashMap<String, InFlightStream>>,
 }
 
 impl Default for AppState {
@@ -181,10 +204,13 @@ impl Default for AppState {
                 TRACK_DURATION_CACHE_TTL,
             )),
             import_library: Default::default(),
-            musixmatch_token: Default::default(),
-            lyric_offset_cache: Default::default(),
             active_save_exports: Default::default(),
             in_flight_streams: Default::default(),
+            video_cache: Mutex::new(crate::cache::TtlCache::new(
+                60,
+                STREAM_CACHE_TTL,
+            )),
+            in_flight_videos: Default::default(),
         }
     }
 }
@@ -3371,149 +3397,9 @@ async fn get_synced_lyrics(
     )
     .await;
 
-    let mut result = lyrics::resolve_synced_lyrics(&lyrics_deps(&state), meta, &ctx).await;
-
-    // Vocal-onset correction for third-party LRC (permanent per-video cache).
-    // Only the fast cache-only check stays on the critical path (microseconds);
-    // a miss warms the cache in the background so the current response is
-    // never blocked by the ffmpeg DSP scan (the #1 macOS pinwheel cause).
-    if let Some(ref mut lyrics) = result {
-        if !is_ytm_native_lyrics(lyrics) && !lyrics.lines.is_empty() {
-            if let Some(offset) =
-                try_cached_vocal_offset(&state, &video_id, lyrics, ctx.leading_silence_skip_ms).await
-            {
-                if offset != 0 {
-                    *lyrics = lyrics::apply_vocal_offset(
-                        std::mem::replace(lyrics, empty_synced_lyrics()),
-                        offset,
-                    );
-                }
-            } else {
-                warm_vocal_offset_cache(
-                    app.clone(),
-                    video_id.clone(),
-                    lyrics.clone(),
-                    ctx.leading_silence_skip_ms,
-                );
-            }
-        }
-    }
+    let result = lyrics::resolve_synced_lyrics(&lyrics_deps(&state), meta, &ctx).await;
 
     Ok(result)
-}
-
-fn empty_synced_lyrics() -> SyncedLyricsResponse {
-    SyncedLyricsResponse {
-        lines: Vec::new(),
-        source: None,
-        has_per_word_sync: None,
-        applied_offset_ms: None,
-    }
-}
-
-fn is_ytm_native_lyrics(lyrics: &SyncedLyricsResponse) -> bool {
-    lyrics
-        .source
-        .as_deref()
-        .is_some_and(|s| s.contains("YouTube Music"))
-}
-
-/// Fast cache-only check for a vocal offset — no ffmpeg work.
-/// Returns `Some(offset)` on hit (including `Some(0)` meaning "no offset"),
-/// `None` on miss so the caller knows to spawn background work.
-async fn try_cached_vocal_offset(
-    state: &State<'_, AppState>,
-    video_id: &str,
-    lyrics: &SyncedLyricsResponse,
-    leading_silence_ms: u32,
-) -> Option<i32> {
-    if lyrics.lines.is_empty() {
-        return Some(0);
-    }
-    let lyrics_hash = lyrics::lyrics_content_hash(lyrics);
-    let cache_key = lyrics::offset_cache_key(video_id);
-    {
-        let cache = state.lyric_offset_cache.lock().await;
-        if let Some(rec) = cache.get(&cache_key) {
-            if rec.lyrics_hash == lyrics_hash && rec.leading_silence_ms == leading_silence_ms {
-                return Some(rec.offset_ms);
-            }
-        }
-    }
-    if let Ok(store) = data_store::current_store() {
-        if let Some(val) = store.get(&cache_key).await {
-            if let Ok(rec) = serde_json::from_value::<lyrics::LyricOffsetRecord>(val) {
-                if rec.lyrics_hash == lyrics_hash && rec.leading_silence_ms == leading_silence_ms {
-                    let mut cache = state.lyric_offset_cache.lock().await;
-                    cache.insert(cache_key, rec.clone());
-                    return Some(rec.offset_ms);
-                }
-            }
-        }
-    }
-    None
-}
-
-/// Warm the vocal-offset cache off the critical path. Spawns ffmpeg to decode
-/// 45s of audio and run the DSP scan; the current lyrics response returns
-/// immediately and the next `get_synced_lyrics` (or `get_lyric_offset`) picks
-/// up the cached offset.
-fn warm_vocal_offset_cache(
-    app: AppHandle,
-    video_id: String,
-    lyrics: SyncedLyricsResponse,
-    leading_silence_ms: u32,
-) {
-    // Fire-and-forget enhancement: skip if an analysis is already running so
-    // we never pile ffmpeg decodes onto the machine (see the semaphore's doc
-    // comment for the macOS failure mode this guards against).
-    let permit = match VOCAL_ANALYSIS_SEMAPHORE.clone().try_acquire_owned() {
-        Ok(permit) => permit,
-        Err(_) => return,
-    };
-    tokio::spawn(async move {
-        let _permit = permit;
-        let Some(app_state) = app.try_state::<AppState>() else { return };
-        // Re-resolve the stream file via the lyrics module's cache + disk-scan
-        // lookup (avoids duplicating that logic here; `app_state` obtained via
-        // `try_state` lives for the whole spawned task, so borrowing its cache
-        // mutex is fine).
-        let file_path = lyrics::resolve_stream_file_path(
-            &app,
-            &app_state.stream_cache,
-            STREAM_CACHE_TTL,
-            &video_id,
-        )
-        .await;
-        let Some(path) = file_path else { return };
-        let Some(vocal_onset) = lyrics::detect_vocal_onset_ms(&app, &path).await else { return };
-        let Some((offset, confidence, method)) = lyrics::compute_vocal_offset(
-            lyrics.lines.first().map(|l| l.start_time_ms).unwrap_or(0),
-            vocal_onset,
-            leading_silence_ms,
-        ) else {
-            return;
-        };
-        let rec = lyrics::LyricOffsetRecord {
-            offset_ms: offset,
-            confidence,
-            method,
-            lyrics_hash: lyrics::lyrics_content_hash(&lyrics),
-            computed_at_ms: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or(0),
-            first_lyric_ms: lyrics.lines.first().map(|l| l.start_time_ms).unwrap_or(0),
-            vocal_onset_ms: vocal_onset,
-            leading_silence_ms,
-        };
-        {
-            let mut cache = app_state.lyric_offset_cache.lock().await;
-            cache.insert(lyrics::offset_cache_key(&video_id), rec.clone());
-        }
-        let key = lyrics::offset_cache_key(&video_id);
-        let _ = data_store::write(&app, &key, &serde_json::to_string(&rec).unwrap_or_default()).await;
-    });
 }
 
 #[tauri::command]
@@ -3523,7 +3409,7 @@ async fn probe_lyrics_availability(
     artist: String,
     album: Option<String>,
     duration_seconds: Option<u32>,
-    video_id: Option<String>,
+    _video_id: Option<String>,
 ) -> Result<lyrics::LyricsAvailability, String> {
     let meta = LyricTrack {
         title,
@@ -3540,59 +3426,8 @@ async fn probe_lyrics_availability(
             ytm_has_tab: false,
         });
     }
-    // Fast YTM tab check — only when we have a videoId; with a 650ms budget.
-    let mut ytm_has_tab: Option<bool> = None;
-    if let Some(ref vid) = video_id {
-        if let Ok(next) = tokio::time::timeout(
-            Duration::from_millis(650),
-            post_ytmusic(&state.client_config, "next", watch_next_payload(vid, None)),
-        )
-        .await
-        {
-            if let Ok(resp) = next {
-                let browse_id = innertube::extract_lyrics_browse_id_from_next(&resp);
-                ytm_has_tab = Some(browse_id.is_some());
-            }
-        }
-    }
-    let avail = lyrics::probe_lyrics_availability(&lyrics_deps(&state), &meta, ytm_has_tab).await;
+    let avail = lyrics::probe_lyrics_availability(&lyrics_deps(&state), &meta).await;
     Ok(avail)
-}
-
-#[tauri::command]
-async fn get_lyric_offset(
-    state: State<'_, AppState>,
-    video_id: String,
-) -> Result<Option<lyrics::LyricOffsetRecord>, String> {
-    let key = lyrics::offset_cache_key(&video_id);
-    {
-        let cache = state.lyric_offset_cache.lock().await;
-        if let Some(rec) = cache.get(&key) {
-            return Ok(Some(rec.clone()));
-        }
-    }
-    if let Ok(store) = data_store::current_store() {
-        if let Some(val) = store.get(&key).await {
-            if let Ok(rec) = serde_json::from_value::<lyrics::LyricOffsetRecord>(val) {
-                let mut cache = state.lyric_offset_cache.lock().await;
-                cache.insert(key, rec.clone());
-                return Ok(Some(rec));
-            }
-        }
-    }
-    Ok(None)
-}
-
-#[tauri::command]
-async fn clear_lyric_offset(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    video_id: String,
-) -> Result<(), String> {
-    let key = lyrics::offset_cache_key(&video_id);
-    state.lyric_offset_cache.lock().await.remove(&key);
-    let _ = data_store::delete(&app, &key).await;
-    Ok(())
 }
 
 #[tauri::command]
@@ -3627,12 +3462,9 @@ async fn get_synced_lyrics_by_meta(
     Ok(lyrics::resolve_synced_lyrics(&lyrics_deps(&state), &meta, &ctx).await)
 }
 
-fn lyrics_deps<'a>(state: &'a State<'_, AppState>) -> lyrics::LyricsDeps<'a> {
+fn lyrics_deps<'a>(_state: &'a State<'_, AppState>) -> lyrics::LyricsDeps<'a> {
     lyrics::LyricsDeps {
         http: &HTTP,
-        http_no_redirect: &HTTP_NO_REDIRECT,
-        user_agent: USER_AGENT,
-        musixmatch_token: &state.musixmatch_token,
     }
 }
 
@@ -3973,7 +3805,7 @@ async fn resolve_stream_download(
         .unwrap_or(0);
     let output_template = cache_dir.join(format!("{video_id}.{nonce}.%(ext)s"));
     let output_template = output_template.to_string_lossy().to_string();
-    let base_args: Vec<&str> = vec![
+    let mut base_args: Vec<&str> = vec![
         "-f",
         // Avoid extension/client constraints: YouTube may expose only SABR
         // formats for one client, while another available audio format is
@@ -3998,6 +3830,9 @@ async fn resolve_stream_download(
         &output_template,
         &watch_url,
     ];
+    // See YT_DLP_PLAYER_CLIENT_EXTRACTOR_ARGS — the default android_vr
+    // client is 403-blocked on the CDN for many IPs.
+    base_args.extend_from_slice(&YT_DLP_PLAYER_CLIENT_EXTRACTOR_ARGS);
     let output = match run_yt_dlp_download_with_recovery(
         app,
         &yt_dlp,
@@ -4057,6 +3892,498 @@ async fn resolve_stream_download(
     })
 }
 
+// ---------------------------------------------------------------------------
+// Music-video resolution (`resolve_video_stream`)
+// ---------------------------------------------------------------------------
+//
+// The watch page plays the music video as a muted visual synced to the
+// player's audio, so the video file must keep its full timeline (never
+// leading-silence trimmed, unlike audio streams). Files live in the same
+// `streams/` cache folder under the `mv-` prefix so the existing TTL janitor
+// (`cleanup_old_stream_cache_files`) sweeps them, while `find_disk_stream_cache`
+// / `remove_cached_streams` (which only match `{video_id}.` names) never
+// mistake them for audio streams. The prefix also drives the MIME mapping in
+// `stream_mime_for_path`, so it must not change casually.
+const VIDEO_CACHE_PREFIX: &str = "mv-";
+
+#[tauri::command]
+async fn resolve_video_stream(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    video_id: String,
+) -> Result<StreamResponse, String> {
+    let cache_key = format!("{VIDEO_CACHE_PREFIX}{video_id}");
+    {
+        let mut cache = state.video_cache.lock().await;
+        if let Some(entry) = cache.get(&cache_key) {
+            if Path::new(&entry.source).exists() {
+                return Ok(StreamResponse {
+                    url: None,
+                    file_path: Some(entry.source.clone()),
+                });
+            }
+        }
+    }
+
+    let cache_dir = stream_cache_dir(&app)?;
+    if let Some(file_path) = find_disk_video_cache(&cache_dir, &video_id).await {
+        let mut cache = state.video_cache.lock().await;
+        cleanup_expired_video_cache(&mut cache);
+        cache.insert(
+            cache_key,
+            CachedStream {
+                source: file_path.clone(),
+                fetched_at: Instant::now(),
+            },
+        );
+        return Ok(StreamResponse {
+            url: None,
+            file_path: Some(file_path),
+        });
+    }
+
+    // In-flight dedupe, mirroring `resolve_stream`: a retry that arrives
+    // while this video is already downloading waits for the leader's outcome
+    // instead of spawning a second yt-dlp for the same id.
+    let (entry, is_leader) = {
+        let mut in_flight = state.in_flight_videos.lock().await;
+        match in_flight.get(&cache_key) {
+            Some(existing) => (existing.clone(), false),
+            None => {
+                let entry = InFlightStream::new();
+                in_flight.insert(cache_key.clone(), entry.clone());
+                (entry, true)
+            }
+        }
+    };
+    if !is_leader {
+        return entry.await_result().await;
+    }
+
+    let outcome = resolve_video_stream_download(&app, &*state, &video_id, &cache_key).await;
+    {
+        let mut in_flight = state.in_flight_videos.lock().await;
+        in_flight.remove(&cache_key);
+    }
+    entry.finish(outcome.clone()).await;
+    outcome
+}
+
+/// The actual yt-dlp download for `resolve_video_stream`, shared by the leader
+/// (runs it) and published to every follower via the in-flight handle.
+async fn resolve_video_stream_download(
+    app: &AppHandle,
+    state: &AppState,
+    video_id: &str,
+    cache_key: &str,
+) -> Result<StreamResponse, String> {
+    let yt_dlp = ensure_yt_dlp(app).await?;
+    let deno = ensure_deno(app).await.ok();
+    let js_runtime_arg = deno.as_ref().map(|p| deno_js_runtime_arg(p.as_path()));
+    let watch_url = format!("https://music.youtube.com/watch?v={video_id}");
+    // The 1080p selector merges separate video+audio streams, which needs the
+    // bundled ffmpeg (`resolve_ffmpeg` downloads it if missing). When it's
+    // unavailable, fall back to a merge-free selector.
+    let ffmpeg = resolve_ffmpeg(app).await;
+    let ffmpeg_dir = ffmpeg
+        .as_ref()
+        .and_then(|path| path.parent())
+        .map(|dir| dir.to_string_lossy().to_string());
+    let cache_dir = stream_cache_dir(app)?;
+    tokio::fs::create_dir_all(&cache_dir)
+        .await
+        .map_err(|error| format!("Failed to create stream cache folder: {error}"))?;
+    // Best-effort janitor: purge stale files and in-memory entries before
+    // downloading so the cache can't grow without bound over a long session.
+    let _ = cleanup_old_stream_cache_files(&cache_dir).await;
+    {
+        let mut cache = state.video_cache.lock().await;
+        cleanup_expired_video_cache(&mut cache);
+    }
+
+    // Never reuse the final cache filename while a player may still have the
+    // previous stream open (same Windows rename-over-open-file constraint as
+    // the audio path). The `mv-` prefix keeps this distinct from audio caches.
+    remove_cached_videos(&cache_dir, video_id).await?;
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|value| value.as_nanos())
+        .unwrap_or(0);
+    let output_template = cache_dir.join(format!("{VIDEO_CACHE_PREFIX}{video_id}.{nonce}.%(ext)s"));
+    let output_template = output_template.to_string_lossy().to_string();
+    let mut base_args: Vec<&str> = vec![
+        "--no-playlist",
+        "--no-progress",
+        "--no-part",
+        "--force-overwrites",
+        // Never let a stray yt-dlp config file silently change how downloads run.
+        "--ignore-config",
+        "--merge-output-format",
+        "mp4",
+        "--retries",
+        "5",
+        "--fragment-retries",
+        "5",
+        "--retry-sleep",
+        "exp=2:8",
+        "--print",
+        "after_move:filepath",
+        "-o",
+        &output_template,
+        &watch_url,
+    ];
+    if let Some(dir) = ffmpeg_dir.as_deref() {
+        base_args.push("--ffmpeg-location");
+        base_args.push(dir);
+    }
+    // Try in order of decreasing quality so a merge or CDN failure degrades
+    // to a still-watchable file instead of failing the page:
+    //   1. default client + 1080p merged pair (best quality, needs ffmpeg)
+    //   2. default client + single combined file (no merge needed)
+    //   3. embed client + single combined file (rare CDN-blocked fallback)
+    let attempts: [(&str, Option<&[&str]>); 3] = [
+        (VIDEO_STREAM_FORMAT, None),
+        (VIDEO_STREAM_FORMAT_NO_MERGE, None),
+        (
+            VIDEO_STREAM_FORMAT_NO_MERGE,
+            Some(YT_DLP_PLAYER_CLIENT_EXTRACTOR_ARGS.as_slice()),
+        ),
+    ];
+    let mut last_error: Option<String> = None;
+    for (format, extractor_args) in attempts {
+        let mut attempt_args: Vec<&str> = vec!["-f", format];
+        attempt_args.extend_from_slice(&base_args);
+        if let Some(args) = extractor_args {
+            attempt_args.extend_from_slice(args);
+        }
+        match run_yt_dlp_download_with_recovery(
+            app,
+            &yt_dlp,
+            &attempt_args,
+            js_runtime_arg.as_deref(),
+            VIDEO_STREAM_RESOLVE_TIMEOUT,
+            "resolve_video_stream",
+        )
+        .await
+        {
+            Ok(output) => {
+                let file_path =
+                    if let Some(path) = find_yt_dlp_output_file(&output) {
+                        path
+                    } else if let Some(path) =
+                        find_largest_video_output(&cache_dir, video_id, nonce).await
+                    {
+                        path
+                    } else {
+                        last_error =
+                            Some("yt-dlp did not return a playable video file.".to_string());
+                        continue;
+                    };
+                let metadata = tokio::fs::metadata(&file_path)
+                    .await
+                    .map_err(|error| format!("Failed to inspect cached video: {error}"))?;
+                if metadata.len() < MIN_STREAM_CACHE_BYTES {
+                    let _ = remove_cached_videos(&cache_dir, video_id).await;
+                    last_error = Some("The downloaded video file was incomplete.".to_string());
+                    continue;
+                }
+                // A merged download can fail into a bare part file (video-only
+                // or audio-only). Probing the streams and retrying is cheaper
+                // than caching a file that renders as a black screen or
+                // silent video.
+                if !video_file_has_both_streams(app, &file_path).await {
+                    let _ = remove_cached_videos(&cache_dir, video_id).await;
+                    last_error = Some(
+                        "The downloaded video had no playable video and audio track.".to_string(),
+                    );
+                    continue;
+                }
+                {
+                    let mut cache = state.video_cache.lock().await;
+                    cleanup_expired_video_cache(&mut cache);
+                    cache.insert(
+                        cache_key.to_string(),
+                        CachedStream {
+                            source: file_path.clone(),
+                            fetched_at: Instant::now(),
+                        },
+                    );
+                }
+                return Ok(StreamResponse {
+                    url: None,
+                    file_path: Some(file_path),
+                });
+            }
+            Err(error) => last_error = Some(error),
+        }
+    }
+    let _ = remove_cached_videos(&cache_dir, video_id).await;
+    Err(last_error
+        .unwrap_or_else(|| "Failed to resolve the music video.".to_string()))
+}
+
+/// Pick the largest file matching this download's output template. yt-dlp
+/// prints the merged file path last (after moving it into place), but if the
+/// print parsing ever fails or a postprocessor leaves part files behind, the
+/// merged video+audio file is always the largest `mv-{video_id}.{nonce}.*`
+/// entry — this is the fallback resolver.
+async fn find_largest_video_output(
+    cache_dir: &Path,
+    video_id: &str,
+    nonce: u128,
+) -> Option<String> {
+    let prefix = format!("{VIDEO_CACHE_PREFIX}{video_id}.{nonce}.");
+    let mut best: Option<(u64, String)> = None;
+    let mut entries = tokio::fs::read_dir(cache_dir).await.ok()?;
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        if !name.starts_with(&prefix) {
+            continue;
+        }
+        let Ok(metadata) = entry.metadata().await else {
+            continue;
+        };
+        if !metadata.is_file() || metadata.len() == 0 {
+            continue;
+        }
+        if best
+            .as_ref()
+            .map(|(size, _)| metadata.len() > *size)
+            .unwrap_or(true)
+        {
+            best = Some((metadata.len(), path.to_string_lossy().to_string()));
+        }
+    }
+    best.map(|(_, path)| path)
+}
+
+/// Verify a downloaded video file actually carries both a video and an audio
+/// stream, using the bundled ffmpeg's header read (fast — no decoding). A
+/// merged download that failed into a bare part file would otherwise play as
+/// a black screen (video-only) or with no sound (audio-only).
+async fn video_file_has_both_streams(app: &AppHandle, file_path: &str) -> bool {
+    let Some(ffmpeg) = resolve_ffmpeg(app).await else {
+        // Can't probe — assume the download is fine rather than blocking.
+        return true;
+    };
+    let mut cmd = Command::new(&ffmpeg);
+    cmd.arg("-nostdin")
+        .arg("-hide_banner")
+        .arg("-i")
+        .arg(file_path);
+    #[cfg(target_os = "windows")]
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    cmd.stdout(std::process::Stdio::null());
+    cmd.stderr(std::process::Stdio::piped());
+    cmd.kill_on_drop(true);
+    let Ok(output) = tokio::time::timeout(Duration::from_secs(15), cmd.output()).await else {
+        return true;
+    };
+    let Ok(output) = output else {
+        return true;
+    };
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // ffmpeg prints one "Stream #0:N ...: Video: ..." / "...: Audio: ..."
+    // line per stream while reading the header (it errors out afterwards for
+    // the missing output file, which is expected and ignored).
+    let video_count = stderr.matches(": Video:").count();
+    let audio_count = stderr.matches(": Audio:").count();
+    video_count > 0 && audio_count > 0
+}
+
+fn cleanup_expired_video_cache(cache: &mut crate::cache::TtlCache<String, CachedStream>) {
+    cache.retain(|_, entry| Path::new(&entry.source).exists());
+}
+
+async fn find_disk_video_cache(cache_dir: &Path, video_id: &str) -> Option<String> {
+    let mut entries = tokio::fs::read_dir(cache_dir).await.ok()?;
+    let prefix = format!("{VIDEO_CACHE_PREFIX}{video_id}.");
+    let cutoff = SystemTime::now() - STREAM_CACHE_TTL;
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        if !name.starts_with(&prefix) {
+            continue;
+        }
+        let Ok(metadata) = entry.metadata().await else {
+            continue;
+        };
+        if !metadata.is_file() || metadata.len() == 0 {
+            continue;
+        }
+        // A failed yt-dlp run can leave a PARTIAL file at the output template;
+        // serving it makes the webview fail to decode. Treat anything below the
+        // same floor as the audio path as a broken download.
+        if metadata.len() < MIN_STREAM_CACHE_BYTES {
+            continue;
+        }
+        let Ok(modified) = metadata.modified() else {
+            continue;
+        };
+        if modified < cutoff {
+            continue;
+        }
+        return Some(path.to_string_lossy().to_string());
+    }
+    None
+}
+
+async fn remove_cached_videos(cache_dir: &Path, video_id: &str) -> Result<(), String> {
+    let mut entries = tokio::fs::read_dir(cache_dir)
+        .await
+        .map_err(|error| format!("Failed to read stream cache folder: {error}"))?;
+    let prefix = format!("{VIDEO_CACHE_PREFIX}{video_id}.");
+    while let Some(entry) = entries
+        .next_entry()
+        .await
+        .map_err(|error| format!("Failed to inspect stream cache entry: {error}"))?
+    {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        if !name.starts_with(&prefix) {
+            continue;
+        }
+        match tokio::fs::remove_file(&path).await {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "Failed to clear old cached video {}: {error}",
+                    path.display()
+                ))
+            }
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Music-video offline saves
+// ---------------------------------------------------------------------------
+//
+// Saved songs with a music video get the MV copied into the offline folder
+// under the `mv-` prefix, mirroring how audio downloads are persisted there
+// (see `save_offline`). The video keeps its full timeline (no leading-silence
+// trim), lives outside the TTL-swept streams cache, and is served through the
+// same `stream://` protocol (the `mv-` prefix drives the video MIME mapping).
+// Saving is a two-step: resolve the playable file (streams cache) then copy it
+// into place, so the retry chain / probing in `resolve_video_stream_download`
+// is reused instead of duplicating yt-dlp logic.
+
+#[tauri::command]
+async fn save_video_offline(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    video_id: String,
+) -> Result<Option<String>, String> {
+    let offline = offline_dir(&app)?;
+    tokio::fs::create_dir_all(&offline)
+        .await
+        .map_err(|error| format!("Failed to create offline folder: {error}"))?;
+
+    // Already saved locally — nothing to do.
+    if let Some(path) = find_offline_video_file(&offline, &video_id).await {
+        return Ok(Some(path.to_string_lossy().to_string()));
+    }
+
+    // Resolve (or re-resolve) a playable video file through the streams
+    // cache, then copy it into the offline folder. The copy is the actual
+    // "save": the streams-cache copy is TTL-swept, the offline copy persists.
+    let resolved = resolve_video_stream(app.clone(), state, video_id.clone()).await?;
+    let source = resolved
+        .file_path
+        .ok_or_else(|| "No video file was resolved.".to_string())?;
+    let ext = Path::new(&source)
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("mp4")
+        .to_string();
+    let target = offline.join(format!("{VIDEO_CACHE_PREFIX}{video_id}.{ext}"));
+    // Copy to a temp name then rename so a partially-written copy can never
+    // be served as the "saved" video (mirrors the audio compact-encode flow).
+    let temp = offline.join(format!("{VIDEO_CACHE_PREFIX}{video_id}.tmp.{ext}"));
+    tokio::fs::copy(&source, &temp)
+        .await
+        .map_err(|error| format!("Failed to copy music video locally: {error}"))?;
+    tokio::fs::rename(&temp, &target)
+        .await
+        .map_err(|error| format!("Failed to finalize music video: {error}"))?;
+    Ok(Some(target.to_string_lossy().to_string()))
+}
+
+/// Find the locally-saved music-video file for a video id, if any.
+async fn find_offline_video_file(dir: &Path, video_id: &str) -> Option<PathBuf> {
+    let prefix = format!("{VIDEO_CACHE_PREFIX}{video_id}.");
+    let mut entries = tokio::fs::read_dir(dir).await.ok()?;
+    while let Some(entry) = entries.next_entry().await.ok()? {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        if name.starts_with(&prefix) && path.is_file() {
+            return Some(path);
+        }
+    }
+    None
+}
+
+#[tauri::command]
+async fn get_offline_video_path(
+    app: AppHandle,
+    video_id: String,
+) -> Result<Option<String>, String> {
+    let offline = offline_dir(&app)?;
+    if !offline.exists() {
+        return Ok(None);
+    }
+    Ok(find_offline_video_file(&offline, &video_id)
+        .await
+        .map(|path| path.to_string_lossy().to_string()))
+}
+
+#[tauri::command]
+async fn remove_video_offline(app: AppHandle, video_id: String) -> Result<(), String> {
+    let offline = offline_dir(&app)?;
+    if !offline.exists() {
+        return Ok(());
+    }
+    let prefix = format!("{VIDEO_CACHE_PREFIX}{video_id}.");
+    let mut entries = tokio::fs::read_dir(&offline)
+        .await
+        .map_err(|error| format!("Failed to read offline folder: {error}"))?;
+    while let Some(entry) = entries
+        .next_entry()
+        .await
+        .map_err(|error| format!("Failed to inspect offline entry: {error}"))?
+    {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        if !name.starts_with(&prefix) {
+            continue;
+        }
+        match tokio::fs::remove_file(&path).await {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "Failed to remove offline music video {}: {error}",
+                    path.display()
+                ))
+            }
+        }
+    }
+    Ok(())
+}
+
 /// If the stream file starts with leading silence / gap,
 /// actual ffmpeg trimming is performed so the audio starts cleanly at 0:00.
 ///
@@ -4070,7 +4397,7 @@ async fn trim_leading_silence_if_needed(app: &AppHandle, file_path: &Path) -> Op
     const SILENCE_MIN_DURATION: f64 = 0.3;
     const MIN_SKIP_SECONDS: f64 = 0.35;
     const MAX_SKIP_SECONDS: f64 = 8.0;
-    const LEADING_SILENCE_START_TOLERANCE: f64 = 0.25;
+    const LEADING_SILENCE_START_TOLERANCE: f64 = 0.5;
     const SILENCE_END_PREROLL: f64 = 0.08;
 
     let ffmpeg = resolve_ffmpeg(app).await?;
@@ -4128,8 +4455,11 @@ async fn trim_leading_silence_if_needed(app: &AppHandle, file_path: &Path) -> Op
                     .or_else(|| silence_dur.map(|dur| (end - dur).max(0.0)))
                     .unwrap_or(0.0);
                 if start <= LEADING_SILENCE_START_TOLERANCE {
-                    leading_skip = Some(end);
-                    break;
+                    let with_preroll = (end - SILENCE_END_PREROLL).max(0.0);
+                    if with_preroll >= MIN_SKIP_SECONDS {
+                        leading_skip = Some(end);
+                        break;
+                    }
                 }
             }
             current_silence_start = None;
@@ -4522,7 +4852,7 @@ async fn download_offline_file(
 
     let output_template = offline.join(format!("{video_id}.%(ext)s"));
     let output_template = output_template.to_string_lossy().to_string();
-    let base_args: Vec<&str> = vec![
+    let mut base_args: Vec<&str> = vec![
         "-f",
         "bestaudio/best",
         "--no-playlist",
@@ -4542,6 +4872,9 @@ async fn download_offline_file(
         &output_template,
         &watch_url,
     ];
+    // See YT_DLP_PLAYER_CLIENT_EXTRACTOR_ARGS — the default android_vr
+    // client is 403-blocked on the CDN for many IPs.
+    base_args.extend_from_slice(&YT_DLP_PLAYER_CLIENT_EXTRACTOR_ARGS);
     let output = run_yt_dlp_download_with_recovery(
         app,
         &yt_dlp,
@@ -4561,6 +4894,12 @@ async fn download_offline_file(
     if metadata.len() == 0 {
         return Err("The downloaded audio file was empty.".to_string());
     }
+
+    let file_path = if let Some(trimmed) = trim_leading_silence_if_needed(app, Path::new(&file_path)).await {
+        trimmed.to_string_lossy().to_string()
+    } else {
+        file_path
+    };
 
     if compact {
         let target = offline.join(format!("{video_id}.opus"));
@@ -4599,6 +4938,39 @@ async fn download_offline_file(
 #[tauri::command]
 async fn save_offline(app: AppHandle, video_id: String, compact: bool) -> Result<(), String> {
     download_offline_file(&app, &video_id, compact).await.map(|_| ())
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+#[serde(rename_all = "camelCase")]
+pub enum OfflineHealOutcome {
+    Missing,
+    Corrupt,
+    Trimmed,
+    Healthy,
+}
+
+#[tauri::command]
+async fn heal_offline_audio(app: AppHandle, video_id: String) -> Result<OfflineHealOutcome, String> {
+    let offline = offline_dir(&app)?;
+    if !offline.exists() {
+        return Ok(OfflineHealOutcome::Missing);
+    }
+    let Some(path) = find_offline_file(&offline, &video_id).await else {
+        return Ok(OfflineHealOutcome::Missing);
+    };
+    let meta = match tokio::fs::metadata(&path).await {
+        Ok(m) => m,
+        Err(_) => return Ok(OfflineHealOutcome::Missing),
+    };
+    if meta.len() == 0 {
+        let _ = tokio::fs::remove_file(&path).await;
+        return Ok(OfflineHealOutcome::Corrupt);
+    }
+    if let Some(_trimmed) = trim_leading_silence_if_needed(&app, &path).await {
+        Ok(OfflineHealOutcome::Trimmed)
+    } else {
+        Ok(OfflineHealOutcome::Healthy)
+    }
 }
 
 #[derive(Serialize)]
@@ -4647,6 +5019,10 @@ async fn reconcile_offline_quality(
             continue;
         };
         if name == "offline-manifest.json" || name.contains(".compact-tmp.") {
+            continue;
+        }
+        // Music-video offline saves are not audio songs — never re-encode them.
+        if name.starts_with(VIDEO_CACHE_PREFIX) {
             continue;
         }
         if let Some(dot) = name.rfind('.') {
@@ -4712,8 +5088,15 @@ async fn get_offline_path(app: AppHandle, video_id: String) -> Result<Option<Str
     if !offline.exists() {
         return Ok(None);
     }
-    let path = find_offline_file(&offline, &video_id).await;
-    Ok(path.map(|p| p.to_string_lossy().to_string()))
+    let Some(path) = find_offline_file(&offline, &video_id).await else {
+        return Ok(None);
+    };
+    let path = if let Some(trimmed) = trim_leading_silence_if_needed(&app, &path).await {
+        trimmed
+    } else {
+        path
+    };
+    Ok(Some(path.to_string_lossy().to_string()))
 }
 
 #[tauri::command]
@@ -4739,6 +5122,11 @@ async fn list_offline(app: AppHandle) -> Result<Vec<String>, String> {
             continue;
         };
         if name == "offline-manifest.json" || name.contains(".compact-tmp.") {
+            continue;
+        }
+        // Music-video offline saves live under the `mv-` prefix; they are not
+        // songs and must not be reported as downloaded song ids.
+        if name.starts_with(VIDEO_CACHE_PREFIX) {
             continue;
         }
         // Extract videoId from "{videoId}.ext"
@@ -5147,7 +5535,7 @@ async fn download_track_audio(
     // `--embed-thumbnail` — we re-tag with lofty afterwards so the
     // user-supplied (and possibly enriched) metadata wins over whatever
     // yt-dlp scraped from the page.
-    let args: Vec<&str> = vec![
+    let mut args: Vec<&str> = vec![
         "-x",
         "--audio-format",
         audio_format,
@@ -5172,6 +5560,9 @@ async fn download_track_audio(
         &temp_template,
         &watch_url,
     ];
+    // See YT_DLP_PLAYER_CLIENT_EXTRACTOR_ARGS — the default android_vr
+    // client is 403-blocked on the CDN for many IPs.
+    args.extend_from_slice(&YT_DLP_PLAYER_CLIENT_EXTRACTOR_ARGS);
     let output = run_yt_dlp_download_with_recovery(
         app,
         yt_dlp,
@@ -5216,7 +5607,7 @@ async fn download_track_native(
         .ok_or_else(|| "Could not derive a file stem from the target path.".to_string())?;
     let temp_template = parent.join(format!(".velocity-export-{stem}-%(ext)s"));
     let temp_template = temp_template.to_string_lossy().to_string();
-    let args: Vec<&str> = vec![
+    let mut args: Vec<&str> = vec![
         "-f",
         "bestaudio/best",
         "--no-playlist",
@@ -5236,6 +5627,9 @@ async fn download_track_native(
         &temp_template,
         &watch_url,
     ];
+    // See YT_DLP_PLAYER_CLIENT_EXTRACTOR_ARGS — the default android_vr
+    // client is 403-blocked on the CDN for many IPs.
+    args.extend_from_slice(&YT_DLP_PLAYER_CLIENT_EXTRACTOR_ARGS);
     let output = run_yt_dlp_download_with_recovery(
         app,
         yt_dlp,
@@ -6190,9 +6584,9 @@ const MAX_CACHED_ARTWORK_DIMENSION: u32 = 512;
 /// Bump when the on-disk format changes so stale full-size entries are bypassed.
 const ARTWORK_CACHE_VERSION: u32 = 1;
 
-/// Downscale oversized artwork to [`MAX_CACHED_ARTWORK_DIMENSION`]. Returns
-/// `(Some(bytes), extension)` when the image was re-encoded, `(None, None)`
-/// when the source is already small enough (or is not a decodable raster).
+/// Downscale oversized artwork to [`MAX_CACHED_ARTWORK_DIMENSION`] and compress
+/// raster artwork to high-efficiency JPEG. Returns `(Some(bytes), extension)` when
+/// re-encoded, `(None, None)` when the source is already small enough or unparseable.
 fn downscale_artwork(bytes: &[u8]) -> (Option<Vec<u8>>, Option<&'static str>) {
     use image::imageops::FilterType;
 
@@ -6201,6 +6595,16 @@ fn downscale_artwork(bytes: &[u8]) -> (Option<Vec<u8>>, Option<&'static str>) {
     };
     let (width, height) = (image.width(), image.height());
     if width <= MAX_CACHED_ARTWORK_DIMENSION && height <= MAX_CACHED_ARTWORK_DIMENSION {
+        if bytes.len() > 40_000 {
+            let mut out = std::io::Cursor::new(Vec::new());
+            let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 85);
+            if image.write_with_encoder(encoder).is_ok() {
+                let compressed = out.into_inner();
+                if compressed.len() < bytes.len() {
+                    return (Some(compressed), Some("jpg"));
+                }
+            }
+        }
         return (None, None);
     }
 
@@ -6211,7 +6615,7 @@ fn downscale_artwork(bytes: &[u8]) -> (Option<Vec<u8>>, Option<&'static str>) {
     );
 
     let mut out = std::io::Cursor::new(Vec::new());
-    let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 88);
+    let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 85);
     if scaled.write_with_encoder(encoder).is_err() {
         return (None, None);
     }
@@ -6659,13 +7063,13 @@ async fn analyze_loudness_slice(
 async fn detect_leading_silence(app: AppHandle, file_path: String) -> Result<LeadingSilenceData, String> {
     // Bump LEADING_SILENCE_ANALYSIS_VERSION whenever detection parameters
     // change to invalidate stale cached results on the frontend.
-    const LEADING_SILENCE_ANALYSIS_VERSION: u8 = 7;
+    const LEADING_SILENCE_ANALYSIS_VERSION: u8 = 8;
     const ANALYSIS_MAX_SECONDS: f64 = 45.0;
     const SILENCE_NOISE_DB: f64 = -42.0;
     const SILENCE_MIN_DURATION: f64 = 0.3;
     const MIN_SKIP_SECONDS: f64 = 0.35;
     const MAX_SKIP_SECONDS: f64 = 8.0;
-    const LEADING_SILENCE_START_TOLERANCE: f64 = 0.25;
+    const LEADING_SILENCE_START_TOLERANCE: f64 = 0.5;
     const SILENCE_END_PREROLL: f64 = 0.08;
 
     fn empty_leading_silence_data() -> LeadingSilenceData {
@@ -6744,8 +7148,11 @@ async fn detect_leading_silence(app: AppHandle, file_path: String) -> Result<Lea
                     .or_else(|| silence_dur.map(|dur| (end - dur).max(0.0)))
                     .unwrap_or(0.0);
                 if start <= LEADING_SILENCE_START_TOLERANCE {
-                    leading_skip = Some(end);
-                    break;
+                    let with_preroll = (end - SILENCE_END_PREROLL).max(0.0);
+                    if with_preroll >= MIN_SKIP_SECONDS {
+                        leading_skip = Some(end);
+                        break;
+                    }
                 }
             }
             current_silence_start = None;
@@ -9228,8 +9635,15 @@ fn spawn_startup_updater(app: &AppHandle) {
 }
 
 
-/// MIME type for a cached stream file, by extension.
+/// MIME type for a cached stream file, by extension. Music-video files (the
+/// `mv-` prefixed cache namespace used by `resolve_video_stream`) are served
+/// with video MIMEs so the webview's `<video>` element decodes them without
+/// sniffing; audio caches keep their audio MIMEs.
 fn stream_mime_for_path(path: &std::path::Path) -> &'static str {
+    let is_video = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with(VIDEO_CACHE_PREFIX));
     match path
         .extension()
         .and_then(|ext| ext.to_str())
@@ -9237,12 +9651,25 @@ fn stream_mime_for_path(path: &std::path::Path) -> &'static str {
         .as_deref()
     {
         Some("mp3") => "audio/mpeg",
-        Some("m4a") | Some("m4b") | Some("aac") | Some("mp4") => "audio/mp4",
+        Some("m4a") | Some("m4b") | Some("aac") => "audio/mp4",
+        Some("mp4") => {
+            if is_video {
+                "video/mp4"
+            } else {
+                "audio/mp4"
+            }
+        }
         Some("wav") => "audio/wav",
         Some("ogg") | Some("oga") => "audio/ogg",
         Some("flac") => "audio/flac",
         Some("opus") => "audio/opus",
-        Some("webm") => "audio/webm",
+        Some("webm") => {
+            if is_video {
+                "video/webm"
+            } else {
+                "audio/webm"
+            }
+        }
         _ => "application/octet-stream",
     }
 }
@@ -9423,9 +9850,8 @@ fn main() {
             get_synced_lyrics,
             get_synced_lyrics_by_meta,
             probe_lyrics_availability,
-            get_lyric_offset,
-            clear_lyric_offset,
             resolve_stream,
+            resolve_video_stream,
             extract_file_metadata,
             list_imported_tracks,
             import_tracks,
@@ -9442,6 +9868,10 @@ fn main() {
             list_offline,
             clear_all_offline,
             get_offline_path,
+            heal_offline_audio,
+            save_video_offline,
+            get_offline_video_path,
+            remove_video_offline,
             save_track_to_mp3,
             save_album_to_mp3,
             save_playlist_to_mp3,

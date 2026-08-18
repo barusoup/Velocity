@@ -1106,7 +1106,7 @@ function PopularTrackRow({
   onHoverChange?: (hovered: boolean) => void;
   queueOrigin?: import("../player").QueueOrigin | null;
 }) {
-  const { togglePlay } = usePlayerActions();
+  const { togglePlay, warm } = usePlayerActions();
   const { active, playingActive, bufferingActive } = useTrackPlaybackState(track);
   const contextTarget = useContextTrackTarget(track);
   const isSaved = useIsTrackSaved(track);
@@ -1137,7 +1137,10 @@ function PopularTrackRow({
       className={`popular-track-row group grid ${POPULAR_TRACK_GRID} cursor-pointer items-center gap-3 rounded-xl px-3 py-3 transition-colors hover:bg-neutral-900 ${active ? "bg-white/[0.04]" : ""} ${isExtra ? "is-extra" : ""}`}
       style={isExtra ? ({ "--domino-index": index - 5 } as CSSProperties) : undefined}
       onClick={active ? togglePlay : onPlay}
-      onMouseEnter={() => onHoverChange?.(true)}
+      onMouseEnter={() => {
+        onHoverChange?.(true);
+        warm(track);
+      }}
       onMouseLeave={() => onHoverChange?.(false)}
     >
       <div className="relative flex min-h-[var(--ui-art-row)] items-center justify-center">
@@ -2492,7 +2495,7 @@ function DiscographyTrackRow({
   onPlay: () => void;
   onHoverChange?: (hovered: boolean) => void;
 }) {
-  const { togglePlay } = usePlayerActions();
+  const { togglePlay, warm } = usePlayerActions();
   const { active, playingActive: playing, bufferingActive: buffering } = useTrackPlaybackState(track);
   const contextTarget = useContextTrackTarget(track);
   const isSaved = useIsTrackSaved(track);
@@ -2505,7 +2508,10 @@ function DiscographyTrackRow({
         active ? "bg-white/[0.04]" : "hover:bg-neutral-900"
       }`}
       onClick={active ? togglePlay : onPlay}
-      onMouseEnter={() => onHoverChange?.(true)}
+      onMouseEnter={() => {
+        onHoverChange?.(true);
+        warm(track);
+      }}
       onMouseLeave={() => onHoverChange?.(false)}
     >
       <div className="relative flex items-center justify-center">
